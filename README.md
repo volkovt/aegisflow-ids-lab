@@ -20,44 +20,6 @@ Laboratório **reprodutível** para **simular ataques**, **coletar telemetria** 
 
 ---
 
-## 📦 Estrutura (sugerida)
-
-```
-
-aegisflow-ids-lab/
-├─ app/
-│  ├─ core/
-│  │  ├─ config\_loader.py
-│  │  ├─ preflight.py
-│  │  ├─ vagrant\_manager.py
-│  │  ├─ ssh\_manager.py
-│  │  └─ logger\_setup.py
-│  ├─ templates/
-│  │  └─ Vagrantfile.j2
-│  ├─ ui/
-│  │  ├─ futuristic.qss
-│  │  ├─ info\_pills.py
-│  │  └─ flow\_layout.py
-│  └─ main.py
-├─ manage\_lab.py
-├─ experiments/
-│  ├─ exp\_scan\_brute.yaml
-│  ├─ exp\_dos.yaml
-│  └─ presets/
-│     ├─ preset\_heavy\_hping3.yaml
-│     └─ preset\_brute\_http\_hydra.yaml
-├─ data/            # (ignore no Git) pcap/logs/zeek
-├─ datasets/        # (ignore no Git) datasets processados para ML
-├─ .logs/           # (ignore no Git) relatórios e logs
-├─ requirements.txt
-├─ config.example.yaml
-├─ .gitignore
-└─ README.md
-
-````
-
----
-
 ## 🚀 Comece agora
 
 ### 1) Requisitos
