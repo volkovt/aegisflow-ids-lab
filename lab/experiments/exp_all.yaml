@@ -1,0 +1,23 @@
+exp_id: "EXP_ALL"
+targets:
+  victim_ip: "192.168.56.20"
+capture:
+  rotate_seconds: 300
+  rotate_size_mb: 100
+  zeek_rotate_seconds: 3600
+actions:
+  - name: "nmap_scan"
+    params:
+      output: "exp_scan.nmap"
+  - name: "hydra_brute"
+    params:
+      user: "tcc"
+      pass_list: ["123456","wrongpass"]
+      output: "exp_brute.hydra"
+  - name: "slowhttp_dos"
+    params:
+      port: 8080
+      duration_s: 120
+      concurrency: 400
+      rate: 150
+      output_prefix: "exp_dos"

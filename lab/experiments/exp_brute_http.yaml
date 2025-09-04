@@ -1,0 +1,17 @@
+exp_id: "EXP_BRUTE_HTTP"
+targets:
+  victim_ip: "192.168.56.20"
+capture:
+  rotate_seconds: 300
+  rotate_size_mb: 100
+  zeek_rotate_seconds: 3600
+actions:
+  - name: "hydra_http_post"
+    params:
+      path: "/login"
+      user: "webuser"
+      pass_list: ["secret", "123456", "admin", "password"]
+      fail_regex: "invalid"
+      port: 8081
+      output: "exp_brute_http.hydra"
+      threads: 4

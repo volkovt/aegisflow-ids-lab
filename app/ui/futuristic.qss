@@ -1,0 +1,65 @@
+/* Tema Futurista: neon ciano + violeta */
+QWidget {
+  background-color: #0b0f14;
+  color: #cfd8dc;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 12pt;
+}
+
+QPushButton {
+  background-color: #121926;
+  border: 1px solid #7a00ff;
+  border-radius: 10px;
+  padding: 8px 14px;
+}
+QPushButton:hover { border-color: #00ffd1; }
+QPushButton:pressed { background-color: #0e1420; }
+
+QGroupBox { border: 1px solid #233044; border-radius: 12px; margin-top: 12px; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #00ffd1; }
+
+QPlainTextEdit, QTextEdit {
+  background: #0e1420;
+  border: 1px solid #233044;
+  border-radius: 10px;
+}
+
+QLabel#statusDot[status="running"] { color: #00ff87; }
+QLabel#statusDot[status="stopped"] { color: #ff3b3b; }
+QLabel#statusDot[status="unknown"] { color: #ffcc00; }
+
+/* Pills neon futuristas */
+QPushButton#InfoPill {
+    border-radius: 16px;
+    padding: 6px 10px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                                stop:0 rgba(18, 26, 32, 210),
+                                stop:1 rgba(28, 38, 46, 210));
+    color: #e6fff8;
+    border: 1px solid rgba(0, 255, 209, 0.35);
+}
+QPushButton#InfoPill:hover {
+    border: 1px solid rgba(0, 255, 209, 0.7);
+    box-shadow: 0 0 12px rgba(0, 255, 209, 0.45);
+}
+
+/* Cores por tipo */
+QPushButton#InfoPill[kind="so"] {
+    border-color: rgba(0, 212, 255, 0.45);
+}
+QPushButton#InfoPill[kind="host"] {
+    border-color: rgba(255, 105, 0, 0.55);
+}
+QPushButton#InfoPill[kind="guest"] {
+    border-color: rgba(168, 85, 247, 0.55);
+}
+
+/* A bolinha de status já existente continua, mas se quiser, dê mais glow */
+#statusDot[status="running"] {
+    color: #00ffd1;
+    text-shadow: 0 0 8px rgba(0,255,209,0.7);
+}
+#statusDot[status="stopped"] { color: #ff5252; }
+#statusDot[status="unknown"] { color: #c0c0c0; }

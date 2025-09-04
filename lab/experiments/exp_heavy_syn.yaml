@@ -1,0 +1,14 @@
+exp_id: "EXP_HEAVY_SYN"
+targets:
+  victim_ip: "192.168.56.20"
+capture:
+  rotate_seconds: 120
+  rotate_size_mb: 200
+  zeek_rotate_seconds: 1200
+actions:
+  - name: "hping3_syn"
+    params:
+      dst_port: 8080
+      rate_pps: 800        # ≈ 800 pps
+      duration_s: 120      # ≈ 96k pacotes
+      # count: 100000      # opcional (se definido, tem precedência)

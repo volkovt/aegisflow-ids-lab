@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+pip-wheel-metadata/
+__pypackages__/
+.pytest_cache/
+.mypy_cache/
+.cache/
+.coverage
+htmlcov/
+
+# IDE/OS
+.ideavimrc
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs & artefatos
+*.log
+.logs/
+artifacts/
+outputs/
+reports/
+*.zip
+*.tar
+*.tar.gz
+
+# Vagrant/VirtualBox
+.vagrant/
+lab/.vagrant/
+*.vbox
+*.vbox-prev
+*.vdi
+*.vmdk
+
+# PCAP & dados brutos (mantém o repo leve)
+*.pcap
+*.pcapng
+data/
+datasets/
+
+# Build/Distribuição
+build/
+dist/
+*.spec
+*.build/
+*.dist/
+
+# Segurança / configs locais
+config.yaml
+*.key
+*.pem
+*.crt
+*.pub
+
+# Node (se usar front opcional)
+node_modules/

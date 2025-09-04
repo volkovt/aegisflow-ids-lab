@@ -1,0 +1,38 @@
+# Arquivo gerado automaticamente — NÃO editar manualmente (edite config.yaml)
+Vagrant.configure("2") do |config|
+  config.vm.box_check_update = true
+  config.vm.provider "{{ provider }}" do |vb|
+    vb.gui = false
+  end
+
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  {% for m in machines %}
+  config.vm.define "{{ m.name }}" do |{{ m.name }}|
+    {{ m.name }}.vm.box = "{{ m.box }}"
+    {{ m.name }}.vm.hostname = "{{ m.hostname }}"
+
+    {{ m.name }}.vm.provider "{{ provider }}" do |vb|
+      vb.memory = {{ m.memory }}
+      vb.cpus = {{ m.cpus }}
+    end
+
+    # Network (Host-Only)
+    {{ m.name }}.vm.network "private_network", ip: "{{ ip_base }}{{ m.ip_last_octet }}"
+
+    {% if m.synced_folders %}
+    {% for sf in m.synced_folders %}
+    {{ m.name }}.vm.synced_folder "{{ sf.host }}", "{{ sf.guest }}", create: true
+    {% endfor %}
+    {% endif %}
+
+    {% if m.provision %}
+    {% for p in m.provision %}
+    {{ m.name }}.vm.provision "shell", inline: <<-SHELL
+{{ p.inline | indent(width=6) }}
+    SHELL
+    {% endfor %}
+    {% endif %}
+  end
+  {% endfor %}
+end
