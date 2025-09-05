@@ -1,17 +1,51 @@
-import re
+import base64
+import os
+import shlex
+import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Dict
 import paramiko
 import logging
 
 logger = logging.getLogger("[SSHManager]")
 
+_CONNECT_GATE = threading.BoundedSemaphore(value=2)
+
 class SSHManager:
     def __init__(self, lab_dir: Path):
         self.lab_dir = lab_dir
+        self._lock = threading.Lock()
+        self._running = {}
+
+    def _register_proc(self, name, proc: subprocess.Popen):
+        with self._lock:
+            self._running.setdefault(name, []).append(proc)
+
+    def _unregister_proc(self, name, proc: subprocess.Popen):
+        with self._lock:
+            if name in self._running and proc in self._running[name]:
+                self._running[name].remove(proc)
+
+    def cancel_all_running(self):
+        with self._lock:
+            items = list(self._running.items())
+        for name, procs in items:
+            for p in list(procs):
+                try:
+                    logger.warn(f"[SSHManager] Matando vagrant ssh ativo em {name} (cancel).")
+                    if os.name == "nt":
+                        p.send_signal(signal.CTRL_BREAK_EVENT)
+                        time.sleep(0.2)
+                        p.terminate()
+                    else:
+                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    p.wait(timeout=5)
+                except Exception as e:
+                    logger.error(f"[SSHManager] Falha ao matar processo SSH ({name}): {e}")
 
     def _parse_ssh_config(self, ssh_config: str) -> Dict[str, str]:
         """
@@ -120,21 +154,23 @@ class SSHManager:
     def open_external_terminal(self, name: str) -> None:
         try:
             f = self.get_ssh_fields(name)
+            host = f["HostName"]
+            port = f["Port"]
+            user = f["User"]
+            key = f["IdentityFile"]
+
             cmd = [
                 "cmd.exe", "/c",
-                f"start cmd.exe /k ssh -p {f['Port']} -i {f['IdentityFile']} "
-                f"{f['User']}@{f['HostName']} -o StrictHostKeyChecking=no"
+                f'start "" cmd.exe /k ssh -p {port} -i "{key}" {user}@{host} '
+                f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
             ]
-            logging.getLogger("[SSHManager]").info(f"Abrindo terminal externo: {' '.join(cmd)}")
+            logger.info(f"[SSHManager] Abrindo terminal externo: {' '.join(cmd)}")
             subprocess.Popen(cmd, cwd=self.lab_dir)
         except Exception as e:
             logger.error(f"[SSHManager] Falha ao abrir terminal externo: {e}")
             raise
 
-    def _wait_port(self, host: str, port: int, wait_secs: float = 6.0) -> None:
-        """
-        Aguarda o socket aceitar conexão (sem fazer handshake SSH ainda).
-        """
+    def _wait_port(self, host: str, port: int, wait_secs: float = 10.0) -> None:
         deadline = time.time() + max(0.5, wait_secs)
         last_err = None
         while time.time() < deadline:
@@ -146,73 +182,118 @@ class SSHManager:
                 time.sleep(0.25)
         raise TimeoutError(f"Porta {host}:{port} indisponível: {last_err}")
 
-    def run_command(
-        self,
-        name: str,
-        command: str,
-        timeout: int = 12,
-        retries: int = 3,
-        backoff: float = 0.8
-    ) -> str:
+    def _wait_ssh_banner(self, host: str, port: int, wait_secs: float = 20.0) -> None:
         """
-        Executa um comando via SSH com retentativas. Mitiga erro:
-        'unpack requires a buffer of 4 bytes' (handshake incompleto).
+        Abre um socket e tenta ler o prefixo 'SSH-' do banner.
+        Só retorna quando o serviço SSH está realmente pronto para handshake.
+        """
+        deadline = time.time() + max(1.0, wait_secs)
+        last_err = None
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=3.0) as s:
+                    s.settimeout(3.0)
+                    data = s.recv(64)
+                    if data and data.startswith(b"SSH-"):
+                        logger.info(f"[SSHManager] Banner ok em {host}:{port}: {data.decode(errors='ignore').strip()}")
+                        return
+                    last_err = RuntimeError(f"Banner inválido: {data!r}")
+            except Exception as e:
+                last_err = e
+            time.sleep(0.4)
+        raise TimeoutError(f"Banner SSH não disponível em {host}:{port}: {last_err}")
+
+    def run_command_cancellable(self, name: str, cmd: str, timeout_s: int = 300):
+        """
+        Executa 'vagrant ssh name -c "bash -lc <cmd>"' de forma cancelável.
+        """
+        try:
+            payload = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
+            wrapped = f'bash -lc "eval \\\"$(echo {payload} | base64 -d)\\\""'
+            ssh_cmd = ["vagrant", "ssh", name, "-c", wrapped]
+            creationflags = 0
+            preexec_fn = None
+            if os.name != "nt":
+                preexec_fn = os.setsid
+            else:
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+
+            proc = subprocess.Popen(
+                ssh_cmd, cwd=self.lab_dir,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                preexec_fn=preexec_fn, creationflags=creationflags
+            )
+            self._register_proc(name, proc)
+            out, err = proc.communicate(timeout=timeout_s)
+            rc = proc.returncode
+            self._unregister_proc(name, proc)
+            if rc != 0:
+                raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
+            return out
+        except subprocess.TimeoutExpired:
+            self.cancel_all_running()
+
+    def run_command(self, name: str, command: str, timeout: int = 15, retries: int = 5) -> str:
+        """
+        Executa 'command' via SSH (Paramiko) checando código de saída.
+        Se esgotar as tentativas, cai em fallback: 'vagrant ssh <name> -c "<command>"'.
         """
         f = self.get_ssh_fields(name)
-        host = f.get("HostName")
-        port = int(f.get("Port", 22))
-        user = f.get("User", "vagrant")
-        key_path = f.get("IdentityFile")
+        host, port, user, key_path = f["HostName"], int(f["Port"]), f["User"], f["IdentityFile"]
+        last = None
 
-        last_exc = None
         for attempt in range(1, retries + 1):
             try:
-                self._wait_port(host, port, wait_secs=min(6.0, timeout))
-
-                pkey = None
-                try:
-                    pkey = paramiko.RSAKey.from_private_key_file(key_path)
-                except Exception as e_key:
-                    logger.warning(f"[SSHManager] Falha lendo chave RSA: {e_key}; tentando Ed25519…")
+                self._wait_port(host, port, wait_secs=min(20, timeout + 5))
+                self._wait_ssh_banner(host, port, wait_secs=min(40, timeout + 20))
+                with _CONNECT_GATE:
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(
+                        hostname=host, port=port, username=user,
+                        key_filename=key_path, look_for_keys=False, allow_agent=False,
+                        timeout=15, banner_timeout=60, auth_timeout=30, compress=True
+                    )
                     try:
-                        pkey = paramiko.Ed25519Key.from_private_key_file(key_path)
-                    except Exception as e_ed:
-                        logger.error(f"[SSHManager] Falha chave SSH: {e_ed}")
-                        raise
-
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-                client.connect(
-                    hostname=host,
-                    port=port,
-                    username=user,
-                    pkey=pkey,
-                    look_for_keys=False,
-                    allow_agent=False,
-                    timeout=6,            # TCP connect timeout
-                    banner_timeout=8,     # banner SSH
-                    auth_timeout=8        # auth timeout
-                )
-
-                try:
-                    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-                    out = (stdout.read() or b"").decode(errors="replace") + \
-                          (stderr.read() or b"").decode(errors="replace")
-                    logger.info(f"[SSHManager] Comando executado em {name}: {command}")
-                    return out
-                finally:
-                    client.close()
-
+                        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                        out = (stdout.read() or b"").decode(errors="replace")
+                        err = (stderr.read() or b"").decode(errors="replace")
+                        try:
+                            rc = stdout.channel.recv_exit_status()
+                        except Exception:
+                            rc = 0
+                        if err.strip():
+                            logger.warning(f"[SSHManager] STDERR ({name}): {err.strip()}")
+                        if rc != 0:
+                            raise RuntimeError(f"Remote exit status {rc} — {err.strip() or out.strip()}")
+                        return out.rstrip()
+                    finally:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
             except Exception as e:
-                last_exc = e
+                last = e
+                sleep_s = 0.8 * attempt
                 logger.warning(
-                    f"[SSHManager] Tentativa {attempt}/{retries} falhou em {name}: {e}"
-                )
-                time.sleep(backoff * attempt)
+                    f"[SSHManager] Tentativa {attempt}/{retries} falhou em {name}: {e}. Retry em {sleep_s:.1f}s")
+                time.sleep(sleep_s)
 
-        logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last_exc}")
-        raise RuntimeError(f"SSH falhou em {name}: {last_exc}")
+        try:
+            logger.info(f"[SSHManager] Fallback via 'vagrant ssh -c' em {name}")
+            proc = subprocess.run(
+                ["vagrant", "ssh", name, "-c", command],
+                cwd=self.lab_dir, text=True, capture_output=True, timeout=max(60, timeout + 30)
+            )
+            if proc.stdout:
+                logger.info(proc.stdout.strip())
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"vagrant ssh retornou {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}")
+            return (proc.stdout or "").rstrip()
+        except Exception as e2:
+            logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last} | fallback: {e2}")
+            raise RuntimeError(f"SSH falhou em {name}: {last}")  # mantém mensagem original
 
     def get_ssh_fields_safe(self, name: str) -> Dict[str, str]:
         """Helper usado pela UI para exibir Host:Port mesmo que Paramiko falhe."""

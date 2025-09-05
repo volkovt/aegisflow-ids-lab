@@ -35,6 +35,7 @@ reports/
 *.zip
 *.tar
 *.tar.gz
+.meta/
 
 # Vagrant/VirtualBox
 .vagrant/

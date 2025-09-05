@@ -6,6 +6,23 @@ capture:
   rotate_size_mb: 100
   zeek_rotate_seconds: 3600
 actions:
+  - name: "Preparar APT + ferramentas no atacante"
+    host: attacker
+    run: |
+      set -euo pipefail
+      unalias rm 2>/dev/null || true
+      cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
+      printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
+      apt-get clean
+      command rm -rf /var/lib/apt/lists/*
+      apt-get update || true
+      apt-get install -y --reinstall kali-archive-keyring || true
+      apt-get update -o Acquire::AllowInsecureRepositories=true || true
+      apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
+      apt-get update
+      apt-get install -y --no-install-recommends nmap hydra slowhttptest curl jq
+      nmap --version && hydra -h >/dev/null && slowhttptest -h >/dev/null || true
+      curl --version && jq --version
   - name: "nmap_scan"
     params:
       output: "exp_scan.nmap"

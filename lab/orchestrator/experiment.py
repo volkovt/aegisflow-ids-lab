@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 logger = logging.getLogger("[Experiment]")
 
@@ -12,17 +12,35 @@ class CapturePlan:
 
     @classmethod
     def with_defaults(cls):
-        return cls()
+        try:
+            return cls()
+        except Exception as e:
+            logger.error(f"[Experiment] Falha ao criar CapturePlan padrão: {e}")
+            raise
 
 @dataclass(frozen=True)
 class Experiment:
     exp_id: str
     name: str
     targets: Dict[str, Any]  # {"victim_ip":"192.168.56.20", "sensor":"sensor", "victim":"victim", "attacker":"attacker"}
-    actions: List[Any] = field(default_factory=list)  # lista de Action plugins
+    actions: Tuple[Any, ...] = field(default_factory=tuple)  # imutável
     capture_plan: CapturePlan = field(default_factory=CapturePlan.with_defaults)
 
     @classmethod
     def with_defaults(cls, exp_id: str, victim_ip: str):
-        targets = {"victim_ip": victim_ip, "sensor": "sensor", "victim": "victim", "attacker": "attacker"}
-        return cls(exp_id=exp_id, name=exp_id, targets=targets)
+        """
+        Gera um experimento mínimo com targets padrão e CapturePlan default.
+        Ideal para cenários ad-hoc, mas para execução vinda de YAML
+        prefira construir com ações e capture_plan explícitos no loader.
+        """
+        try:
+            targets = {
+                "victim_ip": victim_ip,
+                "sensor": "sensor",
+                "victim": "victim",
+                "attacker": "attacker"
+            }
+            return cls(exp_id=exp_id, name=exp_id, targets=targets)
+        except Exception as e:
+            logger.error(f"[Experiment] with_defaults falhou: {e}")
+            raise

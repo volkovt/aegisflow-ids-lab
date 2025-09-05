@@ -20,7 +20,7 @@ class YAMLDesignerDialog(QDialog):
         self.setWindowTitle("Designer de Experimentos (YAML)")
         self.setMinimumSize(800, 600)
         self.current_path = Path(initial_path) if initial_path else None
-        self.experiments_dir = Path(experiments_dir) if experiments_dir else Path.cwd() / "experiments"
+        self.experiments_dir = Path(experiments_dir) if experiments_dir else Path.cwd() / "lab" / "experiments"
         self.experiments_dir.mkdir(parents=True, exist_ok=True)
 
         self._build_ui()
