@@ -420,7 +420,7 @@ class MainWindow(QWidget):
         b_halt.clicked.connect(lambda: self._run_vagrant(self.vagrant.halt, name, b_halt, "Halt…", "Halt"))
         b_destroy.clicked.connect(
             lambda: self._run_vagrant(self.vagrant.destroy, name, b_destroy, "Destroy…", "Destroy"))
-        b_ssh.clicked.connect(lambda: self._ssh(name))
+        b_ssh.clicked.connect(lambda: self._ssh(name, b_ssh))
 
         w.statusDot = status
         w.pills = {"so": pill_so, "host": pill_host, "guest": pill_guest}
@@ -513,23 +513,49 @@ class MainWindow(QWidget):
         self._keep_worker(worker, tag=f"vagrant:{fn.__name__}")
         worker.start()
 
-    def _ssh(self, name: str):
-        try:
-            st = self.vagrant.status_by_name(name)
-            if st != "running":
-                self._append_log(f"[WARN] {name} não está 'running' (rode: vagrant up {name}).")
-                return
-
+    def _ssh(self, name: str, btn: QPushButton | None = None):
+        """
+        Abre o SSH da VM em uma thread (Worker) para não travar a UI.
+        Faz as validações mínimas (running + wait_ssh_ready) e chama o SSHManager.
+        """
+        def gen():
             try:
-                self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
-            except Exception as e:
-                self._append_log(f"[WARN] SSH ainda não pronto em {name}: {e}")
-                return
+                yield f"[SSH] Preparando {name}…"
+                st = self.vagrant.status_by_name(name)
+                if st != "running":
+                    yield f"[WARN] {name} não está 'running' (rode: vagrant up {name})."
+                    return "skip"
 
-            self._append_log(f"Abrindo terminal SSH externo para {name}...")
-            self.ssh.open_external_terminal(name)
+                try:
+                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
+                    yield f"[SSH] {name} com SSH pronto."
+                except Exception as e:
+                    yield f"[WARN] SSH ainda não pronto em {name}: {e}"
+                    return "skip"
+
+                yield f"Abrindo terminal SSH externo para {name}…"
+                try:
+                    self.ssh.open_external_terminal(name)
+                    return "ok"
+                except Exception as e:
+                    yield f"[ERRO] Falha ao abrir SSH externo: {e}"
+                    return "error"
+            except Exception as e:
+                yield f"[ERRO] SSH {name}: {e}"
+                return "error"
+
+        try:
+            worker = Worker(gen)
+            worker.line.connect(self._append_log)
+            worker.error.connect(lambda msg: self._append_log(f"[ERRO] SSH {name}: {msg}"))
+
+            if btn is not None:
+                self._wire_button_with_worker(btn, worker, "SSH", "SSH")
+
+            self._keep_worker(worker, tag=f"ssh:{name}")
+            worker.start()
         except Exception as e:
-            self._append_log(f"Falha ao abrir SSH externo: {e}")
+            self._append_log(f"[ERRO] _ssh: {e}")
 
     def on_write(self):
         try:

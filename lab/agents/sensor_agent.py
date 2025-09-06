@@ -1,4 +1,3 @@
-import time
 import logging
 
 logger = logging.getLogger("[SensorAgent]")
@@ -68,22 +67,25 @@ class SensorAgent:
 
     def ensure_tools(self):
         """
-        Instala tcpdump e tenta Zeek quando disponível no repositório.
-        Se Zeek não existir (Candidate: none), segue PCAP-only sem quebrar o fluxo.
+        Instala tcpdump/jq/curl e tenta Zeek quando houver Candidate.
+        Se Zeek estiver fora do PATH (ex.: /opt/zeek/bin/zeek), ajusta PATH e cria symlink.
         """
         try:
-            logger.info("[Sensor] Instalando tcpdump e avaliando Zeek...")
+            logger.info("[Sensor] Instalando tcpdump/jq/curl e avaliando Zeek...")
             self.ssh.run("sensor", "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y", timeout_s=240)
-            self.ssh.run("sensor", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump", timeout_s=300)
+            self.ssh.run(
+                "sensor",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump jq curl",
+                timeout_s=300
+            )
 
-            # Verifica se há 'zeek' disponível no repo
+            # Verifica Candidate do zeek e tenta instalar por APT
             try:
                 cand = self.ssh.run(
                     "sensor",
-                    "bash -lc \"apt-cache policy zeek | awk '/Candidate:/ {print $2}'\"",
-                    timeout_s=15
-                )
-                cand = (cand or "").strip()
+                    r"bash -lc ""apt-cache policy zeek | awk '/Candidate:/ {print $2}'""",
+                    timeout_s=10
+                ).strip()
             except Exception:
                 cand = ""
 
@@ -94,18 +96,76 @@ class SensorAgent:
                         "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zeek",
                         timeout_s=600
                     )
-                    self.ssh.run("sensor", "bash -lc 'command -v zeek'", timeout_s=10)
-                    self.zeek_ok = True
-                    logger.info("[Sensor] Zeek instalado e disponível.")
                 except Exception as e:
-                    self.zeek_ok = False
-                    logger.warning(f"[Sensor] Zeek indisponível ({e}) — seguiremos apenas com PCAP.")
+                    logger.warning(f"[Sensor] Falha instalando Zeek por APT (seguindo): {e}")
+
+            # Fallback: Zeek do OBS em /opt/zeek/bin (ajusta PATH e symlink)
+            self.ssh.run(
+                "sensor",
+                r"bash -lc 'if [ -x /opt/zeek/bin/zeek ]; then "
+                r"echo export PATH=/opt/zeek/bin:\$PATH | sudo tee /etc/profile.d/zeek.sh >/dev/null; "
+                r"sudo chmod +x /etc/profile.d/zeek.sh; "
+                r"sudo ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek || true; "
+                r"hash -r || true; "
+                r"fi'",
+                timeout_s=20
+            )
+
+            # Sinaliza disponibilidade (PATH ou /opt)
+            z = self.ssh.run(
+                "sensor",
+                "bash -lc 'command -v zeek || { [ -x /opt/zeek/bin/zeek ] && echo /opt/zeek/bin/zeek; }'",
+                timeout_s=10
+            ).strip()
+            self.zeek_ok = bool(z)
+            if self.zeek_ok:
+                logger.info(f"[Sensor] Zeek disponível: {z}")
             else:
-                self.zeek_ok = False
-                logger.info("[Sensor] Repositório sem 'zeek' (Candidate: none). Seguindo com PCAP. "
-                            "Dica: habilite o repo oficial do Zeek se quiser logs em tempo real.")
+                logger.info("[Sensor] Zeek ausente — seguiremos PCAP-only.")
+
+            # Pastas do pipeline
+            self.ssh.run("sensor", "sudo mkdir -p /var/log/pcap /var/log/zeek", timeout_s=10)
+
         except Exception as e:
             logger.error(f"[Sensor] Erro instalando ferramentas: {e}")
+            raise
+
+    def arm_capture(self, rotate_sec: int = 300, rotate_mb: int = 100, zeek_rotate_sec: int = 3600):
+        """
+        Arma captura com rotação (tcpdump) e, se disponível, Zeek em tempo real.
+        """
+        iface = self._iface()
+        try:
+            logger.info(f"[Sensor] Ligando captura (iface={iface})...")
+            self.ssh.run(
+                "sensor",
+                f"nohup bash -lc \"tcpdump -i {iface} -w /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap -G {rotate_sec} -C {rotate_mb} -n\" >/dev/null 2>&1 &",
+                timeout_s=8
+            )
+
+            # pequeno grace-period
+            try:
+                import time as _t
+                _t.sleep(3)
+            except Exception:
+                pass
+
+            if self.zeek_ok:
+                zeek_cmd = (
+                    "bash -lc 'export ZEEK_LOG_DIR=/var/log/zeek; "
+                    "ZEEKBIN=$(command -v zeek || echo /opt/zeek/bin/zeek); "
+                    f"\"$ZEEKBIN\" -i {iface} Log::default_rotation_interval={zeek_rotate_sec}'"
+                )
+                self.ssh.run(
+                    "sensor",
+                    f"nohup {zeek_cmd} >/dev/null 2>&1 &",
+                    timeout_s=8
+                )
+                logger.info("[Sensor] Zeek em tempo real armado.")
+            else:
+                logger.info("[Sensor] Zeek ausente — apenas PCAP ativo.")
+        except Exception as e:
+            logger.error(f"[Sensor] Erro ao armar captura: {e}")
             raise
 
     # ---------------------------
@@ -123,41 +183,6 @@ class SensorAgent:
             f"nohup {start_cmd} >/dev/null 2>&1 & echo $! | sudo tee {pidfile} >/dev/null\""
         )
         return self.ssh.run(host, sh, timeout_s=timeout_s)
-
-    def arm_capture(self, rotate_sec=300, rotate_mb=100, zeek_rotate_sec=3600):
-        """
-        Arma captura com rotação de PCAP e, se disponível, Zeek em tempo real.
-        - PCAP: /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap (-G rotate_sec, -C rotate_mb)
-        - ZEEK: /var/log/zeek (Log::default_rotation_interval=zeek_rotate_sec)
-        """
-        iface = self._iface()
-        try:
-            logger.info(f"[Sensor] Ligando captura em {iface} (tcpdump com rotação)...")
-            self.ssh.run("sensor", "sudo mkdir -p /var/log/pcap /var/log/zeek", timeout_s=10)
-
-            # Inicia tcpdump e grava PID de forma correta
-            tcpdump_cmd = f"tcpdump -i {iface} -w /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap -G {rotate_sec} -C {rotate_mb} -n"
-            self._spawn_with_pidfile("sensor", tcpdump_cmd, "/var/run/tcc_tcpdump.pid", timeout_s=10)
-
-            # Grace period para primeiro arquivo aparecer
-            time.sleep(3)
-
-            if self.zeek_ok:
-                zeek_cmd = f"bash -lc 'export ZEEK_LOG_DIR=/var/log/zeek; zeek -i {iface} Log::default_rotation_interval={zeek_rotate_sec}'"
-                # Observação: o 'bash -lc' acima faz parte do comando do Zeek (para export do env).
-                # Aqui embrulhamos em um 'sh -c' para manter o mesmo padrão de nohup + $! correto.
-                self._spawn_with_pidfile(
-                    "sensor",
-                    f"sh -c {repr(zeek_cmd)}",
-                    "/var/run/tcc_zeek.pid",
-                    timeout_s=10
-                )
-                logger.info("[Sensor] Zeek em tempo real armado.")
-            else:
-                logger.info("[Sensor] Zeek ausente — apenas PCAP ativo.")
-        except Exception as e:
-            logger.error(f"[Sensor] Erro ao armar captura: {e}")
-            raise
 
     def stop_capture(self):
         """

@@ -1,4 +1,5 @@
 import logging, time, json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -95,17 +96,32 @@ class _StreamWorker(QThread):
     line = Signal(str)
     finished_ok = Signal()
     error = Signal(str)
+
     _seq = 0
-    def __init__(self, ssh, host: str, cmd: str, timeout_s: int = 600):
+
+    def __init__(self, ssh, host, cmd, timeout_s=120):
         super().__init__()
         _StreamWorker._seq += 1
         self.id = f"StreamWorker#{_StreamWorker._seq}"
+
         self.ssh = ssh
         self.host = host
         self.cmd = cmd
         self.timeout_s = timeout_s
         self._stop_flag = False
-        logger.warning(f"[Guide][{self.id}] criado host={host} timeout={timeout_s} cmd={cmd[:120]}...")
+        self._last_rc = None  # armazena o exit code observado
+
+    def _emit_chunk(self, text: str):
+        if not text:
+            return
+        self.line.emit(text)
+        # Captura do sentinela [guide] __RC=<n>
+        m = re.search(r"\[guide\]\s*__RC=(\d+)", text)
+        if m:
+            try:
+                self._last_rc = int(m.group(1))
+            except Exception:
+                self._last_rc = 1
 
     def stop(self):
         self._stop_flag = True
@@ -113,57 +129,39 @@ class _StreamWorker(QThread):
 
     def run(self):
         try:
-            _here(f"{self.id}.run:start")
-            logger.warning(f"[Guide][{self.id}] streaming em {self.host}: {self.cmd}")
+            # Encapa para sempre imprimir o exit code no final do stream
+            wrapped = "{ " + self.cmd + " ; } ; rc=$?; printf \"\\n[guide] __RC=%s\\n\" \"$rc\"; exit $rc"
+
             if hasattr(self.ssh, "run_command_stream"):
-                try:
-                    for chunk in self.ssh.run_command_stream(self.host, self.cmd, timeout_s=self.timeout_s):
-                        if self._stop_flag:
-                            logger.warning(f"[Guide][{self.id}] interrompido por stop_flag")
-                            break
-                        self._emit_chunk(chunk)
-                except Exception as e:
-                    logger.warning(f"[Guide][{self.id}] run_command_stream indisponível: {e}")
-                    self._run_no_stream()
-            elif hasattr(self.ssh, "run_command_cancellable"):
+                for chunk in self.ssh.run_command_stream(self.host, wrapped, timeout_s=self.timeout_s):
+                    if self._stop_flag:
+                        break
+                    self._emit_chunk(chunk)
+            else:
                 self._run_no_stream()
-            elif hasattr(self.ssh, "run_command"):
-                self._run_no_stream(use_classic=True)
-            else:
-                raise RuntimeError("SSHManager sem run_command[_stream|_cancellable].")
 
-            if not self._stop_flag:
-                _here(f"{self.id}.run:finished_ok")
-                self.finished_ok.emit()
         except Exception as e:
-            logger.error(f"[Guide][{self.id}] streaming falhou: {e}", exc_info=True)
             self.error.emit(str(e))
-        finally:
-            _here(f"{self.id}.run:end")
+            return
 
-    def _emit_chunk(self, chunk):
-        try:
-            if isinstance(chunk, str):
-                self.line.emit(chunk.rstrip("\n"))
-            elif isinstance(chunk, tuple) and len(chunk) >= 2:
-                kind, text = chunk[0], chunk[1]
-                tag = "stdout" if str(kind).lower().startswith("out") else "stderr"
-                self.line.emit(f"[{tag}] {str(text).rstrip()}")
-            elif isinstance(chunk, dict):
-                text = chunk.get("text") or chunk.get("data") or ""
-                tag  = chunk.get("stream") or chunk.get("kind") or "out"
-                tag  = "stdout" if str(tag).lower().startswith("out") else "stderr"
-                self.line.emit(f"[{tag}] {str(text).rstrip()}")
-            else:
-                self.line.emit(str(chunk).rstrip())
-        except Exception as e:
-            logger.warning(f"[Guide][{self.id}] emit_chunk erro: {e}")
+        if self._stop_flag:
+            self.error.emit("Cancelado")
+            return
+
+        rc = 0 if self._last_rc is None else self._last_rc
+        if rc != 0:
+            self.error.emit(f"Comando falhou (rc={rc})")
+            return
+
+        self.finished_ok.emit()
 
     def _run_no_stream(self, use_classic: bool = False):
         logger.warning(f"[Guide][{self.id}] fallback _run_no_stream classic={use_classic}")
-        out = ( self.ssh.run_command(self.host, f"bash -lc '{self.cmd}'", timeout=self.timeout_s)
-                if use_classic else
-                self.ssh.run_command_cancellable(self.host, self.cmd, timeout_s=self.timeout_s) )
+        out = (
+            self.ssh.run_command(self.host, f"bash -lc '{self.cmd}'", timeout=self.timeout_s)
+            if use_classic else
+            self.ssh.run_command_cancellable(self.host, self.cmd, timeout_s=self.timeout_s)
+        )
         self._emit_block_output(out)
 
     def _emit_block_output(self, out: Any):
@@ -172,16 +170,22 @@ class _StreamWorker(QThread):
             if out is None:
                 return
             if isinstance(out, str):
-                for line in out.splitlines(): self.line.emit(line); return
+                for line in out.splitlines():
+                    self.line.emit(line)
+                return
             if isinstance(out, tuple) and len(out) >= 2:
                 stdout, stderr = out[0] or "", out[1] or ""
-                for line in str(stdout).splitlines(): self.line.emit(f"[stdout] {line}")
-                for line in str(stderr).splitlines(): self.line.emit(f"[stderr] {line}")
+                for line in str(stdout).splitlines():
+                    self.line.emit(f"[stdout] {line}")
+                for line in str(stderr).splitlines():
+                    self.line.emit(f"[stderr] {line}")
                 return
             if isinstance(out, dict):
-                stdout, stderr = out.get("stdout",""), out.get("stderr","")
-                for line in str(stdout).splitlines(): self.line.emit(f"[stdout] {line}")
-                for line in str(stderr).splitlines(): self.line.emit(f"[stderr] {line}")
+                stdout, stderr = out.get("stdout", ""), out.get("stderr", "")
+                for line in str(stdout).splitlines():
+                    self.line.emit(f"[stdout] {line}")
+                for line in str(stderr).splitlines():
+                    self.line.emit(f"[stderr] {line}")
                 return
             self.line.emit(str(out))
         except Exception as e:
@@ -241,7 +245,7 @@ class StepCard(QFrame):
         self.status = QLabel("A fazer")
         self.status.setObjectName("GuideStatus")
 
-        btn_copy.clicked.connect(lambda: self._on_copy(cmd))
+        btn_copy.clicked.connect(lambda: self._on_copy(cmd_box.toPlainText()))
         btn_run.clicked.connect(lambda: self._emit_run(self.step))
         btn_done.clicked.connect(lambda: self._on_done())
 
@@ -263,15 +267,20 @@ class StepCard(QFrame):
         logger.warning(f"[Guide][{self.cid}] RUN clicado step_id={step.get('id')} host={step.get('host')}")
         self.run_clicked.emit(step)
 
-    def _on_copy(self, cmd: str):
+    def _on_copy(self, text: str):
         try:
-            logger.warning(f"[Guide][{self.cid}] COPY clicado")
-            cb: QClipboard = QGuiApplication.clipboard()
-            cb.setText(cmd or "", mode=cb.Clipboard)
+            payload = (text or "").strip()
+            cb = QGuiApplication.clipboard()
+            cb.setText(payload, mode=QClipboard.Clipboard)
+            try:
+                cb.setText(payload, mode=QClipboard.Selection)
+            except Exception:
+                pass
             self.status.setText("Copiado ✓")
+            logger.info(f"[Guide] Comando copiado ({len(payload)} chars).")
         except Exception as e:
-            logger.warning(f"[Guide][{self.cid}] copiar cmd falhou: {e}")
-            self.status.setText("Falha ao copiar")
+            self.status.setText("Falha ao copiar ✖")
+            logger.error(f"[Guide] Falha ao copiar comando: {e}")
 
     def _on_done(self):
         logger.warning(f"[Guide][{self.cid}] DONE marcado")
@@ -316,8 +325,14 @@ class ExperimentGuideDialog(QDialog):
             logger.warning(f"[Guide] _apply_window_flags erro: {e}")
 
         _here("Dialog.__init__:start")
+
         self.setObjectName("GuideDialog")
-        self.yaml_path = yaml_path
+        try:
+            self.yaml_path = str(Path(yaml_path).resolve())
+        except Exception as e:
+            logger.warning(f"[Guide] resolve do yaml_path falhou: {e}")
+            self.yaml_path = yaml_path
+
         self.ssh = ssh
         self.vagrant = vagrant
         self.lab_dir = Path(lab_dir)
@@ -415,9 +430,13 @@ class ExperimentGuideDialog(QDialog):
         self.lbl_title.setObjectName("GuideHeader")
         self.lbl_yaml = QLabel(Path(self.yaml_path).name)
         self.lbl_yaml.setObjectName("GuideYaml")
+        self.lbl_yaml.setToolTip(self.yaml_path)
+        self.btn_reload = QPushButton("Recarregar (oficial)")
+        self.btn_reload.clicked.connect(self._reload_official)
         header.addWidget(self.lbl_title)
         header.addStretch(1)
         header.addWidget(self.lbl_yaml)
+        header.addWidget(self.btn_reload)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -479,6 +498,16 @@ class ExperimentGuideDialog(QDialog):
             logger.warning(f"[Guide] animação falhou: {e}")
 
         _here("Dialog._build_ui:end")
+
+    def _reload_official(self):
+        try:
+            logger.warning("[Guide] Recarregar oficial solicitado")
+            self._ignore_loader_results = False
+            self._rendered_real = False
+            self.lbl_footer.setText("Recarregando (parser oficial)…")
+            self._load_steps_async()
+        except Exception as e:
+            logger.error(f"[Guide] reload oficial falhou: {e}")
 
     # -----------------------------
     # Runner (dataset) — NOVO
@@ -548,7 +577,7 @@ class ExperimentGuideDialog(QDialog):
     def _load_steps_async(self):
         _here("Dialog._load_steps_async:start")
         def job():
-            logger.warning("[Guide][Loader] parse_yaml_to_steps chamado (oficial)")
+            logger.warning(f"[Guide][Loader] parse_yaml_to_steps (oficial) yaml={self.yaml_path}")
             return parse_yaml_to_steps(self.yaml_path, self.ssh, self.vagrant)
         w = _FnWorker(job)
         self._loader_worker = w
@@ -581,7 +610,8 @@ class ExperimentGuideDialog(QDialog):
             }]
         self._render_steps(steps, replace=True)
         self._rendered_fallback = True
-        self.lbl_footer.setText("Fallback simples ativo — aguardando parser oficial (UI livre).")
+        self._ignore_loader_results = True
+        self.lbl_footer.setText("Fallback ativo — clique em ‘Recarregar (oficial)’ quando quiser.")
 
     def _on_loader_ok(self, steps: list[dict]):
         logger.warning(f"[Guide] Parser oficial retornou {len(steps)} passos")
@@ -690,7 +720,7 @@ class ExperimentGuideDialog(QDialog):
         w.finished.connect(lambda: (self._on_step_final(card, step), self._cleanup_worker(w)))
         self._keep_worker(w)
         self.lbl_footer.setText(f"Executando passo em {host}…")
-        logger.warning(f"[Guide] iniciando {w.id}")
+        logger.warning(f"[Guide] iniciando {getattr(w, 'id', '_StreamWorker')}")
         w.start()
 
     def _on_step_done(self, card: StepCard | None, step: dict, ok: bool):

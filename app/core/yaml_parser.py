@@ -73,20 +73,62 @@ def _steps_header() -> list[dict]:
 
 def _step_attacker_prepare_tools() -> dict:
     """
-    Kali (attacker): repara keyring e instala ferramentas de ataque.
+    Kali (attacker): replica o fluxo que funcionou no bash para destravar NO_PUBKEY/404 e
+    instalar ferramentas. Inclui:
+      - sources.list com signed-by e non-free-firmware
+      - limpeza de índices (sem prompt do zsh)
+      - update normal + update permissivo para reinstalar keyring
+      - fallback de chave via curl+gpg
+      - update final normal
+      - instalação dos pacotes e verificação de versões
     """
     cmd = r"""bash -lc '
-set -e
-sudo apt-get update || true
-sudo apt-get install -y --reinstall kali-archive-keyring || true
-sudo apt-get update -y
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nmap hydra slowhttptest curl jq
-echo "[attacker] ferramentas instaladas"
-'"""
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        
+        # Evita prompt do zsh no rm
+        unalias rm 2>/dev/null || true
+        
+        # 1) sources.list moderno com signed-by e non-free-firmware
+        cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
+        printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
+        
+        # 2) limpar índices antigos
+        apt-get clean
+        command rm -rf /var/lib/apt/lists/*
+        
+        # 3) tentativa normal de update + reinstalar keyring (pode falhar na 1ª vez)
+        apt-get update || true
+        apt-get install -y --reinstall kali-archive-keyring || true
+        
+        # 4) update permissivo + reinstalar keyring sem autenticação (quebra NO_PUBKEY)
+        apt-get update -o Acquire::AllowInsecureRepositories=true || true
+        apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
+
+        # 5) fallback extra: grava a chave direto via curl+gpg (se disponíveis)
+        if command -v curl >/dev/null 2>&1; then
+          curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor > /usr/share/keyrings/kali-archive-keyring.gpg || true
+        fi
+        
+        # tenta instalar netcat-traditional (pode falhar se o keyring não estiver ok)
+        apt-get install -y --no-install-recommends netcat-traditional || true
+        
+        # 6) update final (verificação normal)
+        apt-get update -y
+        
+        # 7) instala ferramentas e mostra versões
+        apt-get install -y --no-install-recommends nmap hydra slowhttptest curl jq
+        echo "[attacker] Ferramentas instaladas/ok:"
+        nmap --version | head -1 || true
+        hydra -h | head -1 || true
+        slowhttptest -h | head -1 || true
+        curl --version | head -1 || true
+        jq --version || true
+        '"""
     return {
         "id": "attacker_prepare",
         "title": "Preparar atacante (Kali): keyring + ferramentas",
-        "description": "Reinstala keyring do Kali, atualiza índices e instala nmap/hydra/slowhttptest.",
+        "description": "Corrige keyring/repos (signed-by, non-free-firmware) e instala nmap/hydra/slowhttptest/curl/jq.",
         "host": "attacker",
         "command": cmd,
         "tags": ["infra", "tools"],
@@ -95,26 +137,42 @@ echo "[attacker] ferramentas instaladas"
     }
 
 
+
 def _step_sensor_prepare_tools() -> dict:
     """
     Sensor: garante tcpdump e tenta instalar Zeek se houver Candidate disponível.
+    Se o Zeek estiver instalado via OBS em /opt/zeek/bin/zeek, ajusta PATH e cria symlink.
     """
     cmd = r"""bash -lc '
-set -e
-sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump
-cand=$(apt-cache policy zeek | awk "/Candidate:/ {print $2}")
-if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zeek || true
-  command -v zeek >/dev/null 2>&1 && echo "ZEEK_OK" || echo "ZEEK_SKIP"
-else
-  echo "ZEEK_SKIP"
-fi
-'"""
+        set -e
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump jq curl || true
+        
+        # 1) Tenta via repositório nativo se existir Candidate
+        cand=$(apt-cache policy zeek | awk "/Candidate:/ {print $2}")
+        if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zeek || true
+        fi
+        
+        # 2) Fallback de PATH/symlink: Zeek do OBS em /opt/zeek/bin/zeek
+        if [ -x /opt/zeek/bin/zeek ]; then
+          echo "[sensor] >>> ajustando PATH para /opt/zeek/bin (OBS)"
+          echo "export PATH=/opt/zeek/bin:$PATH" | sudo tee /etc/profile.d/zeek.sh >/dev/null
+          sudo chmod +x /etc/profile.d/zeek.sh
+          sudo ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek || true
+          hash -r || true
+        fi
+        
+        echo "[sensor] >>> versões:"
+        tcpdump --version | head -1 || true
+        (command -v zeek >/dev/null 2>&1 && zeek --version) || (/opt/zeek/bin/zeek --version || true)
+        jq --version || true
+        curl --version | head -1 || true
+    '"""
     return {
         "id": "sensor_prepare",
         "title": "Preparar sensor: tcpdump (+Zeek se disponível)",
-        "description": "Instala tcpdump e tenta Zeek; segue PCAP-only se Zeek não estiver no repo.",
+        "description": "Instala tcpdump e tenta Zeek; se o binário existir em /opt/zeek/bin, ajusta PATH/symlink.",
         "host": "sensor",
         "command": cmd,
         "tags": ["infra", "tools"],
@@ -122,6 +180,99 @@ fi
         "artifacts": [],
     }
 
+def _step_attacker_tools_check() -> dict:
+    """
+    Verifica se as ferramentas do atacante estão acessíveis no PATH e exibe versões.
+    Falha o step (exit!=0) se encontrar ausências — útil para destacar em vermelho.
+    """
+    cmd = r"""bash -lc '
+        set -e
+        missing=0
+        check_ver () {
+          bin="$1"
+          if command -v "$bin" >/dev/null 2>&1; then
+            # tenta --version, se não houver cai no -h
+            ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
+          else
+            echo "[MISSING] $bin"
+            missing=$((missing+1))
+          fi
+        }
+        
+        echo "[attacker] >>> checando ferramentas:"
+        for b in nmap hydra slowhttptest curl jq; do
+          check_ver "$b"
+        done
+        
+        # se algo faltou, retorna código != 0 para marcar o step como falho
+        if [ $missing -ne 0 ]; then
+          echo "[attacker] >>> faltando $missing ferramenta(s)."
+          exit $missing
+        fi
+        echo "[attacker] >>> OK"
+    '"""
+    return {
+        "id": "attacker_tools_check",
+        "title": "Verificar ferramentas no attacker",
+        "description": "Confere nmap/hydra/slowhttptest/curl/jq e mostra versões.",
+        "host": "attacker",
+        "command": cmd,
+        "tags": ["infra", "verify"],
+        "eta": "~5-10s",
+        "artifacts": [],
+    }
+
+
+def _step_sensor_tools_check() -> dict:
+    """
+    Verifica tcpdump/jq/curl e o Zeek (via PATH ou /opt/zeek/bin/zeek).
+    Falha o step (exit!=0) se encontrar ausências.
+    """
+    cmd = r"""bash -lc '
+        set -e
+        missing=0
+        
+        check_ver () {
+          bin="$1"
+          if command -v "$bin" >/dev/null 2>&1; then
+            ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
+          else
+            echo "[MISSING] $bin"
+            missing=$((missing+1))
+          fi
+        }
+        
+        echo "[sensor] >>> checando ferramentas:"
+        check_ver tcpdump
+        check_ver jq
+        check_ver curl
+        
+        # Zeek: PATH ou /opt/zeek/bin/zeek
+        if command -v zeek >/dev/null 2>&1; then
+          zeek --version
+        elif [ -x /opt/zeek/bin/zeek ]; then
+          /opt/zeek/bin/zeek --version
+        else
+          echo "[MISSING] zeek"
+          missing=$((missing+1))
+        fi
+        
+        if [ $missing -ne 0 ]; then
+          echo "[sensor] >>> faltando $missing ferramenta(s)."
+          exit $missing
+        fi
+        echo "[sensor] >>> OK"
+    '"""
+    return {
+        "id": "sensor_tools_check",
+        "title": "Verificar ferramentas no sensor",
+        "description": "Confere tcpdump/jq/curl/zeek (também em /opt/zeek/bin) e mostra versões.",
+        "host": "sensor",
+        "command": cmd,
+        "tags": ["infra", "verify"],
+        "eta": "~5-10s",
+        "artifacts": [],
+    }
 
 def _step_connectivity_check(ips: dict) -> dict:
     """
@@ -129,12 +280,12 @@ def _step_connectivity_check(ips: dict) -> dict:
     """
     victim = ips.get("victim", "192.168.56.20")
     cmd = rf"""bash -lc '
-set -e
-ping -c 2 {victim} || true
-nc -zv {victim} 22 || true
-nc -zv {victim} 80 || true
-echo "[check] conectividade básica testada"
-'"""
+        set -e
+        ping -c 2 {victim} || true
+        nc -zv {victim} 22 || true
+        nc -zv {victim} 80 || true
+        echo "[check] conectividade básica testada"
+        '"""
     return {
         "id": "connectivity",
         "title": "Checagem de conectividade com a vítima",
@@ -182,11 +333,11 @@ def _step_hydra_wordlists(cfg: dict) -> dict:
     pwds_escaped  = "\\n".join(str(p) for p in pwds_inline)
 
     cmd = rf"""bash -lc '
-set -e
-test -f ~/users.txt    || echo -e "{users_escaped}" | tee ~/users.txt >/dev/null
-test -f ~/passwords.txt|| echo -e "{pwds_escaped}" | tee ~/passwords.txt >/dev/null
-wc -l ~/users.txt ~/passwords.txt || true
-'"""
+        set -e
+        test -f ~/users.txt    || echo -e "{users_escaped}" | tee ~/users.txt >/dev/null
+        test -f ~/passwords.txt|| echo -e "{pwds_escaped}" | tee ~/passwords.txt >/dev/null
+        wc -l ~/users.txt ~/passwords.txt || true
+    '"""
     return {
         "id": "hydra_lists",
         "title": "Gerar listas de usuários/senhas (Hydra)",
@@ -222,13 +373,13 @@ def _step_sensor_capture(cfg: dict) -> dict:
 
 def _step_sensor_health() -> dict:
     cmd = r"""bash -lc '
-echo "[health] processos relevantes:"
-pgrep -fa "tcpdump -i" || true
-pgrep -fa "zeek -i" || true
-echo "[health] últimos arquivos:"
-ls -lh /var/log/pcap/*.pcap 2>/dev/null | tail -n 5 || true
-ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 5 || true
-'"""
+        echo "[health] processos relevantes:"
+        pgrep -fa "tcpdump -i" || true
+        pgrep -fa "zeek -i" || true
+        echo "[health] últimos arquivos:"
+        ls -lh /var/log/pcap/*.pcap 2>/dev/null | tail -n 5 || true
+        ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 5 || true
+    '"""
     return {
         "id": "sensor_health",
         "title": "Verificar saúde da captura (Sensor)",
@@ -243,11 +394,11 @@ ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 5 || true
 
 def _step_sensor_stop() -> dict:
     cmd = r"""bash -lc '
-for p in /var/run/tcc_*.pid; do [ -f "$p" ] && sudo kill "$(cat "$p")" 2>/dev/null || true; done
-sudo pkill -f "tcpdump -i" || true
-sudo pkill -f "zeek -i"    || true
-echo "[sensor] captura desligada"
-'"""
+        for p in /var/run/tcc_*.pid; do [ -f "$p" ] && sudo kill "$(cat "$p")" 2>/dev/null || true; done
+        sudo pkill -f "tcpdump -i" || true
+        sudo pkill -f "zeek -i"    || true
+        echo "[sensor] captura desligada"
+    '"""
     return {
         "id": "sensor_stop",
         "title": "Desligar captura no Sensor (opcional)",
@@ -490,6 +641,8 @@ def parse_yaml_to_steps(yaml_path: str, ssh, vagrant) -> list[dict]:
     # Infra mínima: preparar tools e validadores
     steps.append(_step_attacker_prepare_tools())
     steps.append(_step_sensor_prepare_tools())
+    steps.append(_step_attacker_tools_check())
+    steps.append(_step_sensor_tools_check())
 
     # Captura viva no sensor (default: ligado se houver 'capture' ou 'sensor.enable')
     if "capture" in cfg or (cfg.get("sensor", {}).get("enable", True)):

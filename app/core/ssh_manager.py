@@ -1,6 +1,7 @@
 import base64
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -14,6 +15,9 @@ import logging
 logger = logging.getLogger("[SSHManager]")
 
 _CONNECT_GATE = threading.BoundedSemaphore(value=2)
+
+def _null_device() -> str:
+    return "NUL" if os.name == "nt" else "/dev/null"
 
 class SSHManager:
     def __init__(self, lab_dir: Path):
@@ -152,20 +156,49 @@ class SSHManager:
         return result
 
     def open_external_terminal(self, name: str) -> None:
+        """
+        Abre um terminal externo já conectado via SSH na VM.
+        Windows: chama 'wt.exe new-tab' diretamente (sem 'start') e
+        faz fallback para 'cmd.exe /k'. Em Unix mantém o fluxo atual.
+        """
         try:
             f = self.get_ssh_fields(name)
             host = f["HostName"]
             port = f["Port"]
             user = f["User"]
-            key = f["IdentityFile"]
+            key  = f["IdentityFile"]
 
-            cmd = [
-                "cmd.exe", "/c",
-                f'start "" cmd.exe /k ssh -p {port} -i "{key}" {user}@{host} '
-                f'-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-            ]
-            logger.info(f"[SSHManager] Abrindo terminal externo: {' '.join(cmd)}")
-            subprocess.Popen(cmd, cwd=self.lab_dir)
+            known_hosts = _null_device()
+            ssh_cmd = f'ssh -p {port} -i "{key}" {user}@{host} ' \
+                      f'-o StrictHostKeyChecking=no -o UserKnownHostsFile={known_hosts}'
+            logger.warning(f"[SSHManager] Comando SSH para terminal externo: {ssh_cmd}")
+            logger.warning(f"[SSHManager] Diretório do laboratório: {self.lab_dir}")
+
+            if os.name == "nt":
+                creation = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                wt = shutil.which("wt.exe")
+
+                if wt:
+                    args = [wt, "new-tab", "-d", str(self.lab_dir), "cmd.exe", "/k", ssh_cmd]
+                    logger.warning(f"[SSHManager] Abrindo terminal externo (Win/WT): {' '.join(args)}")
+                    subprocess.Popen(args, creationflags=creation)
+                else:
+                    args = ["cmd.exe", "/k", ssh_cmd]
+                    logger.warning(f"[SSHManager] Abrindo terminal externo (Win/CMD): {' '.join(args)}")
+                    subprocess.Popen(args, cwd=str(self.lab_dir), creationflags=creation)
+            else:
+                term = (shutil.which("x-terminal-emulator")
+                        or shutil.which("gnome-terminal")
+                        or shutil.which("konsole")
+                        or shutil.which("xterm"))
+                if term and "gnome-terminal" in term:
+                    args = [term, "--", "bash", "-lc", ssh_cmd]
+                elif term and "konsole" in term:
+                    args = [term, "-e", f"bash -lc '{ssh_cmd}'"]
+                else:
+                    args = ["bash", "-lc", ssh_cmd]
+                logger.warning(f"[SSHManager] Abrindo terminal externo (Unix): {' '.join(args)}")
+                subprocess.Popen(args, cwd=str(self.lab_dir))
         except Exception as e:
             logger.error(f"[SSHManager] Falha ao abrir terminal externo: {e}")
             raise
@@ -295,6 +328,9 @@ class SSHManager:
             logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last} | fallback: {e2}")
             raise RuntimeError(f"SSH falhou em {name}: {last}")  # mantém mensagem original
 
-    def get_ssh_fields_safe(self, name: str) -> Dict[str, str]:
-        """Helper usado pela UI para exibir Host:Port mesmo que Paramiko falhe."""
-        return self.get_ssh_fields(name)
+    def get_ssh_fields_safe(self, name: str) -> dict:
+        try:
+            return self.get_ssh_fields(name)
+        except Exception as e:
+            logger.warning(f"[SSHManager] get_ssh_fields_safe({name}) falhou: {e}")
+            return {}
