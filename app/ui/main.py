@@ -1,6 +1,7 @@
 import inspect
 import os
 import platform
+import shlex
 import subprocess
 import sys
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 from PySide6.QtGui import QCursor, Qt
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QPlainTextEdit, QGroupBox, QGridLayout, QMessageBox, QFileDialog, QProgressBar
+    QPlainTextEdit, QGroupBox, QGridLayout, QMessageBox, QFileDialog, QProgressBar, QMainWindow
 )
 from PySide6.QtCore import QTimer, Signal, QThread
 
@@ -105,6 +106,7 @@ class MainWindow(QWidget):
         super().__init__()
         self._guide_dialog = None
         self.setWindowTitle("VagrantLabUI — ML IDS Lab")
+        self._ssh_tmux_sessions = {}
         self._workers = set()
         self._workers_lock = threading.RLock()
         self.warmup = WarmupCoordinator(warmup_window_s=30)
@@ -171,11 +173,111 @@ class MainWindow(QWidget):
         self._ds_controller.finished.connect(_ds_finished)
 
         self.current_yaml_path = (self.project_root / "lab" / "experiments" / "exp_all.yaml")
+        self._yaml_selected_by_user = False
         self._ensure_experiment_presets()
 
         self._build_ui()
         self._load_theme()
 
+    def _ssh_paste(self, name: str, command: str):
+        """
+        Abre (se necessário) um terminal externo já anexado a um tmux persistente e envia `command`.
+        Agora detecta janela fechada (sem clientes anexados) e reabre automaticamente.
+        """
+        try:
+            host = (name or "attacker").strip().lower()
+            if host == "vitima":
+                host = "victim"
+
+            st = self.vagrant.status_by_name(host)
+            if st != "running":
+                self._append_log(f"[WARN] {host} não está 'running' (rode: vagrant up {host}).")
+                return
+
+            try:
+                self.vagrant.wait_ssh_ready(host, str(self.lab_dir), attempts=10, delay_s=3)
+            except Exception as e:
+                self._append_log(f"[WARN] SSH ainda não pronto em {host}: {e}")
+                return
+
+            session = f"guide_{host}"
+
+            # 1) Garante tmux instalado e sessão criada (idempotente)
+            try:
+                self.ssh.run_command(host, "which tmux || sudo apt-get update && sudo apt-get install -y tmux",
+                                     timeout=60)
+            except Exception as e:
+                self._append_log(f"[WARN] tmux não disponível em {host}: {e}")
+            try:
+                # cria se não existir; se existir, o stderr pode ter 'duplicate session' (ok)
+                self.ssh.run_command(host, f"tmux new-session -d -s {session} || true", timeout=20)
+            except Exception as e:
+                self._append_log(f"[WARN] falha ao garantir sessão tmux em {host}: {e}")
+
+            # 2) Descobre se há cliente anexado; se não houver, reabrimos o terminal
+            attached = 0
+            try:
+                out = (self.ssh.run_command(
+                    host,
+                    f'tmux display-message -p -t {session} "#{ {"session_attached"} }"',
+                    timeout=8
+                ) or "").strip()
+                # Fallback caso a forma acima não funcione
+                if not out or not out.isdigit():
+                    out = (self.ssh.run_command(
+                        host, f"tmux list-clients -t {session} 2>/dev/null | wc -l", timeout=8
+                    ) or "0").strip()
+                attached = int(out or "0")
+            except Exception as e:
+                self._append_log(f"[WARN] não foi possível consultar clientes do tmux:{session} em {host}: {e}")
+                attached = 0
+
+            need_open = attached <= 0
+
+            # 3) Decide abrir/reativar o terminal local
+            proc = None
+            try:
+                rec = self._ssh_tmux_sessions.get(host) or {}
+                old_proc = rec.get("proc")
+                if old_proc is not None:
+                    try:
+                        # Se o processo do terminal morreu, consideramos como fechado
+                        if hasattr(old_proc, "poll") and old_proc.poll() is not None:
+                            need_open = True
+                    except Exception:
+                        need_open = True
+            except Exception:
+                pass
+
+            if need_open:
+                self._append_log(f"Abrindo terminal SSH (tmux:{session}) para {host}…")
+                try:
+                    # Agora open_external_terminal retorna o processo do terminal
+                    proc = self.ssh.open_external_terminal(host, tmux_session=session)
+                    # breve respiro para anexar
+                    time.sleep(1.0)
+                    # atualiza nosso registry local
+                    self._ssh_tmux_sessions[host] = {"session": session, "opened": True, "proc": proc}
+                except Exception as e:
+                    self._append_log(f"[ERRO] Falha ao abrir SSH externo: {e}")
+                    return
+            else:
+                self._append_log(f"[SSH] Terminal já anexado ao tmux:{session} em {host} (clientes={attached}).")
+
+            # 4) Envia o comando para a sessão tmux (se houver payload)
+            try:
+                cmd = (command or "").strip().replace("\r\n", "\n")
+                if cmd:
+                    quoted = shlex.quote(cmd)
+                    self.ssh.run_command(host, f"tmux send-keys -t {session} {quoted} C-m", timeout=20)
+                    self._append_log(f"[SSH] Comando enviado ao tmux:{session} em {host}.")
+                else:
+                    self._append_log(f"[SSH] Sessão tmux:{session} pronta em {host} (sem comando para enviar).")
+            except Exception as e:
+                self._append_log(f"[WARN] Falha ao enviar comando ao tmux em {host}: {e}")
+
+        except Exception as e:
+            self._append_log(f"[ERRO] _ssh_paste falhou: {e}")
 
     def _with_ui_lock(self, fn, busy_msg: str):
         """
@@ -404,12 +506,14 @@ class MainWindow(QWidget):
         b_up = QPushButton("Up")
         b_status = QPushButton("Status")
         b_halt = QPushButton("Halt")
+        b_restart = QPushButton("Restart")
         b_destroy = QPushButton("Destroy")
         b_ssh = QPushButton("SSH")
 
         row.addWidget(b_up)
         row.addWidget(b_status)
         row.addWidget(b_halt)
+        row.addWidget(b_restart)
         row.addWidget(b_destroy)
         row.addWidget(b_ssh)
         v.addLayout(row)
@@ -418,6 +522,7 @@ class MainWindow(QWidget):
         b_up.clicked.connect(lambda: self._run_vagrant(self._on_up_vm, name, b_up, "Subindo…", "Up"))
         b_status.clicked.connect(lambda: self._run_status_by_name(name, b_status))
         b_halt.clicked.connect(lambda: self._run_vagrant(self.vagrant.halt, name, b_halt, "Halt…", "Halt"))
+        b_restart.clicked.connect(lambda: self._on_restart_vm(name, b_restart))
         b_destroy.clicked.connect(
             lambda: self._run_vagrant(self.vagrant.destroy, name, b_destroy, "Destroy…", "Destroy"))
         b_ssh.clicked.connect(lambda: self._ssh(name, b_ssh))
@@ -687,6 +792,95 @@ class MainWindow(QWidget):
         except Exception as e:
             self._append_log(f"Erro no status de {name}: {e}")
 
+    def _on_restart_vm(self, name: str, btn: QPushButton | None = None):
+        """
+        Reinicia a VM 'name' com segurança:
+        - Tenta vagrant reload (se disponível no VagrantManager).
+        - Fallback para halt + up quando reload não existir.
+        - Aguarda SSH ficar pronto e marca janela de aquecimento.
+        - Atualiza o status do card ao final.
+        """
+
+        def gen():
+            try:
+                self._append_log(f"[Restart] Reiniciando {name}…")
+
+                # Quiesce threads ativas (como em halt/destroy)
+                try:
+                    self._append_log("[Thread] Parando threads antes de 'reload'…")
+                    self._quiesce_background(reason="reload", timeout_s=6)
+                except Exception as e:
+                    self._append_log(f"[WARN] reload quiesce: {e}")
+
+                # Se não está running, apenas "Up"
+                try:
+                    st = self.vagrant.status_by_name(name)
+                except Exception as e:
+                    st = None
+                    yield f"[Restart] Falha ao consultar status de {name}: {e}"
+
+                if st != "running":
+                    yield f"[Restart] {name} não está 'running' — executando Up."
+                    try:
+                        for ln in self.vagrant.up(name):
+                            yield ln
+                    except Exception as e:
+                        yield f"[ERRO] Up {name}: {e}"
+                        return "error"
+                else:
+                    # Tenta reload nativo se existir
+                    try:
+                        if hasattr(self.vagrant, "reload"):
+                            yield f"[Restart] Executando vagrant reload em {name}…"
+                            for ln in self.vagrant.reload(name):
+                                yield ln
+                        else:
+                            yield f"[Restart] reload indisponível; executando Halt + Up em {name}…"
+                            for ln in self.vagrant.halt(name):
+                                yield ln
+                            for ln in self.vagrant.up(name):
+                                yield ln
+                    except Exception as e:
+                        yield f"[ERRO] Restart {name}: {e}"
+                        return "error"
+
+                # Aguarda SSH e marca janela de aquecimento
+                try:
+                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
+                    yield f"[Restart] {name} está 'running' e SSH pronto."
+                except Exception as e:
+                    yield f"[Restart] {name} 'running' porém SSH ainda não respondeu: {e}"
+
+                try:
+                    self.warmup.mark_boot(name)
+                    yield f"[Warmup] {name}: janela de aquecimento iniciada (30s)."
+                except Exception as e:
+                    yield f"[Warmup] Falha ao marcar boot de {name}: {e}"
+
+                yield "[Restart] Concluído."
+                return "ok"
+
+            except Exception as e:
+                yield f"[ERRO] Restart {name}: {e}"
+                return "error"
+
+        try:
+            worker = Worker(gen)
+            worker.line.connect(self._append_log)
+            worker.error.connect(lambda msg: self._append_log(f"[ERRO] Restart {name}: {msg}"))
+
+            # spinner no botão
+            if btn is not None:
+                self._wire_button_with_worker(btn, worker, "Restart…", "Restart")
+
+            # ao terminar, atualiza status/infos do card
+            worker.done.connect(lambda: self.status_by_name(name))
+
+            self._keep_worker(worker, tag=f"restart:{name}")
+            worker.start()
+        except Exception as e:
+            self._append_log(f"[ERRO] _on_restart_vm({name}): {e}")
+
     def on_halt_all(self):
         self._run_vagrant(self.vagrant.halt, btn=self.btn_halt_all, active_label="Halt…", idle_label="Halt todas")
 
@@ -712,16 +906,18 @@ class MainWindow(QWidget):
         try:
             path, _ = QFileDialog.getOpenFileName(
                 self, "Escolher YAML de experimento",
-                str(self.current_yaml_path if self.current_yaml_path.exists() else (self.project_root / "lab" / "experiments")),
+                str(self.current_yaml_path if self.current_yaml_path.exists() else (
+                            self.project_root / "lab" / "experiments")),
                 "YAML (*.yaml *.yml)"
             )
             if path:
                 self.current_yaml_path = Path(path)
+                self._yaml_selected_by_user = True
                 self._append_log(f"[Dataset] YAML selecionado: {self.current_yaml_path}")
             else:
                 self._append_log("[Dataset] YAML não alterado.")
         except Exception as e:
-            self._append_log(f"[Dataset] Falha ao escolher YAML: {e}")
+            self._append_log(f"[ERRO] Escolher YAML: {e}")
 
     def on_generate_dataset(self):
         """
@@ -1144,23 +1340,20 @@ class MainWindow(QWidget):
 
     def on_open_guide(self):
         try:
-            if not getattr(self, "current_yaml_path", None):
-                QMessageBox.warning(self, "YAML não selecionado",
-                                    "Escolha um arquivo YAML de experimento primeiro.")
-                return
-
-            self._guide_dialog = ExperimentGuideDialog(
-                parent=self,
-                yaml_path=str(self.current_yaml_path),
+            yaml_for_guide = str(
+                self.current_yaml_path) if self._yaml_selected_by_user and self.current_yaml_path else ""
+            dlg = ExperimentGuideDialog(
+                yaml_path=yaml_for_guide,
                 ssh=self.ssh,
                 vagrant=self.vagrant,
                 lab_dir=str(self.lab_dir),
-                project_root=str(self.project_root)
+                project_root=str(self.project_root),
             )
-            self._guide_dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-            self._guide_dialog.show()
+            dlg.show()
+            self._guide_dialog = dlg
         except Exception as e:
-            self._append_log(f"[ERRO] Guia: {e}")
+            self._append_log(f"[ERRO] Abrir Guia: {e}")
+            QMessageBox.critical(self, "Guia do Experimento", str(e))
 
     def _reset_busy_ui(self):
         try:

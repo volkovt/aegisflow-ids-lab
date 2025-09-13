@@ -1,7 +1,45 @@
+import base64
 import logging, json, time
 from pathlib import Path
 
 logger = logging.getLogger("[Guide]")
+
+def _bash_heredoc(script: str, sudo: bool = True, strict: bool = True) -> str:
+    """
+    Encapsula 'script' em um heredoc sem expansão:
+      [sudo] bash [-se] <<'__EOF__'
+      ...
+      __EOF__
+    Útil para uma versão 'normal' de cópia, à prova de aspas, parênteses etc.
+    """
+    runner = "bash -se" if strict else "bash"
+    if sudo:
+        runner = "sudo " + runner
+    return f"{runner} <<'__EOF__'\n{script}\n__EOF__"
+
+def _bash_heredoc_sudo_noninteractive(script: str, strict: bool = True) -> str:
+    """
+    Executa o SCRIPT via heredoc com sudo não-interativo:
+      sudo -n bash [-se] <<'__EOF__'
+      ...
+      __EOF__
+    Isso evita prompt de senha/TTY e reduz problemas com payloads gigantes (vs. linha única).
+    """
+    runner = "bash -se" if strict else "bash"
+    return f"sudo -n {runner} <<'__EOF__'\n{script}\n__EOF__"
+
+
+def _bash_b64(script: str, sudo: bool = True, strict: bool = True) -> str:
+    """
+    Empacota 'script' em Base64 e retorna um comando sem aspas internas:
+      echo <B64> | base64 -d | [sudo] bash [-e]
+    Evita conflitos de aspas, parênteses, pipes e here-docs ao passar pelo runner.
+    """
+    payload = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    runner = "bash -e" if strict else "bash"
+    if sudo:
+        runner = "sudo " + runner
+    return f"echo {payload} | base64 -d | {runner}"
 
 def _safe_load_yaml(yaml_path: str) -> dict:
     """
@@ -44,14 +82,19 @@ def substitute_vars(command: str, ips: dict) -> str:
 
 
 def _steps_header() -> list[dict]:
-    # Passos didáticos iniciais para o modo "playbook"
+    preflight_script = 'echo "[preflight] OK (executado pela UI principal)."'
+    up_script = 'echo "[infra] VMs UP (executado pela UI principal)."'
+
     return [
         {
             "id": "preflight",
             "title": "Preflight do Lab",
             "description": "Valida virtualização, Vagrant, rede host-only e chaves SSH.",
             "host": "attacker",
-            "command": "echo Preflight OK (executado pela UI principal).",
+            "script": preflight_script,
+            "command_normal": _bash_heredoc(preflight_script, sudo=False),
+            "command_b64": _bash_b64(preflight_script, sudo=False),
+            "command": _bash_b64(preflight_script, sudo=False),  # mantém execução como antes
             "tags": ["safety", "infra"],
             "eta": "~1 min",
             "artifacts": [],
@@ -61,7 +104,10 @@ def _steps_header() -> list[dict]:
             "title": "Subir e aquecer VMs",
             "description": "Suba sensor, vítima e atacante. Aguarde SSH ficar pronto (a UI já faz o aquecimento).",
             "host": "attacker",
-            "command": "echo 'VMs UP (executado pela UI principal).'",
+            "script": up_script,
+            "command_normal": _bash_heredoc(up_script, sudo=False),
+            "command_b64": _bash_b64(up_script, sudo=False),
+            "command": _bash_b64(up_script, sudo=False),
             "tags": ["infra"],
             "eta": "~2-4 min",
             "artifacts": [],
@@ -69,154 +115,217 @@ def _steps_header() -> list[dict]:
     ]
 
 
+
 # ===== Novos passos “infra/tools” (preparo real do ambiente) =====
+def _step_attacker_sudo_diag() -> dict:
+    script = r'''
+        set -e
+        echo "[diag] whoami=$(whoami)"
+        if sudo -n true 2>/dev/null; then
+          echo "[diag] sudo -n OK (NOPASSWD ativo)"
+        else
+          echo "[diag] sudo -n FALHOU (sem NOPASSWD ou sudo exige TTY)"
+          exit 42
+        fi
+        if command -v base64 >/dev/null 2>&1; then
+          echo "[diag] base64 OK"
+        else
+          echo "[diag] base64 ausente"
+          exit 43
+        fi
+    '''
+    return {
+        "id": "attacker_sudo_diag",
+        "title": "Diagnóstico sudo/PTY no atacante",
+        "description": "Verifica se sudo -n funciona e se base64 existe (evita 255 silencioso).",
+        "host": "attacker",
+        "command_normal": _bash_heredoc(script, sudo=False),
+        "command_b64": _bash_b64(script, sudo=False),
+        "command": _bash_heredoc(script, sudo=False),
+        "tags": ["infra", "diagnostic"],
+        "eta": "<3s",
+        "artifacts": [],
+    }
+
 
 def _step_attacker_prepare_tools() -> dict:
-    """
-    Kali (attacker): replica o fluxo que funcionou no bash para destravar NO_PUBKEY/404 e
-    instalar ferramentas. Inclui:
-      - sources.list com signed-by e non-free-firmware
-      - limpeza de índices (sem prompt do zsh)
-      - update normal + update permissivo para reinstalar keyring
-      - fallback de chave via curl+gpg
-      - update final normal
-      - instalação dos pacotes e verificação de versões
-    """
-    cmd = r"""bash -lc '
-        set -euo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        
-        # Evita prompt do zsh no rm
-        unalias rm 2>/dev/null || true
-        
-        # 1) sources.list moderno com signed-by e non-free-firmware
-        cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
-        printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
-        
-        # 2) limpar índices antigos
-        apt-get clean
-        command rm -rf /var/lib/apt/lists/*
-        
-        # 3) tentativa normal de update + reinstalar keyring (pode falhar na 1ª vez)
-        apt-get update || true
-        apt-get install -y --reinstall kali-archive-keyring || true
-        
-        # 4) update permissivo + reinstalar keyring sem autenticação (quebra NO_PUBKEY)
-        apt-get update -o Acquire::AllowInsecureRepositories=true || true
-        apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
+    script = r'''
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            unalias rm 2>/dev/null || true
 
-        # 5) fallback extra: grava a chave direto via curl+gpg (se disponíveis)
-        if command -v curl >/dev/null 2>&1; then
-          curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor > /usr/share/keyrings/kali-archive-keyring.gpg || true
-        fi
-        
-        # tenta instalar netcat-traditional (pode falhar se o keyring não estiver ok)
-        apt-get install -y --no-install-recommends netcat-traditional || true
-        
-        # 6) update final (verificação normal)
-        apt-get update -y
-        
-        # 7) instala ferramentas e mostra versões
-        apt-get install -y --no-install-recommends nmap hydra slowhttptest curl jq
-        echo "[attacker] Ferramentas instaladas/ok:"
-        nmap --version | head -1 || true
-        hydra -h | head -1 || true
-        slowhttptest -h | head -1 || true
-        curl --version | head -1 || true
-        jq --version || true
-        '"""
+            # Repositório/Keyring (como antes)
+            cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
+            printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
+            apt-get clean
+            rm -rf /var/lib/apt/lists/* || true
+            apt-get update || true
+            apt-get install -y --reinstall kali-archive-keyring || true
+            apt-get update -o Acquire::AllowInsecureRepositories=true || true
+            apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
+            if command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+              curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor > /usr/share/keyrings/kali-archive-keyring.gpg || true
+            fi
+
+            # Corrige estado quebrado do dpkg se houver
+            if dpkg -l 2>/dev/null | awk '/^..r|^..U/ {print $2}' | grep -Eq '^(firebird4\.0-common|libfbclient2|hydra)$'; then
+              echo "[attacker] >>> dpkg com pacotes presos; removendo e atualizando Perl…"
+              dpkg --remove --force-remove-reinstreq hydra libfbclient2:amd64 firebird4.0-common || true
+              apt-get update || true
+              apt-get install -y perl-base perl || true
+              apt-get -y -f install || true
+              apt-get -y full-upgrade || true
+            fi
+
+            # Instala base sem travar o dpkg
+            apt-get update || true
+            apt-get install -y --no-install-recommends netcat-traditional nmap slowhttptest curl jq || true
+
+            # Tenta Hydra (mas não deixa o script falhar se der erro de dpkg/postinst)
+            set +e
+            apt-get install -y --no-install-recommends hydra
+            hydra_ok=$?
+            set -e
+
+            if [ $hydra_ok -ne 0 ] || ! command -v hydra >/dev/null 2>&1; then
+              echo "[attacker] >>> Hydra indisponível; instalando alternativas (ncrack/patator)…"
+              apt-get install -y --no-install-recommends ncrack patator || true
+            fi
+
+            echo "[attacker] Ferramentas instaladas/ok:"
+            nmap --version | head -1 || true
+            if command -v hydra >/dev/null 2>&1; then
+              hydra -V 2>/dev/null | head -1 || true
+            else
+              echo "[MISSING] hydra"
+            fi
+            slowhttptest -h | head -1 || true
+            curl --version | head -1 || true
+            jq --version || true
+            if command -v ncrack >/dev/null 2>&1; then ncrack --version | head -1 || true; fi
+            if command -v patator >/dev/null 2>&1; then patator --help | head -3 | tail -1 || true; fi
+        '''
     return {
         "id": "attacker_prepare",
         "title": "Preparar atacante (Kali): keyring + ferramentas",
-        "description": "Corrige keyring/repos (signed-by, non-free-firmware) e instala nmap/hydra/slowhttptest/curl/jq.",
+        "description": "Corrige keyring/repos, previne dpkg quebrado e instala nmap/slowhttptest/curl/jq; tenta Hydra e faz fallback para ncrack/patator.",
         "host": "attacker",
-        "command": cmd,
+        "script": script,
+        "command_normal": _bash_heredoc(script, sudo=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_heredoc_sudo_noninteractive(script, strict=True),
         "tags": ["infra", "tools"],
-        "eta": "~1-2 min",
+        "eta": "~2-4 min",
         "artifacts": [],
     }
 
 
 
 def _step_sensor_prepare_tools() -> dict:
-    """
-    Sensor: garante tcpdump e tenta instalar Zeek se houver Candidate disponível.
-    Se o Zeek estiver instalado via OBS em /opt/zeek/bin/zeek, ajusta PATH e cria symlink.
-    """
-    cmd = r"""bash -lc '
+    script = r'''
         set -e
-        sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump jq curl || true
-        
-        # 1) Tenta via repositório nativo se existir Candidate
-        cand=$(apt-cache policy zeek | awk "/Candidate:/ {print $2}")
-        if [ -n "$cand" ] && [ "$cand" != "(none)" ]; then
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zeek || true
+        export DEBIAN_FRONTEND=noninteractive
+
+        echo "[sensor] >>> Atualizando índices e instalando utilitários base…"
+        apt-get update || true
+        apt-get install -y \
+          tcpdump jq curl gnupg ca-certificates apt-transport-https \
+          tmux iproute2 net-tools ethtool iftop tshark || true
+
+        echo "[sensor] >>> Configurando repositório do Zeek (OBS, xUbuntu_20.04)…"
+        if ! command -v zeek >/dev/null 2>&1 && [ ! -x /opt/zeek/bin/zeek ]; then
+          echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/ /' \
+            | tee /etc/apt/sources.list.d/security:zeek.list
+          curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_20.04/Release.key \
+            | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+          apt-get update
+          apt-get install -y zeek
         fi
-        
-        # 2) Fallback de PATH/symlink: Zeek do OBS em /opt/zeek/bin/zeek
+
+        echo "[sensor] >>> Ajustando PATH do Zeek e atalho…"
         if [ -x /opt/zeek/bin/zeek ]; then
-          echo "[sensor] >>> ajustando PATH para /opt/zeek/bin (OBS)"
-          echo "export PATH=/opt/zeek/bin:$PATH" | sudo tee /etc/profile.d/zeek.sh >/dev/null
-          sudo chmod +x /etc/profile.d/zeek.sh
-          sudo ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek || true
-          hash -r || true
+          printf 'export PATH=/opt/zeek/bin:$PATH\n' | tee /etc/profile.d/zeek.sh >/dev/null
+          chmod +x /etc/profile.d/zeek.sh
+          ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek || true
+          . /etc/profile || true
         fi
-        
-        echo "[sensor] >>> versões:"
+
+        echo "[sensor] >>> Verificando versões instaladas…"
         tcpdump --version | head -1 || true
-        (command -v zeek >/dev/null 2>&1 && zeek --version) || (/opt/zeek/bin/zeek --version || true)
+        if command -v zeek >/dev/null 2>&1; then
+          zeek --version | head -1 || true
+        elif [ -x /opt/zeek/bin/zeek ]; then
+          /opt/zeek/bin/zeek --version | head -1 || true
+        else
+          echo "[MISSING] zeek"
+        fi
+        tshark -v 2>/dev/null | head -1 || true
         jq --version || true
         curl --version | head -1 || true
-    '"""
+    '''
     return {
         "id": "sensor_prepare",
-        "title": "Preparar sensor: tcpdump (+Zeek se disponível)",
-        "description": "Instala tcpdump e tenta Zeek; se o binário existir em /opt/zeek/bin, ajusta PATH/symlink.",
+        "title": "Preparar sensor: Zeek (OBS xUbuntu_20.04) + ferramentas",
+        "description": "Adiciona o repositório OBS do Zeek, instala Zeek e utilitários (tcpdump, tshark, jq, curl, tmux etc.), ajusta PATH e valida versões.",
         "host": "sensor",
-        "command": cmd,
-        "tags": ["infra", "tools"],
-        "eta": "~1-2 min",
+        "script": script,
+        "command_normal": _bash_heredoc_sudo_noninteractive(script, strict=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_heredoc_sudo_noninteractive(script, strict=True),
+        "tags": ["infra", "tools", "sensor", "zeek"],
+        "eta": "~2-5 min",
         "artifacts": [],
     }
 
+
+
+
 def _step_attacker_tools_check() -> dict:
-    """
-    Verifica se as ferramentas do atacante estão acessíveis no PATH e exibe versões.
-    Falha o step (exit!=0) se encontrar ausências — útil para destacar em vermelho.
-    """
-    cmd = r"""bash -lc '
+    script = r'''
         set -e
         missing=0
-        check_ver () {
+
+        check_ver() {
           bin="$1"
           if command -v "$bin" >/dev/null 2>&1; then
-            # tenta --version, se não houver cai no -h
             ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
           else
             echo "[MISSING] $bin"
             missing=$((missing+1))
           fi
         }
-        
-        echo "[attacker] >>> checando ferramentas:"
-        for b in nmap hydra slowhttptest curl jq; do
+
+        echo "[attacker] >>> checando ferramentas base:"
+        for b in nmap slowhttptest curl jq; do
           check_ver "$b"
         done
-        
-        # se algo faltou, retorna código != 0 para marcar o step como falho
+
+        echo "[attacker] >>> checando ferramenta de brute-force:"
+        if command -v hydra >/dev/null 2>&1; then
+          hydra -V 2>/dev/null | head -1 || true
+        elif command -v ncrack >/dev/null 2>&1; then
+          ncrack --version 2>/dev/null | head -1 || true
+        elif command -v patator >/dev/null 2>&1; then
+          patator --help 2>/dev/null | head -3 | tail -1 || true
+        else
+          echo "[MISSING] hydra/ncrack/patator"
+          missing=$((missing+1))
+        fi
+
         if [ $missing -ne 0 ]; then
           echo "[attacker] >>> faltando $missing ferramenta(s)."
           exit $missing
         fi
         echo "[attacker] >>> OK"
-    '"""
+    '''
     return {
         "id": "attacker_tools_check",
         "title": "Verificar ferramentas no attacker",
-        "description": "Confere nmap/hydra/slowhttptest/curl/jq e mostra versões.",
+        "description": "Confere nmap/slowhttptest/curl/jq e valida Hydra OU Ncrack OU Patator.",
         "host": "attacker",
-        "command": cmd,
+        "command_normal": _bash_heredoc(script, sudo=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_heredoc(script, sudo=True),
         "tags": ["infra", "verify"],
         "eta": "~5-10s",
         "artifacts": [],
@@ -224,15 +333,10 @@ def _step_attacker_tools_check() -> dict:
 
 
 def _step_sensor_tools_check() -> dict:
-    """
-    Verifica tcpdump/jq/curl e o Zeek (via PATH ou /opt/zeek/bin/zeek).
-    Falha o step (exit!=0) se encontrar ausências.
-    """
-    cmd = r"""bash -lc '
+    script = r'''
         set -e
         missing=0
-        
-        check_ver () {
+        check_ver() {
           bin="$1"
           if command -v "$bin" >/dev/null 2>&1; then
             ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
@@ -243,15 +347,15 @@ def _step_sensor_tools_check() -> dict:
         }
         
         echo "[sensor] >>> checando ferramentas:"
-        check_ver tcpdump
-        check_ver jq
-        check_ver curl
+        for b in tcpdump jq curl; do
+          check_ver "$b"
+        done
         
         # Zeek: PATH ou /opt/zeek/bin/zeek
         if command -v zeek >/dev/null 2>&1; then
-          zeek --version
+          zeek --version | head -1 || true
         elif [ -x /opt/zeek/bin/zeek ]; then
-          /opt/zeek/bin/zeek --version
+          /opt/zeek/bin/zeek --version | head -1 || true
         else
           echo "[MISSING] zeek"
           missing=$((missing+1))
@@ -262,48 +366,46 @@ def _step_sensor_tools_check() -> dict:
           exit $missing
         fi
         echo "[sensor] >>> OK"
-    '"""
+    '''
     return {
         "id": "sensor_tools_check",
         "title": "Verificar ferramentas no sensor",
         "description": "Confere tcpdump/jq/curl/zeek (também em /opt/zeek/bin) e mostra versões.",
         "host": "sensor",
-        "command": cmd,
+        "command_normal": _bash_heredoc(script, sudo=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_heredoc(script, sudo=True),
         "tags": ["infra", "verify"],
         "eta": "~5-10s",
         "artifacts": [],
     }
 
+
 def _step_connectivity_check(ips: dict) -> dict:
-    """
-    Confirma conectividade attacker→victim e portas básicas (ex.: 80/22).
-    """
     victim = ips.get("victim", "192.168.56.20")
-    cmd = rf"""bash -lc '
+    script = f'''
         set -e
         ping -c 2 {victim} || true
         nc -zv {victim} 22 || true
         nc -zv {victim} 80 || true
         echo "[check] conectividade básica testada"
-        '"""
+    '''
     return {
         "id": "connectivity",
         "title": "Checagem de conectividade com a vítima",
         "description": "Ping e tentativas de conexão a portas comuns para validar o alvo.",
         "host": "attacker",
-        "command": cmd,
+        "command_normal": _bash_heredoc(script, sudo=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_b64(script, sudo=True),
         "tags": ["infra", "recon"],
         "eta": "<15s",
         "artifacts": [],
     }
 
 
+
 def _step_hydra_wordlists(cfg: dict) -> dict:
-    """
-    Gera/normaliza listas padrão para Hydra se não existirem.
-    Caso o YAML traga listas embutidas, elas serão gravadas também.
-    """
-    # extrai listas embutidas, quando presentes (actions.hydra_brute / legacy.brute)
     users_inline = []
     pwds_inline = []
     try:
@@ -323,7 +425,6 @@ def _step_hydra_wordlists(cfg: dict) -> dict:
     except Exception:
         pass
 
-    # conteúdo padrão caso nada seja informado
     if not users_inline:
         users_inline = ["admin", "user", "test", "tcc"]
     if not pwds_inline:
@@ -332,83 +433,135 @@ def _step_hydra_wordlists(cfg: dict) -> dict:
     users_escaped = "\\n".join(str(u) for u in users_inline)
     pwds_escaped  = "\\n".join(str(p) for p in pwds_inline)
 
-    cmd = rf"""bash -lc '
+    script = f'''
         set -e
-        test -f ~/users.txt    || echo -e "{users_escaped}" | tee ~/users.txt >/dev/null
-        test -f ~/passwords.txt|| echo -e "{pwds_escaped}" | tee ~/passwords.txt >/dev/null
+        test -f ~/users.txt     || echo -e "{users_escaped}" | tee ~/users.txt >/dev/null
+        test -f ~/passwords.txt || echo -e "{pwds_escaped}" | tee ~/passwords.txt >/dev/null
         wc -l ~/users.txt ~/passwords.txt || true
-    '"""
+    '''
     return {
         "id": "hydra_lists",
         "title": "Gerar listas de usuários/senhas (Hydra)",
         "description": "Cria ~/users.txt e ~/passwords.txt (não sobrescreve se já existirem).",
         "host": "attacker",
-        "command": cmd,
+        "command_normal": _bash_heredoc(script, sudo=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_b64(script, sudo=True),
         "tags": ["prep", "credential_access"],
         "eta": "<5s",
         "artifacts": ["~/users.txt", "~/passwords.txt"],
     }
 
 
-def _step_sensor_capture(cfg: dict) -> dict:
-    cap = cfg.get("capture", {}) or {}
-    rotate_sec = cap.get("rotate_seconds", 300)
-    rotate_mb = cap.get("rotate_size_mb", 100)
-    return {
-        "id": "sensor_capture",
-        "title": "Ativar captura no Sensor",
-        "description": "Liga tcpdump (e Zeek se disponível). Gera PCAP e logs em /var/log/{pcap,zeek}.",
-        "host": "sensor",
-        "command": (
-            "nohup bash -lc 'sudo mkdir -p /var/log/pcap /var/log/zeek; "
-            "ip -br addr; "
-            "tcpdump -i $(ip -br addr | awk \"/192\\.168\\.56\\./{print $1; exit}\") "
-            f"-w /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap -G {rotate_sec} -C {rotate_mb} -n' >/dev/null 2>&1 &"
-        ),
-        "tags": ["capture", "pcap"],
-        "eta": "contínuo",
-        "artifacts": ["/var/log/pcap/*.pcap", "/var/log/zeek/*.log"],
-    }
 
+def _step_sensor_capture_show(ips: dict, cfg: dict) -> dict:
+    """
+    Liga tcpdump + Zeek, força tráfego de teste (ICMP/TCP) e imprime uma amostra dos logs,
+    tudo em um único passo — ideal para o Guia do experimento do TCC.
+    """
+    attacker_ip = ips.get("attacker", "192.168.56.11")
+    victim_ip   = ips.get("victim",   "192.168.56.12")
 
-def _step_sensor_health() -> dict:
-    cmd = r"""bash -lc '
+    # Rotação configurável (fallbacks seguros)
+    cap = (cfg or {}).get("capture", {}) if isinstance(cfg, dict) else {}
+    rotate_sec = int(cap.get("rotate_seconds", 300))
+    rotate_mb  = int(cap.get("rotate_size_mb", 100))
+
+    script = f'''
+        set -Eeuo pipefail
+
+        log() {{ printf "[sensor] %s\\n" "$*"; }}
+
+        mkdir -p /var/log/pcap /var/log/zeek /var/run/sensor
+        chown -R tcpdump:tcpdump /var/log/pcap || true
+        chmod 0755 /var/log/pcap /var/log/zeek || true
+
+        attacker="{attacker_ip}"
+        victim="{victim_ip}"
+
+        # Descobre a interface: tenta rota p/ vítima, depois atacante; por fim 1ª UP não-loopback
+        iface=$(ip route get "$victim" 2>/dev/null | awk '/dev/ {{for(i=1;i<=NF;i++) if($i=="dev"){{print $(i+1); exit}}}}')
+        [ -z "${{iface:-}}" ] && iface=$(ip route get "$attacker" 2>/dev/null | awk '/dev/ {{for(i=1;i<=NF;i++) if($i=="dev"){{print $(i+1); exit}}}}')
+        [ -z "${{iface:-}}" ] && iface=$(ip -br link | awk '/UP/ && !/LOOPBACK/ {{print $1; exit}}')
+        log "usando iface: $iface"
+
+        # Mata processos antigos
+        pkill -f "tcpdump -i $iface" 2>/dev/null || true
+        pkill -f "zeek -i $iface"    2>/dev/null || true
+        sleep 0.3
+
+        # Inicia tcpdump com rotação (-G segundos, -C MB) e queda de privilégios (-Z tcpdump)
+        nohup /usr/sbin/tcpdump -i "$iface" -s 0 -U -nn \\
+          -w /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap -G {rotate_sec} -C {rotate_mb} -W 48 -Z tcpdump \\
+          >/var/log/pcap/tcpdump.out 2>&1 &
+
+        sleep 0.8
+        if ! pgrep -fa "tcpdump -i $iface" >/dev/null; then
+          log "ERRO ao iniciar tcpdump — últimas linhas:"
+          tail -n 60 /var/log/pcap/tcpdump.out || true
+          exit 1
+        fi
+
+        # Inicia Zeek, fixando o diretório de logs via 'redef' e ignorando checksums (-C)
+        ZEEXE=$(command -v zeek || echo /opt/zeek/bin/zeek)
+        truncate -s 0 /var/log/zeek/zeek.out || true
+        nohup "$ZEEXE" -i "$iface" -C \\
+          -e 'redef Log::default_logdir="/var/log/zeek";' \\
+          >>/var/log/zeek/zeek.out 2>&1 &
+        sleep 1.2
+        if ! pgrep -fa "zeek -i $iface" >/dev/null; then
+          log "ERRO ao iniciar Zeek — últimas linhas:"
+          tail -n 80 /var/log/zeek/zeek.out || true
+          exit 1
+        fi
+
+        log "processos iniciados com sucesso"
+
+        # --- Tráfego de teste para 'provar' a coleta ---
+        (ping -c 6 "$attacker" >/dev/null 2>&1 & ping -c 6 "$victim" >/dev/null 2>&1 &)
+        sleep 0.4
+        # Gera alguns SYNs em 22/80 se possível
+        nc -z -w1 "$victim" 22  >/dev/null 2>&1 || true
+        curl -m 2 -s "http://$victim:80/" >/dev/null 2>&1 || true
+        nc -z -w1 "$attacker" 22 >/dev/null 2>&1 || true
+        sleep 1
+
+        # --- Impressões para o Guia: processos + arquivos + amostras ---
         echo "[health] processos relevantes:"
         pgrep -fa "tcpdump -i" || true
-        pgrep -fa "zeek -i" || true
+        pgrep -fa "zeek -i"    || true
+
         echo "[health] últimos arquivos:"
         ls -lh /var/log/pcap/*.pcap 2>/dev/null | tail -n 5 || true
-        ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 5 || true
-    '"""
+        ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 10 || true
+
+        echo "[health] amostra do conn.log:"
+        if [ -f /var/log/zeek/conn.log ]; then
+          grep -m1 '^#fields' /var/log/zeek/conn.log || true
+          # imprime somente linhas de dados (sem cabeçalho '#')
+          grep -v '^#' /var/log/zeek/conn.log | tail -n 5 | sed -e 's/\\t/ | /g' || true
+        else
+          echo "[warn] conn.log ainda não criado — gere tráfego e rode novamente o passo."
+        fi
+
+        echo "[health] tails dos serviços:"
+        tail -n 10 /var/log/pcap/tcpdump.out 2>/dev/null || true
+        tail -n 10 /var/log/zeek/zeek.out    2>/dev/null || true
+    '''
     return {
-        "id": "sensor_health",
-        "title": "Verificar saúde da captura (Sensor)",
-        "description": "Lista processos e últimos PCAP/Zeek para confirmar coleta.",
+        "id": "sensor_capture_show",
+        "title": "Ativar captura e exibir provas (PCAP + Zeek)",
+        "description": "Liga tcpdump e Zeek, gera tráfego de teste e imprime amostras (conn.log, pcaps, tails) para comprovar a coleta.",
         "host": "sensor",
-        "command": cmd,
-        "tags": ["capture", "healthcheck"],
-        "eta": "<5s",
-        "artifacts": ["/var/log/pcap/*.pcap", "/var/log/zeek/*.log"],
+        "script": script,
+        "command_normal": _bash_heredoc_sudo_noninteractive(script, strict=True),
+        "command_b64": _bash_b64(script, sudo=True),
+        "command": _bash_heredoc_sudo_noninteractive(script, strict=True),
+        "tags": ["capture", "healthcheck", "sensor", "zeek"],
+        "eta": "<15s",
+        "artifacts": ["/var/log/pcap/*.pcap", "/var/log/zeek/conn.log", "/var/log/zeek/zeek.out"],
     }
 
-
-def _step_sensor_stop() -> dict:
-    cmd = r"""bash -lc '
-        for p in /var/run/tcc_*.pid; do [ -f "$p" ] && sudo kill "$(cat "$p")" 2>/dev/null || true; done
-        sudo pkill -f "tcpdump -i" || true
-        sudo pkill -f "zeek -i"    || true
-        echo "[sensor] captura desligada"
-    '"""
-    return {
-        "id": "sensor_stop",
-        "title": "Desligar captura no Sensor (opcional)",
-        "description": "Encerra tcpdump/zeek; normalmente pare apenas após empacotar o dataset.",
-        "host": "sensor",
-        "command": cmd,
-        "tags": ["capture", "cleanup"],
-        "eta": "<5s",
-        "artifacts": [],
-    }
 
 
 # ===== Ações (scan/brute/dos/custom) — preserva compatibilidade =====
@@ -434,12 +587,16 @@ def _steps_from_actions(cfg: dict, ips: dict) -> list[dict]:
             flags = p.get("flags", "-sS -sV -T4")
             ports = p.get("ports", "1-1024")
             out = p.get("output", "~/exp_scan.nmap")
+            cmd = f"nmap {flags} -p {ports} -oA {out} {victim_ip}"
             steps.append({
                 "id": f"scan_{i}",
                 "title": "Varredura de portas e serviços (Nmap)",
                 "description": "Descobre portas abertas e versões de serviços no alvo.",
                 "host": "attacker",
-                "command": f"nmap {flags} -p {ports} -oA {out} {victim_ip}",
+                "script": cmd,
+                "command_normal": _bash_heredoc(cmd, sudo=False),
+                "command_b64": _bash_b64(cmd, sudo=False),
+                "command": cmd,
                 "tags": ["recon", "MITRE:T1046"],
                 "eta": "~1-3 min",
                 "artifacts": [f"{out}.nmap", f"{out}.gnmap", f"{out}.xml"],
@@ -454,12 +611,16 @@ def _steps_from_actions(cfg: dict, ips: dict) -> list[dict]:
             port = p.get("port")
             out = p.get("output", "~/exp_brute.hydra")
             port_flag = f"-s {port} " if port else ""
+            cmd = f"hydra -L {users} -P {pwds} {port_flag}{service}://{victim_ip}{path} {extra} -o {out}"
             steps.append({
                 "id": f"brute_{i}",
                 "title": "Força bruta de credenciais (Hydra)",
                 "description": "Testa combinações de usuário/senha contra o serviço indicado.",
                 "host": "attacker",
-                "command": f"hydra -L {users} -P {pwds} {port_flag}{service}://{victim_ip}{path} {extra} -o {out}",
+                "script": cmd,
+                "command_normal": _bash_heredoc(cmd, sudo=False),
+                "command_b64": _bash_b64(cmd, sudo=False),
+                "command": cmd,
                 "tags": ["credential_access", "MITRE:T1110"],
                 "eta": "varia",
                 "artifacts": [out],
@@ -485,6 +646,9 @@ def _steps_from_actions(cfg: dict, ips: dict) -> list[dict]:
                 "title": "Degradação/DoS controlado",
                 "description": "Gera carga controlada contra o alvo dentro do lab (NUNCA rode fora do lab).",
                 "host": "attacker",
+                "script": cmd,
+                "command_normal": _bash_heredoc(cmd, sudo=False),
+                "command_b64": _bash_b64(cmd, sudo=False),
                 "command": cmd,
                 "tags": ["impact", "safety"],
                 "eta": "~1-2 min",
@@ -492,24 +656,31 @@ def _steps_from_actions(cfg: dict, ips: dict) -> list[dict]:
             })
 
         elif name in ("custom",):
+            cmd = a.get("command", "")
             steps.append({
                 "id": f"custom_{i}",
                 "title": a.get("title", "Ação customizada"),
                 "description": a.get("description", ""),
                 "host": a.get("host", "attacker"),
-                "command": a.get("command", ""),
+                "script": cmd,
+                "command_normal": _bash_heredoc(cmd, sudo=False),
+                "command_b64": _bash_b64(cmd, sudo=False),
+                "command": cmd,
                 "tags": a.get("tags", ["custom"]),
                 "eta": a.get("eta", ""),
                 "artifacts": a.get("artifacts", []),
             })
-
         else:
+            cmd = a.get("command", "")
             steps.append({
                 "id": f"action_{i}",
                 "title": f"Ação: {name or 'desconhecida'}",
                 "description": "Passo gerado do YAML (ação não padronizada).",
                 "host": a.get("host", "attacker"),
-                "command": a.get("command", ""),
+                "script": cmd,
+                "command_normal": _bash_heredoc(cmd, sudo=False),
+                "command_b64": _bash_b64(cmd, sudo=False),
+                "command": cmd,
                 "tags": ["custom"],
                 "eta": a.get("eta", ""),
                 "artifacts": a.get("artifacts", []),
@@ -518,164 +689,55 @@ def _steps_from_actions(cfg: dict, ips: dict) -> list[dict]:
     return steps
 
 
-def _steps_from_legacy(cfg: dict, ips: dict) -> list[dict]:
+def parse_yaml_to_steps(yaml_path: str | None, ssh=None) -> list[dict]:
     """
-    Converte o formato CLÁSSICO (sensor/scan/brute/dos/custom) em passos.
+    Gera a lista de passos do Guia.
+
+    IMPORTANTE: Esta função NÃO deve realizar chamadas de rede/SSH.
+    Qualquer verificação remota deve ser feita somente na execução do passo.
+
+    - Se yaml_path for None/"" ou o arquivo não existir: entra no modo oficial.
+    - Se yaml_path existir e for válido: inclui as ações definidas no YAML.
     """
-    steps = []
+    try:
+        import yaml  # PyYAML
+    except Exception as e:
+        raise RuntimeError("PyYAML não está instalado (pip install pyyaml).") from e
 
-    # 1) Sensor
-    if (cfg.get("sensor") or {}).get("enable", True) or "capture" in cfg:
-        steps.append(_step_sensor_capture(cfg))
-
-    # 2) Prep
-    for i, p in enumerate(cfg.get("prep", []), start=1):
-        steps.append({
-            "id": f"prep_{i}",
-            "title": f"Preparação: {p.get('title','comando')}",
-            "description": p.get("description", "Ajuste do ambiente."),
-            "host": p.get("host", "victim"),
-            "command": substitute_vars(p.get("command", ""), ips),
-            "tags": ["prep"],
-            "eta": "<30s",
-            "artifacts": [],
-        })
-
-    # 3) Scan
-    if "scan" in cfg:
-        scan = cfg["scan"]
-        target_host = scan.get("target", "victim")
-        target_ip = ips.get(target_host, scan.get("target_ip", "127.0.0.1"))
-        ports = scan.get("ports", "1-1024")
-        flags = scan.get("flags", "-sS -sV -T4")
-        out = scan.get("output", "~/exp_scan.nmap")
-        steps.append({
-            "id": "scan",
-            "title": "Varredura de portas e serviços (Nmap)",
-            "description": "Descobre portas abertas e versões de serviços no alvo.",
-            "host": "attacker",
-            "command": f"nmap {flags} -p {ports} -oA {out} {target_ip}",
-            "tags": ["recon", "MITRE:T1046"],
-            "eta": "~1-3 min",
-            "artifacts": [f"{out}.nmap", f"{out}.gnmap", f"{out}.xml"],
-        })
-
-    # 4) Brute force
-    if "brute" in cfg:
-        b = cfg["brute"]
-        target_host = b.get("target", "victim")
-        target_ip = ips.get(target_host, b.get("target_ip", "127.0.0.1"))
-        service = b.get("service", "http-post-form")
-        path = b.get("path", "/login")
-        users = b.get("userlist", "~/users.txt")
-        pwds = b.get("passlist", "~/passwords.txt")
-        extra = b.get("extra", "")
-        port = b.get("port", "")
-        out = b.get("output", "~/exp_brute.hydra")
-        port_flag = f"-s {port} " if port else ""
-        steps.append({
-            "id": "brute",
-            "title": "Força bruta de credenciais (Hydra)",
-            "description": "Testa combinações de usuário/senha contra o serviço indicado.",
-            "host": "attacker",
-            "command": f"hydra -L {users} -P {pwds} {port_flag}{service}://{target_ip}{path} {extra} -o {out}",
-            "tags": ["credential_access", "MITRE:T1110"],
-            "eta": "varia",
-            "artifacts": [out],
-        })
-
-    # 5) DoS
-    if "dos" in cfg:
-        d = cfg["dos"]
-        target_host = d.get("target", "victim")
-        target_ip = ips.get(target_host, d.get("target_ip", "127.0.0.1"))
-        tool = d.get("tool", "slowhttptest")
-        params = d.get("params", "-X -c 400 -r 50 -l 60")
-        out = d.get("output", "~/exp_dos")
-        if tool == "slowhttptest":
-            cmd = f"slowhttptest {params} -g -o {out} -u http://{target_ip}/"
-        elif tool == "hping3":
-            cmd = f"hping3 -S -p 80 --flood {params} {target_ip}"
+    # 1) Carregar YAML (ou seguir em modo oficial)
+    cfg = {}
+    has_yaml = False
+    try:
+        if yaml_path and Path(yaml_path).exists():
+            cfg = yaml.safe_load(Path(yaml_path).read_text(encoding="utf-8")) or {}
+            has_yaml = True
+            logger.info(f"[Guide] YAML carregado: {yaml_path}")
         else:
-            cmd = f"{tool} {params}"
-        steps.append({
-            "id": "dos",
-            "title": "Degradação/DoS controlado",
-            "description": "Gera carga controlada contra o alvo dentro do lab (NUNCA rode fora do lab).",
-            "host": "attacker",
-            "command": cmd,
-            "tags": ["impact", "safety"],
-            "eta": "~1-2 min",
-            "artifacts": [f"{out}*"],
-        })
+            logger.info("[Guide] Modo oficial: nenhuma seleção de YAML detectada (ou arquivo ausente).")
+    except Exception as e:
+        logger.warning(f"[Guide] Falha ao carregar YAML; seguindo em modo oficial: {e}")
+        cfg = {}
+        has_yaml = False
 
-    # 6) Custom
-    for i, c in enumerate(cfg.get("custom", []), start=1):
-        steps.append({
-            "id": f"custom_{i}",
-            "title": c.get("title", "Ação customizada"),
-            "description": c.get("description", ""),
-            "host": c.get("host", "attacker"),
-            "command": substitute_vars(c.get("command", ""), ips),
-            "tags": c.get("tags", ["custom"]),
-            "eta": c.get("eta", ""),
-            "artifacts": c.get("artifacts", []),
-        })
+    # 2) NÃO use SSH aqui. Forneça IPs padrão imediatos (rápidos para renderizar UI)
+    ips = {"attacker": "192.168.56.11", "victim": "192.168.56.12", "sensor": "192.168.56.13"}
+    logger.info("[Guide] Parser oficial em modo 'no-SSH' (IPs padrão aplicados).")
 
-    return steps
-
-
-def parse_yaml_to_steps(yaml_path: str, ssh, vagrant) -> list[dict]:
-    """
-    Lê o YAML e traduz em passos executáveis para o Guia do Experimento.
-    - Suporta formato novo com 'actions' (nmap_scan/hydra_brute/slowhttp_dos).
-    - Suporta formato clássico (sensor/scan/brute/dos/custom).
-    - Enriquecido com preparo de ferramentas, checagens e saúde da captura.
-    """
-    cfg = _safe_load_yaml(yaml_path)
-    ips = resolve_guest_ips(ssh)
-
+    # 3) Montar passos oficiais + (opcional) ações do YAML
     steps: list[dict] = []
     steps.extend(_steps_header())
-
-    # Infra mínima: preparar tools e validadores
+    steps.append(_step_attacker_sudo_diag())
     steps.append(_step_attacker_prepare_tools())
     steps.append(_step_sensor_prepare_tools())
     steps.append(_step_attacker_tools_check())
     steps.append(_step_sensor_tools_check())
-
-    # Captura viva no sensor (default: ligado se houver 'capture' ou 'sensor.enable')
-    if "capture" in cfg or (cfg.get("sensor", {}).get("enable", True)):
-        steps.append(_step_sensor_capture(cfg))
-
-    # Conectividade antes dos ataques
     steps.append(_step_connectivity_check(ips))
+    steps.append(_step_sensor_capture_show(ips, cfg))
 
-    # Listas para Hydra (sempre cria se não existir)
-    steps.append(_step_hydra_wordlists(cfg))
-
-    # Preferir 'actions' se existir, senão legacy
-    if "actions" in cfg:
-        steps.extend(_steps_from_actions(cfg, ips))
-    else:
-        steps.extend(_steps_from_legacy(cfg, ips))
-
-    # Saúde da captura (rápido)
-    steps.append(_step_sensor_health())
-
-    # Passo final “coleta+zip” (UI tem botão dedicado; aqui só informa)
-    steps.append({
-        "id": "harvest",
-        "title": "Coletar artefatos e empacotar dataset",
-        "description": "Puxa PCAP/Zeek e artefatos do atacante. Use o botão 'Gerar dataset (Runner)' abaixo.",
-        "host": "attacker",
-        "command": "echo 'Use o botão Gerar dataset (Runner) na UI.'",
-        "tags": ["dataset"],
-        "eta": "~30-90s",
-        "artifacts": ["data/<exp_id>.zip"],
-    })
-
-    # Opcional: passo de desligar captura (se desejar encerrar manualmente)
-    steps.append(_step_sensor_stop())
+    if has_yaml:
+        try:
+            steps.extend(_steps_from_actions(cfg, ips))
+        except Exception as e:
+            logger.warning(f"[Guide] Falha ao materializar ações do YAML (seguindo com oficiais): {e}")
 
     return steps

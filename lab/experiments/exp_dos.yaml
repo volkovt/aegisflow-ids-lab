@@ -1,15 +1,18 @@
-exp_id: "EXP_DOS"
+# ML IDS Lab — DoS controlado (SlowHTTPTest)
+version: 1
+name: exp_dos
+description: Gera carga lenta no HTTP para observar impacto e logs no sensor.
 targets:
-  victim_ip: "192.168.56.20"
+  victim_ip: "192.168.56.12"
 capture:
-  rotate_seconds: 300
+  rotate_seconds: 120
   rotate_size_mb: 100
-  zeek_rotate_seconds: 3600
+
 actions:
-  - name: "slowhttp_dos"
+  - name: slowhttp_dos
     params:
-      port: 8080
-      duration_s: 180
+      port: 80
+      duration_s: 90
       concurrency: 600
-      rate: 200
-      output_prefix: "exp_dos"
+      rate: 80
+      output_prefix: "~/exp_dos/slowhttp"

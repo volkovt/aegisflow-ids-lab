@@ -47,7 +47,7 @@ sudo apt-get update -y
     end
 
     # Network (Host-Only)
-    victim.vm.network "private_network", ip: "192.168.56.20"
+    victim.vm.network "private_network", ip: "192.168.56.12"
 
     
     

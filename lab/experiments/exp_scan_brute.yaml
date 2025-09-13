@@ -1,33 +1,37 @@
-exp_id: "EXP_SCAN_BRUTE"
+# ML IDS Lab — Scan + Brute HTTP
+version: 1
+name: exp_scan_brute
+description: Nmap seguido de tentativa de força bruta HTTP via Hydra.
 targets:
-  victim_ip: "192.168.56.20"
+  victim_ip: "192.168.56.12"
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
-  zeek_rotate_seconds: 3600
+
+brute:
+  users_inline: ["admin", "user", "test"]
+  pass_inline: ["123456", "password", "tcc2025"]
+
 actions:
-  - name: "Preparar APT + ferramentas no atacante"
-    host: attacker
-    run: |
-      set -euo pipefail
-      unalias rm 2>/dev/null || true
-      cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
-      printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
-      apt-get clean
-      command rm -rf /var/lib/apt/lists/*
-      apt-get update || true
-      apt-get install -y --reinstall kali-archive-keyring || true
-      apt-get update -o Acquire::AllowInsecureRepositories=true || true
-      apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
-      apt-get update
-      apt-get install -y --no-install-recommends nmap hydra slowhttptest curl jq
-      nmap --version && hydra -h >/dev/null && slowhttptest -h >/dev/null || true
-      curl --version && jq --version
-  - name: "nmap_scan"
+  - name: custom
+    title: "Preparar listas de usuários/senhas"
+    description: "Gera ~/users.txt e ~/passwords.txt se não existirem."
+    command: |
+      set -e
+      test -f ~/users.txt     || printf "admin\nuser\ntest\n" > ~/users.txt
+      test -f ~/passwords.txt || printf "123456\npassword\ntcc2025\n" > ~/passwords.txt
+
+  - name: nmap_scan
     params:
-      output: "exp_scan.nmap"
-  - name: "hydra_brute"
+      flags: "-sS -sV -T4 --open"
+      ports: "1-1024"
+      output: "~/exp_nmap/scan"
+
+  - name: hydra_brute
     params:
-      user: "tcc"
-      pass_list: ["123456", "wrongpass"]
-      output: "exp_brute.hydra"
+      service: "http-post-form"
+      port: 80
+      path: "/login:username=^USER^&password=^PASS^:F=Invalid"
+      user: "~/users.txt"
+      pass_list: "~/passwords.txt"
+      output: "~/exp_brute/hydra_http"

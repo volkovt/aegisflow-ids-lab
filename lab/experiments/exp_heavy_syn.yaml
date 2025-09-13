@@ -1,14 +1,22 @@
-exp_id: "EXP_HEAVY_SYN"
+# ML IDS Lab — Tráfego SYN pesado (hping3)
+version: 1
+name: exp_heavy_syn
+description: Tráfego SYN acelerado para estudo de picos (usar com parcimônia).
 targets:
-  victim_ip: "192.168.56.20"
+  victim_ip: "192.168.56.12"
 capture:
   rotate_seconds: 120
-  rotate_size_mb: 200
-  zeek_rotate_seconds: 1200
+  rotate_size_mb: 100
+
 actions:
-  - name: "hping3_syn"
+  - name: custom
+    title: "Aviso de segurança"
+    description: "Confirmação explícita para tráfego sintético alto."
+    command: |
+      echo "[safety] Este passo é exclusivo do ambiente de laboratório."
+
+  - name: hping3_dos
     params:
-      dst_port: 8080
-      rate_pps: 800        # ≈ 800 pps
-      duration_s: 120      # ≈ 96k pacotes
-      # count: 100000      # opcional (se definido, tem precedência)
+      # Ajuste o parâmetro -i (intervalo) conforme a capacidade do lab.
+      # u1000 ~ 1000 microsegundos (1ms). '--flood' ignora intervalos e envia o mais rápido possível.
+      params: "-S -p 80 -i u1000 --flood"

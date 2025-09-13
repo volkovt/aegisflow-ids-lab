@@ -1,15 +1,17 @@
+import base64
 import logging, time, json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, List
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QWidget, QFrame, QMessageBox, QPlainTextEdit, QFileDialog
+    QWidget, QFrame, QMessageBox, QPlainTextEdit, QFileDialog, QToolButton, QMenu, QApplication
 )
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Signal, QThread
-from PySide6.QtGui import QGuiApplication, QClipboard
+from PySide6.QtGui import QGuiApplication, QClipboard, QAction, QActionGroup, QCursor
 
 # Parser “oficial”
 from app.core.yaml_parser import parse_yaml_to_steps
@@ -30,6 +32,63 @@ def _here(tag: str):
     logger.warning(f"[Guide] >>> {tag}")
 
 logger.warning("[Guide] step_card.py importado")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def _wrap_b64_for_copy(cmd: str) -> str:
+    """
+    Gera um transporte Base64 seguro a partir de 'cmd'.
+    Heurísticas:
+      - Se já houver base64 -d, retorna cmd (já está blindado).
+      - Se detectar 'nohup' e '&', preserva background.
+      - Se detectar 'sudo', usa 'sudo bash -se' no destino; senão 'bash -se'.
+      - Se detectar padrão 'bash -lc' com bloco entre aspas, tenta extrair o script interno.
+      - Caso contrário, encapsula 'cmd' como script para o bash interpretar.
+    """
+    try:
+        text = cmd.strip()
+        if "| base64 -d |" in text:
+            return text  # já está blindado
+
+        has_nohup = "nohup " in text
+        ends_bg = text.rstrip().endswith("&")
+        wants_sudo = text.startswith("sudo ") or " sudo " in text
+
+        # 1) tenta extrair script interno de 'bash -lc' ou 'bash -c'
+        inner_script = None
+        m = re.search(r"""bash\s+-l?c\s+(['"])(?P<body>.*)\1\s*$""", text, re.DOTALL)
+        if m:
+            inner_script = m.group("body")
+
+        # 2) determina o runner de destino
+        runner = "bash -se"
+        if wants_sudo:
+            runner = "sudo " + runner
+
+        # 3) escolhe o payload a codificar
+        if inner_script:
+            payload = inner_script
+        else:
+            payload = text
+
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+        core = f"echo {b64} | base64 -d | {runner}"
+
+        if has_nohup or ends_bg:
+            # Encapsula para fundo; evita escapar demais
+            return f'nohup sh -c {shlex.quote(core)} >/dev/null 2>&1 &'
+
+        return core
+    except Exception as e:
+        logging.getLogger("VagrantLabUI").error(f"[Guide] falha ao montar b64: {e}")
+        # fallback mínimo: retorna cmd original para não travar UX
+        return cmd
+
+def _is_heredoc(cmd: str) -> bool:
+    t = cmd or ""
+    return ("<<'__EOF__'" in t) or ('<<"__EOF__"' in t) or ('<<__EOF__' in t) or ("\n__EOF__" in t)
+
 
 # -----------------------------
 # Mini spinner
@@ -156,13 +215,23 @@ class _StreamWorker(QThread):
         self.finished_ok.emit()
 
     def _run_no_stream(self, use_classic: bool = False):
-        logger.warning(f"[Guide][{self.id}] fallback _run_no_stream classic={use_classic}")
-        out = (
-            self.ssh.run_command(self.host, f"bash -lc '{self.cmd}'", timeout=self.timeout_s)
-            if use_classic else
-            self.ssh.run_command_cancellable(self.host, self.cmd, timeout_s=self.timeout_s)
-        )
-        self._emit_block_output(out)
+        try:
+            logger.warning(f"[Guide][{self.id}] _run_no_stream classic={use_classic}")
+
+            if _is_heredoc(self.cmd):
+                logger.warning(f"[Guide][{self.id}] detected heredoc; sending raw to Paramiko")
+                out = self.ssh.run_command(self.host, self.cmd, timeout=self.timeout_s)
+            else:
+                out = (
+                    self.ssh.run_command(self.host, f"bash -lc '{self.cmd}'", timeout=self.timeout_s)
+                    if use_classic else
+                    self.ssh.run_command_cancellable(self.host, self.cmd, timeout_s=self.timeout_s)
+                )
+
+            self._emit_block_output(out)
+        except Exception as e:
+            self.error.emit(str(e))
+            return
 
     def _emit_block_output(self, out: Any):
         try:
@@ -198,6 +267,7 @@ class StepCard(QFrame):
     run_clicked = Signal(dict)
     copy_clicked = Signal(str)
     mark_done = Signal(dict)
+    ssh_clicked = Signal(str, str)
     _seq = 0
 
     def __init__(self, idx: int, step: dict):
@@ -227,11 +297,17 @@ class StepCard(QFrame):
         meta.setObjectName("GuideMeta")
         meta.setWordWrap(True)
 
-        cmd = self.step.get("command","")
-        cmd_box = QPlainTextEdit(cmd)
+        cmd_to_show = self.step.get("command_normal") or self.step.get("command_b64") or self.step.get("command") or ""
+        cmd_box = QPlainTextEdit(cmd_to_show)
         cmd_box.setReadOnly(True)
         cmd_box.setFixedHeight(64)
         cmd_box.setObjectName("GuideCmd")
+        try:
+            shown = "command_normal" if self.step.get("command_normal") else ("command_b64" if self.step.get("command_b64") else (
+                "command" if self.step.get("command") else "—"))
+            cmd_box.setToolTip(f"Mostrando: {shown}")
+        except Exception:
+            pass
 
         art = self.step.get("artifacts", [])
         art_label = QLabel("Artefatos esperados: " + (", ".join(art) if art else "—"))
@@ -239,18 +315,22 @@ class StepCard(QFrame):
         art_label.setWordWrap(True)
 
         row = QHBoxLayout()
-        btn_copy = QPushButton("Copiar")
+        copy_btn = self._build_copy_button(self.step)
         btn_run  = QPushButton(f"Rodar no {self.step.get('host','guest')}")
+        host_label = self.step.get('host', 'guest')
+        btn_ssh = QPushButton(f"SSH em {host_label}")
+        self.btn_ssh = btn_ssh
         btn_done = QPushButton("Marcar ✓")
         self.status = QLabel("A fazer")
         self.status.setObjectName("GuideStatus")
 
-        btn_copy.clicked.connect(lambda: self._on_copy(cmd_box.toPlainText()))
         btn_run.clicked.connect(lambda: self._emit_run(self.step))
+        btn_ssh.clicked.connect(lambda: self._emit_ssh(self.step, cmd_box.toPlainText()))
         btn_done.clicked.connect(lambda: self._on_done())
 
-        row.addWidget(btn_copy)
+        row.addWidget(copy_btn)
         row.addWidget(btn_run)
+        row.addWidget(btn_ssh)
         row.addWidget(btn_done)
         row.addStretch(1)
         row.addWidget(self.status)
@@ -262,6 +342,132 @@ class StepCard(QFrame):
         layout.addWidget(art_label)
         layout.addLayout(row)
         _here(f"{self.cid}._build:end")
+
+    def _build_copy_button(self, step: dict) -> QToolButton:
+        logger = logging.getLogger("VagrantLabUI")
+
+        btn = QToolButton(self)
+        btn.setToolTip("Selecione o modo no menu e clique para copiar")
+        btn.setPopupMode(QToolButton.MenuButtonPopup)
+
+        menu = QMenu(btn)
+
+        # Fontes
+        normal = step.get("command_normal") or step.get("command") or ""
+        legacy = step.get("command") or ""
+        try:
+            b64 = step.get("command_b64") or (_wrap_b64_for_copy(normal or legacy) if (normal or legacy) else "")
+        except Exception as e:
+            logger.error(f"[Guide] Falha ao montar b64: {e}")
+            b64 = step.get("command_b64") or ""
+        script_text = step.get("script", "")
+
+        # Modelagem dos modos
+        modes = [("normal", "Normal", normal or legacy), ("b64", "Base64", b64)]
+        if script_text:
+            modes.append(("script", "Script puro", script_text))
+
+        # Grupo checkable para refletir modo escolhido
+        group = QActionGroup(btn)
+        group.setExclusive(True)
+        actions = {}
+        label_by_key = {k: lbl for k, lbl, _ in modes}
+
+        for key, label, _ in modes:
+            act = QAction(f"Usar {label}", btn)
+            act.setCheckable(True)
+            group.addAction(act)
+            menu.addAction(act)
+            actions[key] = act
+
+        # Estado inicial do modo
+        self._copy_mode = getattr(self, "_copy_mode", None) or ("normal" if "normal" in actions else modes[0][0])
+        if self._copy_mode not in actions:
+            self._copy_mode = modes[0][0]
+        actions[self._copy_mode].setChecked(True)
+
+        # Texto do botão reflete o modo atual
+        btn.setText(f"Copiar ({label_by_key[self._copy_mode]})")
+        btn.setMenu(menu)
+
+        def _update_caption():
+            try:
+                btn.setText(f"Copiar ({label_by_key[self._copy_mode]})")
+                # Só atualiza status se já existir (durante build ainda não existe)
+                if hasattr(self, "status"):
+                    self.status.setText(f"Modo de cópia: {label_by_key[self._copy_mode]}")
+                logger.info(f"[Guide] Modo de cópia selecionado: {self._copy_mode}")
+            except Exception as e:
+                logger.warning(f"[Guide] update_caption erro: {e}")
+
+        def _select_mode(key: str):
+            try:
+                self._copy_mode = key
+                for k, act in actions.items():
+                    act.setChecked(k == key)
+                _update_caption()
+            except Exception as e:
+                logger.error(f"[Guide] select_mode falhou: {e}")
+
+        # Conecta cada item do menu para apenas SELECIONAR o modo (não copia aqui)
+        if "normal" in actions: actions["normal"].triggered.connect(lambda: _select_mode("normal"))
+        if "b64" in actions:    actions["b64"].triggered.connect(lambda: _select_mode("b64"))
+        if "script" in actions: actions["script"].triggered.connect(lambda: _select_mode("script"))
+
+        # Clique no botão copia conforme o modo atual
+        def _copy_current_mode():
+            try:
+                key = self._copy_mode
+                payload = ""
+                if key == "normal":
+                    payload = (normal or legacy).strip()
+                elif key == "b64":
+                    payload = (b64 or "").strip()
+                elif key == "script":
+                    payload = (script_text or "").strip()
+
+                if not payload:
+                    QMessageBox.warning(self, "Copiar", "Nada para copiar.")
+                    return
+
+                self._on_copy(payload)  # já seta "Copiado ✓"
+                # reforça o feedback com o modo
+                if hasattr(self, "status"):
+                    self.status.setText(f"Copiado ✓ ({label_by_key[key]})")
+                logger.info(f"[Guide] Copiado para a área de transferência ({key}, {len(payload)} chars).")
+            except Exception as e:
+                logger.error(f"[Guide] Falha ao copiar (modo={getattr(self, '_copy_mode', '?')}): {e}")
+                QMessageBox.critical(self, "Erro", f"Não foi possível copiar. {e}")
+
+        btn.clicked.connect(_copy_current_mode)
+        return btn
+
+    def _emit_ssh(self, step: dict, cmd_text: str = ""):
+        try:
+            host = (step.get("host") or "attacker").strip().lower()
+            if host == "vitima":
+                host = "victim"
+            self.status.setText("Abrindo SSH…")
+            try:
+                if hasattr(self, "btn_ssh"):
+                    self.btn_ssh.setEnabled(False)
+                    self.btn_ssh.setText(f"SSH em {host} (abrindo…)")
+            except Exception:
+                pass
+            self.ssh_clicked.emit(host, cmd_text or "")
+        except Exception as e:
+            logger.error(f"[Guide][{self.cid}] Falha ao acionar SSH: {e}")
+            self.status.setText("Falha ao abrir SSH ✖")
+
+    def set_ssh_done(self, msg: str = "Comando enviado via SSH ✓"):
+        self.status.setText(msg)
+        try:
+            if hasattr(self, "btn_ssh"):
+                self.btn_ssh.setEnabled(True)
+                base = self.step.get('host', 'guest')
+                self.btn_ssh.setText(f"SSH em {base}")
+        except Exception as e:
+            logger.warning(f"[Guide][{self.cid}] reabilitar SSH falhou: {e}")
 
     def _emit_run(self, step: dict):
         logger.warning(f"[Guide][{self.cid}] RUN clicado step_id={step.get('id')} host={step.get('host')}")
@@ -317,8 +523,9 @@ class StepCard(QFrame):
 # Diálogo do Guia com console
 # -----------------------------
 class ExperimentGuideDialog(QDialog):
-    def __init__(self, parent, yaml_path: str, ssh, vagrant, lab_dir: str, project_root: str):
+    def __init__(self, yaml_path: str, ssh, vagrant, lab_dir: str, project_root: str, parent=None):
         super().__init__(parent)
+        self._load_theme()
         try:
             self._apply_window_flags()
         except Exception as e:
@@ -328,10 +535,16 @@ class ExperimentGuideDialog(QDialog):
 
         self.setObjectName("GuideDialog")
         try:
-            self.yaml_path = str(Path(yaml_path).resolve())
+            self.yaml_path = str(Path(yaml_path).resolve()) if yaml_path else ""
+            if self.yaml_path and Path(self.yaml_path).is_dir():
+                logger.warning("[Guide] yaml_path aponta para diretório; forçando modo oficial.")
+                self.yaml_path = ""
         except Exception as e:
             logger.warning(f"[Guide] resolve do yaml_path falhou: {e}")
-            self.yaml_path = yaml_path
+            self.yaml_path = yaml_path or ""
+
+        self._official_mode = (not self.yaml_path) or (not Path(self.yaml_path).exists())
+        self._only_yaml_actions = bool(self.yaml_path) and (not self._official_mode)
 
         self.ssh = ssh
         self.vagrant = vagrant
@@ -344,6 +557,8 @@ class ExperimentGuideDialog(QDialog):
         self._stream_worker: _StreamWorker | None = None
         self._loader_worker: _FnWorker | None = None
         self._watchdog: QTimer | None = None
+        self._batch_running = False
+        self._batch_queue = []
 
         self._rendered_fallback = False
         self._rendered_real = False
@@ -353,6 +568,7 @@ class ExperimentGuideDialog(QDialog):
         logger.warning(f"[Guide][Dialog] parent={_safe(parent)} ssh={_safe(type(self.ssh))} vagrant={_safe(type(self.vagrant))}")
 
         self._build_ui()
+        self._update_yaml_header_label()
 
         # Garantir que a janela aparece e só então começamos tarefas
         QTimer.singleShot(0, self._start_loading_with_watchdog)
@@ -373,6 +589,20 @@ class ExperimentGuideDialog(QDialog):
             self.setSizeGripEnabled(True)
         except Exception:
             pass
+
+        try:
+            screen = QApplication.screenAt(QCursor.pos())
+            if screen:
+                size = 600
+                sg = screen.geometry()
+                x = sg.x() + (sg.width() - size) // 2
+                y = sg.y() + (sg.height() - size) // 2
+                self.setGeometry(x, y, size, size)
+            else:
+                self.setGeometry(100, 100, 600, 600)
+        except Exception as e:
+            print(f"Falha ao posicionar janela: {e}")
+            self.setGeometry(100, 100, 600, 600)
 
         logger.warning("[Guide] window flags aplicados: min/max/close habilitados")
 
@@ -428,15 +658,43 @@ class ExperimentGuideDialog(QDialog):
         header = QHBoxLayout()
         self.lbl_title = QLabel("Guia do Experimento")
         self.lbl_title.setObjectName("GuideHeader")
-        self.lbl_yaml = QLabel(Path(self.yaml_path).name)
+        self.lbl_yaml = QLabel("oficial (sem YAML)" if self._official_mode else Path(self.yaml_path).name)
         self.lbl_yaml.setObjectName("GuideYaml")
-        self.lbl_yaml.setToolTip(self.yaml_path)
+        self.lbl_yaml.setToolTip(
+            "Modo oficial (parser) sem YAML selecionado — escolha um YAML para ver ações específicas."
+            if self._official_mode else self.yaml_path
+        )
+        self.btn_pick_yaml = QPushButton("Escolher YAML…", self)
+        self.btn_pick_yaml.setToolTip("Carregar um arquivo .yaml diretamente no guia e renderizar os passos.")
+        self.btn_pick_yaml.clicked.connect(self._on_pick_yaml_in_guide)
+
         self.btn_reload = QPushButton("Recarregar (oficial)")
         self.btn_reload.clicked.connect(self._reload_official)
+
+        self.btn_clear_tests = QPushButton("Limpar testes")
+        self.btn_run_all = QPushButton("Rodar todos")
+        self.btn_mark_all_done = QPushButton("Marcar todos ✓")
+
+        self.btn_clear_tests.setToolTip("Remove os cards atuais e zera a timeline do YAML.")
+        self.btn_run_all.setToolTip("Executa todos os passos, em sequência.")
+        self.btn_mark_all_done.setToolTip("Marca todos os passos como concluídos (apenas visual e timeline).")
+
+        self.btn_clear_tests.clicked.connect(self._clear_tests)
+        self.btn_run_all.clicked.connect(self._run_all_steps)
+        self.btn_mark_all_done.clicked.connect(self._mark_all_done)
+
+        self.btn_show_basic = QPushButton("Guia básico agora")
+        self.btn_show_basic.setVisible(False)
+        self.btn_show_basic.clicked.connect(self._show_basic_fallback)
         header.addWidget(self.lbl_title)
         header.addStretch(1)
         header.addWidget(self.lbl_yaml)
+        header.addWidget(self.btn_show_basic)
+        header.addWidget(self.btn_pick_yaml)
         header.addWidget(self.btn_reload)
+        header.addWidget(self.btn_clear_tests)
+        header.addWidget(self.btn_run_all)
+        header.addWidget(self.btn_mark_all_done)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -499,11 +757,218 @@ class ExperimentGuideDialog(QDialog):
 
         _here("Dialog._build_ui:end")
 
+    def _timeline_path(self):
+        try:
+            if not getattr(self, "yaml_path", ""):
+                return None
+            meta_dir = self.project_root / ".meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
+            return meta_dir / (Path(self.yaml_path).stem + "_timeline.json")
+        except Exception as e:
+            logger.warning(f"[Guide] _timeline_path erro: {e}")
+            return None
+
+    def _clear_tests(self):
+        try:
+            logger.info("[Guide] Limpar testes solicitado")
+            try:
+                self._cancel_running(wait_worker=True)
+            except Exception as e:
+                logger.warning(f"[Guide] limpar: cancelamento falhou: {e}")
+
+            removed = 0
+            while self.cards_layout.count():
+                item = self.cards_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+                    w.deleteLater()
+                    removed += 1
+            self.cards.clear()
+
+            self.timeline = {}
+            try:
+                tpath = self._timeline_path()
+                if tpath and tpath.exists():
+                    tpath.unlink(missing_ok=True)
+                    logger.info(f"[Guide] timeline removida: {tpath}")
+            except Exception as e:
+                logger.warning(f"[Guide] limpar: falha ao remover timeline: {e}")
+
+            self.console.appendPlainText("[guide] Testes limpos. Timeline zerada.")
+            self.lbl_footer.setText("Testes limpos. Carregue um novo YAML ou recarregue o oficial.")
+            QMessageBox.information(self, "Limpar testes", "Testes limpos com sucesso.")
+        except Exception as e:
+            logger.error(f"[Guide] _clear_tests falhou: {e}")
+            QMessageBox.critical(self, "Limpar testes", f"Falha: {e}")
+
+    def _run_all_steps(self):
+        try:
+            if self._stream_worker and self._stream_worker.isRunning():
+                self._append_console("[warn] Um passo está em execução. Cancelando antes do lote…")
+                self._cancel_running(wait_worker=True)
+
+            if not self.cards:
+                QMessageBox.warning(self, "Rodar todos", "Não há passos para executar.")
+                return
+
+            self._batch_queue = []
+            for c in self.cards:
+                try:
+                    st = dict(c.step)
+                    cmd = (st.get("command") or "").strip()
+                    if not cmd:
+                        cmd = (st.get("command_normal") or st.get("command_b64") or "").strip()
+                        if cmd:
+                            st["command"] = cmd
+                    if st.get("command"):
+                        self._batch_queue.append(st)
+                except Exception as e:
+                    logger.warning(f"[Guide] montar fila: card inválido: {e}")
+
+            if not self._batch_queue:
+                QMessageBox.information(self, "Rodar todos", "Nenhum passo executável encontrado.")
+                return
+
+            self._batch_running = True
+            self.console.appendPlainText(f"[guide] Rodando {len(self._batch_queue)} passo(s) em sequência…")
+            self.lbl_footer.setText("Execução em lote iniciada…")
+
+            next_step = self._batch_queue.pop(0)
+            self._run_step_async(next_step)
+        except Exception as e:
+            logger.error(f"[Guide] _run_all_steps falhou: {e}")
+            QMessageBox.critical(self, "Rodar todos", f"Falha: {e}")
+
+    def _mark_all_done(self):
+        try:
+            if not self.cards:
+                QMessageBox.information(self, "Marcar todos ✓", "Não há passos na tela.")
+                return
+
+            count = 0
+            for card in self.cards:
+                try:
+                    card._on_done()
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"[Guide] marcar done falhou em um card: {e}")
+
+            self._write_timeline()
+            self.lbl_footer.setText(f"Todos marcados como concluídos (total={count}).")
+            self.console.appendPlainText(f"[guide] Marcados como concluídos: {count} passo(s).")
+            QMessageBox.information(self, "Marcar todos ✓", f"Concluído: {count} passo(s).")
+        except Exception as e:
+            logger.error(f"[Guide] _mark_all_done falhou: {e}")
+            QMessageBox.critical(self, "Marcar todos ✓", f"Falha: {e}")
+
+    def _update_yaml_header_label(self):
+        try:
+            if getattr(self, "yaml_path", None) and Path(self.yaml_path).exists():
+                p = Path(self.yaml_path)
+                self.lbl_yaml.setText(f"YAML: {p.name}")
+                self.lbl_yaml.setToolTip(str(p))
+            else:
+                self.lbl_yaml.setText("YAML: (oficial)")
+                self.lbl_yaml.setToolTip("Parser oficial (sem arquivo .yaml selecionado).")
+        except Exception as e:
+            logger.warning(f"[GuideUI] Falha ao atualizar label do YAML: {e}")
+
+    def _on_pick_yaml_in_guide(self):
+        try:
+            try:
+                if getattr(self, "yaml_path", None) and Path(self.yaml_path).exists():
+                    start_dir = str(Path(self.yaml_path).parent)
+                else:
+                    pr = Path(getattr(self, "project_root", "."))
+                    start_dir = str(pr / "lab" / "experiments")
+            except Exception:
+                start_dir = "."
+
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Escolher YAML de experimento (Guia)",
+                start_dir,
+                "YAML (*.yaml *.yml)"
+            )
+            if not path:
+                logger.info("[GuideUI] Escolha de YAML cancelada pelo usuário.")
+                return
+
+            p = Path(path)
+            if not p.exists():
+                QMessageBox.warning(self, "YAML não encontrado", f"O arquivo não existe:\n{path}")
+                return
+
+            self.yaml_path = str(p)
+            self._official_mode = False
+            self._only_yaml_actions = True
+            logger.info(f"[GuideUI] YAML escolhido no Guia: {self.yaml_path}")
+
+            try:
+                parent = self.parent()
+                if parent is not None:
+                    if hasattr(parent, "current_yaml_path"):
+                        parent.current_yaml_path = p
+                    if hasattr(parent, "_yaml_selected_by_user"):
+                        parent._yaml_selected_by_user = True
+                    if hasattr(parent, "_append_log"):
+                        parent._append_log(f"[Guide] YAML selecionado no guia: {p}")
+            except Exception as e:
+                logger.warning(f"[GuideUI] Falha ao sincronizar com MainWindow: {e}")
+
+            self._update_yaml_header_label()
+            self._load_steps_async()
+
+        except Exception as e:
+            logger.error(f"[GuideUI] Erro ao escolher YAML no Guia: {e}")
+            QMessageBox.critical(self, "Erro", f"Falha ao escolher/carregar o YAML:\n{e}")
+
+    def _filter_only_yaml_steps(self, steps: list[dict]) -> list[dict]:
+        """
+        Remove passos oficiais (infra/diagnóstico/prepare/check/capture) e
+        mantém apenas ações vindas do YAML (ex.: scan_, brute_, dos_, custom_).
+        """
+        try:
+            OFFICIAL_IDS = {
+                "preflight", "up_vms",
+                "attacker_prepare", "sensor_prepare",
+                "attacker_tools_check", "sensor_tools_check",
+                "connectivity", "sensor_capture_show",
+                "hydra_lists"
+            }
+
+            filtered = []
+            for st in steps:
+                sid = (st.get("id") or "").strip()
+                tags = [str(t).lower() for t in (st.get("tags") or [])]
+
+                if sid in OFFICIAL_IDS:
+                    continue
+                if any(t in ("infra", "diagnostic", "safety") for t in tags):
+                    continue
+
+                # opcional: se quiser excluir qualquer passo de "captura"
+                # if any(t in ("capture", "sensor") for t in tags):
+                #     continue
+
+                filtered.append(st)
+
+            logger.info(f"[Guide] only_yaml: {len(filtered)}/{len(steps)} passos após filtro")
+            return filtered or steps
+        except Exception as e:
+            logger.warning(f"[Guide] only_yaml filtro falhou: {e}")
+            return steps
+
     def _reload_official(self):
         try:
-            logger.warning("[Guide] Recarregar oficial solicitado")
+            logger.info("[Guide] Recarregar oficial solicitado")
             self._ignore_loader_results = False
             self._rendered_real = False
+            self._official_mode = True
+            self._only_yaml_actions = False
+            self.lbl_yaml.setText("oficial (sem YAML)")
+            self.lbl_yaml.setToolTip("Modo oficial (parser) sem YAML selecionado.")
             self.lbl_footer.setText("Recarregando (parser oficial)…")
             self._load_steps_async()
         except Exception as e:
@@ -566,11 +1031,18 @@ class ExperimentGuideDialog(QDialog):
         _here("Dialog._start_loading_with_watchdog")
         try:
             self._load_steps_async()
+
             self._watchdog = QTimer(self)
             self._watchdog.setSingleShot(True)
             self._watchdog.timeout.connect(self._on_loading_slow)
-            self._watchdog.start(6000)
-            self.lbl_footer.setText("Carregando passos do YAML…")
+            self._watchdog.start(5000)
+
+            self._watchdog2 = QTimer(self)
+            self._watchdog2.setSingleShot(True)
+            self._watchdog2.timeout.connect(self._on_loading_very_slow)
+            self._watchdog2.start(20000)
+
+            self.lbl_footer.setText("Carregando passos do guia (parser oficial)…")
         except Exception as e:
             logger.error(f"[Guide] start_loading_with_watchdog erro: {e}", exc_info=True)
 
@@ -578,7 +1050,7 @@ class ExperimentGuideDialog(QDialog):
         _here("Dialog._load_steps_async:start")
         def job():
             logger.warning(f"[Guide][Loader] parse_yaml_to_steps (oficial) yaml={self.yaml_path}")
-            return parse_yaml_to_steps(self.yaml_path, self.ssh, self.vagrant)
+            return parse_yaml_to_steps(self.yaml_path or "", self.ssh)
         w = _FnWorker(job)
         self._loader_worker = w
         w.result.connect(self._on_loader_ok)
@@ -589,13 +1061,42 @@ class ExperimentGuideDialog(QDialog):
         _here("Dialog._load_steps_async:end")
 
     def _on_loading_slow(self):
-        logger.warning("[Guide] Watchdog disparou — exibindo fallback simples.")
+        logger.warning("[Guide] Watchdog fase-1: oficial está demorando.")
         if self._rendered_real or self._rendered_fallback:
-            logger.warning("[Guide] Watchdog ignorado (já renderizou algo).")
+            logger.warning("[Guide] Watchdog fase-1 ignorado (já renderizou algo).")
+            return
+        try:
+            if getattr(self, "_loading_spinner", None):
+                try:
+                    self._loading_spinner.base = "Carregando (parser oficial demorando…)"
+                except Exception:
+                    self._loading_spinner.start("Carregando (parser oficial demorando…)")
+            if getattr(self, "_loading_label", None):
+                self._loading_label.setText("Carregando passos… (parser oficial está processando)")
+            self.lbl_footer.setText("Aguarde: obtendo passos oficiais (rede/SSH/VMs podem influenciar).")
+        except Exception as e:
+            logger.warning(f"[Guide] slow info erro: {e}")
+
+    def _on_loading_very_slow(self):
+        logger.warning("[Guide] Watchdog fase-2: ainda sem resultado; oferecendo guia básico.")
+        if self._rendered_real or self._rendered_fallback:
+            logger.warning("[Guide] Watchdog fase-2 ignorado (já renderizou algo).")
+            return
+        try:
+            self.btn_show_basic.setVisible(True)
+            self.lbl_footer.setText(
+                "Parser oficial ainda carregando… Você pode abrir o 'Guia básico agora' enquanto isso."
+            )
+        except Exception as e:
+            logger.warning(f"[Guide] very slow erro: {e}")
+
+    def _show_basic_fallback(self):
+        logger.warning("[Guide] Usuário solicitou guia básico enquanto oficial carrega.")
+        if self._rendered_real:
+            logger.warning("[Guide] Oficial já renderizado — ignorando guia básico.")
             return
         try:
             steps = self._naive_parse_yaml(self.yaml_path)
-            logger.warning(f"[Guide] Fallback montou {len(steps)} passos")
         except Exception as e:
             logger.error(f"[Guide] Fallback falhou: {e}", exc_info=True)
             steps = [{
@@ -610,14 +1111,22 @@ class ExperimentGuideDialog(QDialog):
             }]
         self._render_steps(steps, replace=True)
         self._rendered_fallback = True
-        self._ignore_loader_results = True
-        self.lbl_footer.setText("Fallback ativo — clique em ‘Recarregar (oficial)’ quando quiser.")
+        self._ignore_loader_results = False
+        self.btn_show_basic.setVisible(False)
+        self.lbl_footer.setText("Guia básico exibido — parser oficial substituirá ao concluir.")
 
     def _on_loader_ok(self, steps: list[dict]):
         logger.warning(f"[Guide] Parser oficial retornou {len(steps)} passos")
         if self._ignore_loader_results:
             logger.warning("[Guide] Ignorando resultados do parser oficial (flag ativa).")
             return
+        if (not self._official_mode) and getattr(self, "_only_yaml_actions", False):
+            try:
+                steps = self._filter_only_yaml_steps(steps)
+                self.lbl_footer.setText("Passos prontos (apenas ações do YAML).")
+            except Exception as e:
+                logger.warning(f"[Guide] falha ao filtrar only_yaml: {e}")
+                self.lbl_footer.setText("Passos prontos (parser oficial).")
         self._render_steps(steps, replace=True)
         self._rendered_real = True
         self.lbl_footer.setText("Passos prontos (parser oficial).")
@@ -640,18 +1149,18 @@ class ExperimentGuideDialog(QDialog):
     def _render_steps(self, steps: list[dict], replace: bool):
         _here(f"Dialog._render_steps replace={replace} count={len(steps)}")
         try:
-            # parar spinner
             try:
                 if getattr(self, "_watchdog", None): self._watchdog.stop()
                 if getattr(self, "_loading_spinner", None): self._loading_spinner.stop("")
                 if getattr(self, "_loading_label", None):
                     self.cards_layout.removeWidget(self._loading_label)
                     self._loading_label.deleteLater()
+                if getattr(self, "_watchdog2", None):
+                    self._watchdog2.stop()
             except Exception as e:
                 logger.warning(f"[Guide] limpar placeholder: {e}")
 
             if replace:
-                # remove antigos
                 removed = 0
                 while self.cards_layout.count():
                     item = self.cards_layout.takeAt(0)
@@ -663,11 +1172,11 @@ class ExperimentGuideDialog(QDialog):
                 self.cards.clear()
                 logger.warning(f"[Guide] cards removidos do layout: {removed}")
 
-            # adiciona novos
             for i, st in enumerate(steps, start=1):
                 logger.warning(f"[Guide] adicionando card {i}: id={st.get('id')} title={st.get('title')}")
                 card = StepCard(i, st)
                 card.run_clicked.connect(self._run_step_async)
+                card.ssh_clicked.connect(lambda host, cmd, c=card: self._ssh_exec_or_paste(host, cmd, c))
                 card.mark_done.connect(lambda s: self._mark_timeline(s, "done"))
                 self.cards_layout.addWidget(card)
                 self.cards.append(card)
@@ -693,22 +1202,174 @@ class ExperimentGuideDialog(QDialog):
                 return c
         return None
 
+    def _ssh_exec_or_paste(self, host: str, cmd: str, card: 'StepCard'):
+        """
+        Abre/reutiliza SSH e (se houver) envia o comando via tmux — sem bloquear a UI.
+        Usa _FnWorker para isolar as chamadas potencialmente lentas (status/wait_ssh/ssh).
+        """
+        try:
+            base_host = (host or "attacker").strip().lower()
+            self._append_console(f"[guide] Preparando SSH para '{base_host}'…")
+
+            def job():
+                # 1) Se a MainWindow oferece _ssh_paste, use-a (mas agora em thread)
+                parent = self.parent()
+                if parent is not None and hasattr(parent, "_ssh_paste"):
+                    parent._ssh_paste(base_host, cmd or "")
+                    return f"ssh_paste:{base_host}"
+
+                # 2) Fallback local (mesma lógica de _open_ssh_from_card, porém sem UI calls)
+                st = self.vagrant.status_by_name(base_host)
+                if st != "running":
+                    return {"warn": f"{base_host} não está 'running' (rode: vagrant up {base_host})."}
+
+                # Pode demorar – mantemos fora da UI
+                self.vagrant.wait_ssh_ready(base_host, str(self.lab_dir), attempts=10, delay_s=3)
+
+                # Abre o terminal externo
+                self.ssh.open_external_terminal(base_host)
+
+                # tmux opcional + paste do comando
+                try:
+                    session = f"guide_{base_host}"
+                    self.ssh.run_command(base_host, f"tmux new-session -d -s {session} || true", timeout=20)
+                    payload = (cmd or "").strip()
+                    if payload:
+                        import shlex
+                        quoted = shlex.quote(payload.replace("\r\n", "\n"))
+                        self.ssh.run_command(base_host, f"tmux send-keys -t {session} {quoted} C-m", timeout=20)
+                    return f"fallback_tmux:{base_host}"
+                except Exception as e:
+                    return {"warn": f"SSH aberto (sem tmux) — envie manualmente. Detalhe: {e}"}
+
+            def ok(res):
+                try:
+                    if isinstance(res, dict) and "warn" in res:
+                        self._append_console(f"[warn] {res['warn']}")
+                        card.set_ssh_done(res["warn"])
+                        self.lbl_footer.setText(res["warn"])
+                    else:
+                        self._append_console(f"[guide] SSH ativo em {host}. Comando (se fornecido) foi enviado.")
+                        card.set_ssh_done("Comando enviado via SSH ✓")
+                        self.lbl_footer.setText(f"SSH ativo em {host}.")
+                except Exception:
+                    pass
+
+            def fail(msg: str):
+                logger.error(f"[Guide] _ssh_exec_or_paste async falhou: {msg}", exc_info=False)
+                card.set_ssh_done("Falha ao enviar comando via SSH ✖")
+                try:
+                    QMessageBox.warning(self, "SSH", f"Falha: {msg}")
+                except Exception:
+                    pass
+
+            w = _FnWorker(job)
+            self._keep_worker(w)
+            w.result.connect(ok)
+            w.error.connect(fail)
+            w.finished.connect(lambda: self._cleanup_worker(w))
+            w.start()
+
+        except Exception as e:
+            logger.error(f"[Guide] _ssh_exec_or_paste falhou: {e}", exc_info=True)
+            card.set_ssh_done("Falha ao enviar comando via SSH ✖")
+            try:
+                QMessageBox.warning(self, "SSH", f"Falha: {e}")
+            except Exception:
+                pass
+
+    def _open_ssh_from_card(self, host: str, card: StepCard | None = None):
+        """
+        Abre um terminal SSH externo para 'host' com todas as salvaguardas.
+        1) Prioriza a lógica centralizada da MainWindow (_ssh), que já valida estado e SSH-ready.
+        2) Se a MainWindow não estiver disponível, aplica fallback seguro local.
+        """
+        try:
+            host = (host or "attacker").strip().lower()
+            host = {"vitima": "victim"}.get(host, host)
+
+            if self._stream_worker and self._stream_worker.isRunning():
+                self._append_console(
+                    "[guide] Aviso: há um passo em execução; abrir SSH pode interferir na leitura do console.")
+
+            try:
+                parent = self.parent()
+                if parent is not None and hasattr(parent, "_ssh"):
+                    self._append_console(f"[guide] Solicitando SSH seguro via tela principal para '{host}'…")
+                    parent._ssh(host)
+                    self.lbl_footer.setText(f"Abrindo SSH para {host}…")
+                    return
+            except Exception as e:
+                logger.warning(f"[Guide] MainWindow._ssh indisponível: {e}")
+
+            try:
+                st = self.vagrant.status_by_name(host)
+                if st != "running":
+                    self._append_console(f"[warn] {host} não está 'running'. Rode: vagrant up {host}.")
+                    QMessageBox.warning(self, "SSH", f"{host} não está 'running'.")
+                    return
+            except Exception as e:
+                self._append_console(f"[erro] Falha ao consultar status de {host}: {e}")
+                QMessageBox.critical(self, "SSH", f"Falha ao consultar status: {e}")
+                return
+
+            try:
+                self.vagrant.wait_ssh_ready(host, str(self.lab_dir), attempts=10, delay_s=3)
+                self._append_console(f"[guide] {host} com SSH pronto.")
+            except Exception as e:
+                self._append_console(f"[warn] SSH ainda não pronto em {host}: {e}")
+                QMessageBox.warning(self, "SSH", f"SSH não respondeu ainda em {host}: {e}")
+                return
+
+            try:
+                self._append_console(f"[guide] Abrindo terminal SSH externo para {host}…")
+                self.ssh.open_external_terminal(host)
+                self.lbl_footer.setText(f"Terminal SSH aberto para {host}.")
+            except Exception as e:
+                self._append_console(f"[erro] Falha ao abrir SSH externo: {e}")
+                QMessageBox.critical(self, "SSH", f"Falha ao abrir terminal: {e}")
+
+        except Exception as e:
+            logger.error(f"[Guide] _open_ssh_from_card falhou: {e}", exc_info=True)
+            try:
+                if card: card.set_idle()
+            except Exception:
+                pass
+            QMessageBox.critical(self, "SSH", f"Erro: {e}")
+
     def _run_step_async(self, step: dict):
-        host = step.get("host","attacker")
-        cmd  = (step.get("command","") or "").strip()
-        logger.warning(f"[Guide] run_step_async host={host} cmd_len={len(cmd)} step_id={step.get('id')}")
+        host = step.get("host", "attacker")
+        cmd = (step.get("command", "") or "").strip()
+        logger.info(f"[Guide] run_step_async host={host} cmd_len={len(cmd)} step_id={step.get('id')}")
+
         if not cmd:
             QMessageBox.warning(self, "Sem comando", "Este passo não definiu um comando executável.")
             return
+
+        # Tentativa opcional de substituir placeholders {attacker_ip}/{victim_ip}/{sensor_ip}
+        try:
+            if any(tok in cmd for tok in ("{attacker_ip}", "{victim_ip}", "{sensor_ip}")):
+                try:
+                    from app.core.yaml_parser import resolve_guest_ips, substitute_vars
+                    ips = resolve_guest_ips(self.ssh)
+                    cmd = substitute_vars(cmd, ips)
+                    logger.info(f"[Guide] Placeholders de IP substituídos com sucesso: {ips}")
+                except Exception as e:
+                    logger.warning(
+                        f"[Guide] Não foi possível resolver IPs agora (seguindo com o comando original): {e}")
+        except Exception as e:
+            logger.warning(f"[Guide] Substituição de placeholders falhou: {e}")
+
         if self._stream_worker and self._stream_worker.isRunning():
             self._append_console("[guide] Encerrando stream anterior…")
             self._cancel_running(wait_worker=True)
 
         card = self._find_card(step)
-        if card: card.set_running()
+        if card:
+            card.set_running()
         self._mark_timeline(step, "start")
         self._append_console("")
-        self._append_console(f"=== PASSO: {step.get('title','(sem título)')} | host={host} ===")
+        self._append_console(f"=== PASSO: {step.get('title', '(sem título)')} | host={host} ===")
         self._append_console(f"$ {cmd}")
 
         timeout = int(step.get("timeout", 600))
@@ -720,7 +1381,7 @@ class ExperimentGuideDialog(QDialog):
         w.finished.connect(lambda: (self._on_step_final(card, step), self._cleanup_worker(w)))
         self._keep_worker(w)
         self.lbl_footer.setText(f"Executando passo em {host}…")
-        logger.warning(f"[Guide] iniciando {getattr(w, 'id', '_StreamWorker')}")
+        logger.info(f"[Guide] iniciando {getattr(w, 'id', '_StreamWorker')}")
         w.start()
 
     def _on_step_done(self, card: StepCard | None, step: dict, ok: bool):
@@ -746,6 +1407,18 @@ class ExperimentGuideDialog(QDialog):
             if card: card.set_idle()
             self._mark_timeline(step, "end")
             self._write_timeline()
+
+            try:
+                if self._batch_running:
+                    if self._batch_queue:
+                        self.console.appendPlainText("[guide] Próximo passo em 0.15s…")
+                        QTimer.singleShot(150, lambda: self._run_step_async(self._batch_queue.pop(0)))
+                    else:
+                        self._batch_running = False
+                        self.console.appendPlainText("[guide] Lote concluído ✓")
+                        self.lbl_footer.setText("Execução em lote concluída.")
+            except Exception as e:
+                logger.warning(f"[Guide] batch-next falhou: {e}")
         except Exception:
             pass
 
@@ -764,6 +1437,8 @@ class ExperimentGuideDialog(QDialog):
                     self._stream_worker.wait(2000)
             self._append_console("[guide] Cancelamento solicitado.")
             self.lbl_footer.setText("Cancelamento solicitado.")
+            self._batch_running = False
+            self._batch_queue = []
         except Exception as e:
             logger.error(f"[Guide] cancel falhou: {e}")
             QMessageBox.warning(self, "Cancelar", f"Falha ao cancelar: {e}")
@@ -858,6 +1533,28 @@ class ExperimentGuideDialog(QDialog):
     # -----------------------------
     def _naive_parse_yaml(self, yaml_path: str) -> list[dict]:
         logger.warning(f"[Guide] naive_parse_yaml: {yaml_path}")
+        # 1) Guard clause para vazio/diretório/arquivo inexistente
+        try:
+            p = Path(yaml_path) if yaml_path else None
+            if (not yaml_path) or (p and (not p.exists() or p.is_dir())):
+                logger.warning("[Guide] naive_parse_yaml: sem YAML válido — usando fallback oficial.")
+                return [{
+                    "id": "fallback_official",
+                    "title": "Modo oficial (sem YAML)",
+                    "description": (
+                        "Nenhum YAML selecionado. Use 'Recarregar (oficial)' para carregar os passos padrão "
+                        "ou escolha um YAML para ver ações específicas (scan/brute/DoS)."
+                    ),
+                    "command": "",
+                    "host": "attacker",
+                    "tags": ["fallback", "official"],
+                    "eta": "",
+                    "artifacts": []
+                }]
+        except Exception as e:
+            logger.warning(f"[Guide] naive_parse_yaml guard falhou: {e}")
+
+        # 2) Parsing local rápido (apenas quando é realmente um arquivo)
         try:
             try:
                 import yaml
@@ -880,7 +1577,8 @@ class ExperimentGuideDialog(QDialog):
         for i, act in enumerate(actions, start=1):
             name = (act.get("name") or f"acao_{i}").strip()
             params = act.get("params") or {}
-            host = params.get("host") or ("attacker" if any(k in name.lower() for k in ("scan","brute","dos")) else "sensor")
+            host = params.get("host") or (
+                "attacker" if any(k in name.lower() for k in ("scan", "brute", "dos")) else "sensor")
             cmd_hint = f"# execute '{name}' com params={params}"
             steps.append({
                 "id": f"fallback_{i}",
@@ -904,3 +1602,10 @@ class ExperimentGuideDialog(QDialog):
                 "artifacts": []
             }]
         return steps
+
+    def _load_theme(self):
+        try:
+            qss = (Path(__file__).parent / "futuristic.qss").read_text(encoding="utf-8")
+            self.setStyleSheet(qss)
+        except Exception as e:
+            logger.warning(f"[Guide] load_theme falhou: {e}")

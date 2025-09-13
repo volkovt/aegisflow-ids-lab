@@ -1,23 +1,50 @@
-exp_id: "EXP_ALL"
+# ML IDS Lab — Experimento completo (scan + brute + DoS)
+# Uso exclusivo dentro do laboratório. Ajuste 'targets.victim_ip' se necessário.
+version: 1
+name: exp_all
+description: Varredura de serviços, força bruta HTTP e DoS controlado.
 targets:
-  victim_ip: "192.168.56.20"
+  victim_ip: "192.168.56.12"
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
-  zeek_rotate_seconds: 3600
+
+# Listas padrão para brute (serão usadas por passos customizados abaixo)
+brute:
+  users_inline: ["admin", "user", "test", "tcc"]
+  pass_inline: ["123456", "password", "tcc2025", "admin"]
+
 actions:
-  - name: "nmap_scan"
+  - name: custom
+    title: "Preparar listas de usuários/senhas"
+    description: "Gera ~/users.txt e ~/passwords.txt se não existirem."
+    command: |
+      set -e
+      test -f ~/users.txt     || printf "admin\nuser\ntest\ntcc\n" > ~/users.txt
+      test -f ~/passwords.txt || printf "123456\npassword\ntcc2025\nadmin\n" > ~/passwords.txt
+      wc -l ~/users.txt ~/passwords.txt
+
+  - name: nmap_scan
     params:
-      output: "exp_scan.nmap"
-  - name: "hydra_brute"
+      flags: "-sS -sV -T4 --open"
+      ports: "1-1024"
+      output: "~/exp_nmap/scan"
+
+  - name: hydra_brute
     params:
-      user: "tcc"
-      pass_list: ["123456","wrongpass"]
-      output: "exp_brute.hydra"
-  - name: "slowhttp_dos"
+      service: "http-post-form"
+      port: 80
+      # O 'path' deve incluir os campos do módulo do Hydra (formato: /Rota:params:falha)
+      # Ajuste para a sua aplicação alvo no laboratório.
+      path: "/login:username=^USER^&password=^PASS^:F=Invalid"
+      user: "~/users.txt"
+      pass_list: "~/passwords.txt"
+      output: "~/exp_brute/hydra_http"
+
+  - name: slowhttp_dos
     params:
-      port: 8080
-      duration_s: 120
+      port: 80
+      duration_s: 60
       concurrency: 400
-      rate: 150
-      output_prefix: "exp_dos"
+      rate: 50
+      output_prefix: "~/exp_dos/slowhttp"

@@ -155,37 +155,48 @@ class SSHManager:
         )
         return result
 
-    def open_external_terminal(self, name: str) -> None:
+    def open_external_terminal(self, name: str, tmux_session: str | None = None):
         """
-        Abre um terminal externo já conectado via SSH na VM.
-        Windows: chama 'wt.exe new-tab' diretamente (sem 'start') e
-        faz fallback para 'cmd.exe /k'. Em Unix mantém o fluxo atual.
+        Abre um terminal externo conectado em SSH. Se `tmux_session` for informado,
+        a conexão já entra em um tmux persistente no host remoto.
+        Retorna o objeto subprocess.Popen do terminal criado (quando aplicável).
         """
         try:
             f = self.get_ssh_fields(name)
             host = f["HostName"]
             port = f["Port"]
             user = f["User"]
-            key  = f["IdentityFile"]
+            key = f["IdentityFile"]
 
             known_hosts = _null_device()
-            ssh_cmd = f'ssh -p {port} -i "{key}" {user}@{host} ' \
-                      f'-o StrictHostKeyChecking=no -o UserKnownHostsFile={known_hosts}'
+            base = (
+                f'ssh -p {port} -i "{key}" {user}@{host} '
+                f'-o StrictHostKeyChecking=no -o UserKnownHostsFile={known_hosts}'
+            )
+
+            if tmux_session:
+                # -A: anexa se existir, cria se não existir
+                remote = f'"bash -lc \'tmux new-session -A -s {tmux_session}\'"'
+                ssh_cmd = f'{base} -t {remote}'
+            else:
+                ssh_cmd = base
+
             logger.warning(f"[SSHManager] Comando SSH para terminal externo: {ssh_cmd}")
             logger.warning(f"[SSHManager] Diretório do laboratório: {self.lab_dir}")
+
+            proc = None
 
             if os.name == "nt":
                 creation = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
                 wt = shutil.which("wt.exe")
-
                 if wt:
                     args = [wt, "new-tab", "-d", str(self.lab_dir), "cmd.exe", "/k", ssh_cmd]
                     logger.warning(f"[SSHManager] Abrindo terminal externo (Win/WT): {' '.join(args)}")
-                    subprocess.Popen(args, creationflags=creation)
+                    proc = subprocess.Popen(args, creationflags=creation)
                 else:
                     args = ["cmd.exe", "/k", ssh_cmd]
                     logger.warning(f"[SSHManager] Abrindo terminal externo (Win/CMD): {' '.join(args)}")
-                    subprocess.Popen(args, cwd=str(self.lab_dir), creationflags=creation)
+                    proc = subprocess.Popen(args, cwd=str(self.lab_dir), creationflags=creation)
             else:
                 term = (shutil.which("x-terminal-emulator")
                         or shutil.which("gnome-terminal")
@@ -195,10 +206,14 @@ class SSHManager:
                     args = [term, "--", "bash", "-lc", ssh_cmd]
                 elif term and "konsole" in term:
                     args = [term, "-e", f"bash -lc '{ssh_cmd}'"]
+                elif term:
+                    args = [term, "-e", f"bash -lc '{ssh_cmd}'"]
                 else:
                     args = ["bash", "-lc", ssh_cmd]
                 logger.warning(f"[SSHManager] Abrindo terminal externo (Unix): {' '.join(args)}")
-                subprocess.Popen(args, cwd=str(self.lab_dir))
+                proc = subprocess.Popen(args, cwd=str(self.lab_dir))
+
+            return proc
         except Exception as e:
             logger.error(f"[SSHManager] Falha ao abrir terminal externo: {e}")
             raise
@@ -269,42 +284,49 @@ class SSHManager:
     def run_command(self, name: str, command: str, timeout: int = 15, retries: int = 5) -> str:
         """
         Executa 'command' via SSH (Paramiko) checando código de saída.
-        Se esgotar as tentativas, cai em fallback: 'vagrant ssh <name> -c "<command>"'.
+        Se esgotar as tentativas, cai em fallback 'vagrant ssh -c' (somente se não for heredoc).
         """
         f = self.get_ssh_fields(name)
         host, port, user, key_path = f["HostName"], int(f["Port"]), f["User"], f["IdentityFile"]
+
+        def _needs_pty(cmd: str) -> bool:
+            t = cmd or ""
+            return ("<<'__EOF__'" in t) or ('<<"__EOF__"' in t) or ('<<__EOF__' in t) or ("\n__EOF__" in t) or (
+                        len(t) > 8000)
+
         last = None
+        cmd = (command or "").replace("\r\n", "\n")  # normaliza CRLF do Windows
+        want_pty = _needs_pty(cmd)
 
         for attempt in range(1, retries + 1):
             try:
                 self._wait_port(host, port, wait_secs=min(20, timeout + 5))
                 self._wait_ssh_banner(host, port, wait_secs=min(40, timeout + 20))
+
                 with _CONNECT_GATE:
                     client = paramiko.SSHClient()
                     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                     client.connect(
                         hostname=host, port=port, username=user,
                         key_filename=key_path, look_for_keys=False, allow_agent=False,
-                        timeout=15, banner_timeout=60, auth_timeout=30, compress=True
+                        timeout=max(20, timeout + 10)
                     )
+
+                    # IMPORTANTE: heredoc/longos pedem PTY para não fechar o canal (evita 255)
+                    stdin, stdout, stderr = client.exec_command(cmd, get_pty=want_pty, timeout=timeout)
+
+                    out = stdout.read().decode(errors="ignore")
+                    err = stderr.read().decode(errors="ignore")
+                    rc = stdout.channel.recv_exit_status()
+
                     try:
-                        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-                        out = (stdout.read() or b"").decode(errors="replace")
-                        err = (stderr.read() or b"").decode(errors="replace")
-                        try:
-                            rc = stdout.channel.recv_exit_status()
-                        except Exception:
-                            rc = 0
-                        if err.strip():
-                            logger.warning(f"[SSHManager] STDERR ({name}): {err.strip()}")
-                        if rc != 0:
-                            raise RuntimeError(f"Remote exit status {rc} — {err.strip() or out.strip()}")
-                        return out.rstrip()
-                    finally:
-                        try:
-                            client.close()
-                        except Exception:
-                            pass
+                        client.close()
+                    except Exception:
+                        pass
+
+                    if rc != 0:
+                        raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
+                    return out
             except Exception as e:
                 last = e
                 sleep_s = 0.8 * attempt
@@ -312,21 +334,26 @@ class SSHManager:
                     f"[SSHManager] Tentativa {attempt}/{retries} falhou em {name}: {e}. Retry em {sleep_s:.1f}s")
                 time.sleep(sleep_s)
 
-        try:
-            logger.info(f"[SSHManager] Fallback via 'vagrant ssh -c' em {name}")
-            proc = subprocess.run(
-                ["vagrant", "ssh", name, "-c", command],
-                cwd=self.lab_dir, text=True, capture_output=True, timeout=max(60, timeout + 30)
-            )
-            if proc.stdout:
-                logger.info(proc.stdout.strip())
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f"vagrant ssh retornou {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}")
-            return (proc.stdout or "").rstrip()
-        except Exception as e2:
-            logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last} | fallback: {e2}")
-            raise RuntimeError(f"SSH falhou em {name}: {last}")  # mantém mensagem original
+        # Fallback só é seguro quando NÃO é heredoc (evita a ‘sopa de aspas’ no Windows)
+        if not _needs_pty(cmd):
+            try:
+                logger.info(f"[SSHManager] Fallback via 'vagrant ssh -c' em {name}")
+                proc = subprocess.run(
+                    ["vagrant", "ssh", name, "-c", cmd],
+                    cwd=self.lab_dir, text=True, capture_output=True, timeout=max(60, timeout + 30)
+                )
+                if proc.stdout:
+                    logger.info(proc.stdout.strip())
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"vagrant ssh retornou {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}")
+                return (proc.stdout or "").rstrip()
+            except Exception as e2:
+                logger.error(f"[SSHManager] Erro no fallback 'vagrant ssh -c' em {name}: {e2}")
+
+        # Se chegou aqui, reporte a falha original (Paramiko)
+        logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last}")
+        raise RuntimeError(f"SSH falhou em {name}: {last}")
 
     def get_ssh_fields_safe(self, name: str) -> dict:
         try:
