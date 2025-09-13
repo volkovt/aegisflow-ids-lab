@@ -142,3 +142,49 @@ QPushButton#btnOpenGuide:hover {
     box-shadow: 0 0 12px rgba(0,255,209,0.45);
     border: 1px solid rgba(0,255,209,0.75);
 }
+
+/* colapsável */
+#MachineCard {
+  border: 1px solid rgba(0,255,170,0.25);
+  border-radius: 14px;
+  background: rgba(0, 20, 14, 0.55);
+}
+
+#MachineCard #chevron {
+  color: #00ffaa;
+  padding-right: 6px;
+}
+
+#MachineCard #machineTitle {
+  font-size: 16px;
+  font-weight: 600;
+  color: #c7ffef;
+}
+
+#MachineCard #statusDot[status="running"] { color: #00ffaa; }
+#MachineCard #statusDot[status="stopped"] { color: #ff5e5e; }
+#MachineCard #statusDot[status="unknown"] { color: #889; }
+
+/* botão de menu de ações */
+#actionMenuBtn {
+  padding: 6px 12px;
+  border: 1px solid rgba(0,255,170,0.35);
+  border-radius: 10px;
+  color: #00ffaa;
+  background: rgba(0,255,170,0.06);
+}
+
+/* badge de risco */
+#riskBadge[level="high"] {
+  color: #0a0;
+  border: 1px solid #0a0;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+#riskBadge[level="low"] {
+  color: #aa0;
+  border: 1px solid #aa0;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+

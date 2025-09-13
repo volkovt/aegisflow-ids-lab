@@ -1,7 +1,21 @@
+"""
+UI futurista (tema Matrix) para o laboratório de IDS/ML do TCC.
+
+Arquitetura:
+- ActionDockWidget (esquerda): ações agrupadas (Infra, Dataset/Experimentos).
+- MachinesBoard (centro): cards de máquinas com desenho de "computador" e ações rápidas.
+- LogConsole (base): QPlainTextEdit para logs, com fonte monoespaçada e realce neon.
+- MatrixRainWidget (fundo): animação leve de "digital rain" (mouse-transparent).
+
+Observação:
+- O main tenta importar componentes desacoplados de app.ui2.*.
+- Se ainda não existirem, define fallbacks internos equivalentes (rodável agora).
+- Mantém compatibilidade com o core atual (Vagrant/SSH/DatasetController, etc.).
+"""
+
 import inspect
 import os
 import platform
-import shlex
 import subprocess
 import sys
 import threading
@@ -12,9 +26,10 @@ from pathlib import Path
 from PySide6.QtGui import QCursor, Qt
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QPlainTextEdit, QGroupBox, QGridLayout, QMessageBox, QFileDialog, QProgressBar, QMainWindow
+    QPlainTextEdit, QGroupBox, QMessageBox, QFileDialog, QProgressBar,
+    QMainWindow, QFrame, QSizePolicy, QScrollArea, QLayout, QToolButton, QSplitter,
 )
-from PySide6.QtCore import QTimer, Signal, QThread
+from PySide6.QtCore import QTimer, Signal, QThread, QEvent, QSettings
 
 from app.core.data_collector import WarmupCoordinator
 from app.core.default_presets import preset_all, preset_scan_brute, preset_dos, preset_brute_http, preset_heavy_syn
@@ -30,9 +45,11 @@ import warnings
 
 from app.core.workers.result_worker import ResultWorker
 from app.core.workers.worker import Worker
-from app.ui.flow_layout import FlowLayout
-from app.ui.info_pills import InfoPill
-from app.ui.spinner_animation import _SpinnerAnimator
+from app.ui.components.action_dock import ActionDockWidgetExt
+from app.ui.components.machine_avatar import MachineAvatarExt
+from app.ui.components.machine_card import MachineCardWidgetExt
+from app.ui.components.ui_runner_shim import UiRunnerShim
+from app.ui.components.spinner_animation import _SpinnerAnimator
 from app.ui.step_card import ExperimentGuideDialog
 from app.ui.yaml_designer import YAMLDesignerDialog
 
@@ -44,84 +61,32 @@ except Exception:
 
 LOG_DIR = Path(".logs")
 
-def _import_orchestrator():
-    """
-    Tenta importar orquestrador tanto em 'orchestrator/*' quanto 'app/orchestrator/*'.
-    Retorna (load_experiment_from_yaml, ExperimentRunner).
-    """
-    try:
-        from lab.orchestrator.runner import ExperimentRunner
-        from lab.orchestrator.yaml_loader import load_experiment_from_yaml
-        return load_experiment_from_yaml, ExperimentRunner
-    except Exception as e:
-        raise ImportError(
-            "Módulos de orquestração não encontrados. "
-            "Crie as pastas 'orchestrator/', 'agents/', 'actions/', 'capture/', 'datasets/' e 'experiments/' "
-            "conforme sugerido (ou use 'app/orchestrator/*')."
-        ) from e
-
-class UiRunnerShim:
-    """
-    Adaptador leve para o DatasetController.
-    - Expõe .ssh para permitir cancel_all_running().
-    - Faz preflight e chama o Runner real.
-    - Se o Runner suportar cancel_event, repassa; se não, segue sem (fallback).
-    """
-    def __init__(self, ssh_manager, lab_dir: Path, project_root: Path, preflight, log):
-        self.ssh = ssh_manager
-        self._lab_dir = lab_dir
-        self._project_root = project_root
-        self._preflight = preflight
-        self._log = log
-
-    def run_from_yaml(self, yaml_path: str, out_dir: str, cancel_event=None):
+def _self_contained(fn):
+    def inner(*args, **kwargs):
+        logger = setup_logger(LOG_DIR)
+        logger.info(f"[UI] Iniciando {fn.__name__}...")
         try:
-            loader, Runner = _import_orchestrator()
-        except Exception as e:
-            raise RuntimeError(f"Orquestrador ausente: {e}")
+            return fn(*args, **kwargs)
+        finally:
+            logger.info(f"[UI] Finalizado {fn.__name__}.")
+    return inner
 
-        try:
-            try:
-                self._preflight.ensure(["attacker", "sensor", "victim"])
-            except Exception as e:
-                self._log(f"[Preflight] Aviso: {e}")
-
-            exp = loader(str(yaml_path))
-            runner = Runner(self.ssh, self._lab_dir)
-
-            try:
-                zip_path = runner.run(exp, out_dir=self._project_root / "data",
-                                      run_pre_etl=True, cancel_event=cancel_event)
-            except TypeError:
-                zip_path = runner.run(exp, out_dir=self._project_root / "data",
-                                      run_pre_etl=True)
-            return str(zip_path)
-        except Exception as e:
-            raise
-
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     log_line = Signal(str)
 
     def __init__(self):
         super().__init__()
+        self.first_show = True
         self._guide_dialog = None
-        self.setWindowTitle("VagrantLabUI — ML IDS Lab")
         self._ssh_tmux_sessions = {}
         self._workers = set()
         self._workers_lock = threading.RLock()
         self.warmup = WarmupCoordinator(warmup_window_s=30)
         self.log_line.connect(self._append_log_gui)
 
-        try:
-            screen = QApplication.screenAt(QCursor.pos())
-            if screen:
-                self.setGeometry(screen.geometry())
-            self.showMaximized()
-        except Exception as e:
-            print(f"Falha ao maximizar janela: {e}")
-            self.resize(600, 600)
-
+        self.setWindowTitle("VagrantLabUI — ML IDS Lab (Matrix Edition)")
         self.logger = setup_logger(LOG_DIR)
+
         self.project_root = get_project_root(Path(__file__))
         try:
             self.cfg_path = find_config(self.project_root / "config.yaml")
@@ -138,7 +103,6 @@ class MainWindow(QWidget):
         self.ssh = SSHManager(self.lab_dir)
         self.preflight = PreflightEnforcer(self.vagrant, self.lab_dir)
 
-        # --- Dataset Controller (toggle Gerar/Cancelar) ---
         try:
             from app.core.dataset_controller import DatasetController
         except Exception:
@@ -146,31 +110,8 @@ class MainWindow(QWidget):
         self._ds_shim = UiRunnerShim(self.ssh, self.lab_dir, self.project_root, self.preflight, self._append_log)
         self._ds_controller = DatasetController(self._ds_shim)
 
-        # UI feedback ao iniciar/terminar
-        def _ds_started():
-            try:
-                self._append_log("[Dataset] Iniciando…")
-                self.global_progress.setVisible(True)
-                self.btn_generate_dataset.setText("Cancelar")
-                self._ds_spinner = getattr(self, "_ds_spinner", None)
-                if self._ds_spinner is None:
-                    self._ds_spinner = _SpinnerAnimator(self.btn_generate_dataset, "Gerando dataset…")
-                self._ds_spinner.start()
-            except Exception as e:
-                self._append_log(f"[WARN] start dataset ui: {e}")
-
-        def _ds_finished(status: str):
-            try:
-                self.global_progress.setVisible(False)
-                if hasattr(self, "_ds_spinner") and self._ds_spinner:
-                    self._ds_spinner.stop("Gerar Dataset (YAML)")
-                self.btn_generate_dataset.setText("Gerar Dataset (YAML)")
-                self._append_log(f"[Dataset] Finalizado com status: {status}")
-            except Exception as e:
-                self._append_log(f"[WARN] finish dataset ui: {e}")
-
-        self._ds_controller.started.connect(_ds_started)
-        self._ds_controller.finished.connect(_ds_finished)
+        self._ds_controller.started.connect(self._on_ds_started)
+        self._ds_controller.finished.connect(self._on_ds_finished)
 
         self.current_yaml_path = (self.project_root / "lab" / "experiments" / "exp_all.yaml")
         self._yaml_selected_by_user = False
@@ -179,154 +120,248 @@ class MainWindow(QWidget):
         self._build_ui()
         self._load_theme()
 
-    def _ssh_paste(self, name: str, command: str):
-        """
-        Abre (se necessário) um terminal externo já anexado a um tmux persistente e envia `command`.
-        Agora detecta janela fechada (sem clientes anexados) e reabre automaticamente.
-        """
+    def _build_ui(self):
+        ActionDock = ActionDockWidgetExt
+        MachineCard = MachineCardWidgetExt
+        MatrixRain = MachineAvatarExt
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.settings = QSettings("VagrantLabUI", "MatrixEdition")
+
+        content = QWidget()
+        content.setObjectName("matrixRoot")
+        content_l = QVBoxLayout(content)
+        content_l.setContentsMargins(0, 0, 0, 0)
+        content_l.setSpacing(0)
+        root.addWidget(content, 1)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(12, 8, 12, 8)
+        lbl = QLabel("◤ MATRIX OPS")
+        lbl.setObjectName("matrixBrand")
+        top.addWidget(lbl)
+        top.addStretch(1)
+        content_l.addLayout(top)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(12, 0, 12, 0)
+        body.setSpacing(12)
+        content_l.addLayout(body, 1)
+
+        self.dock = ActionDock()
+        self.dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.dock.setMinimumWidth(265)
+
+        self.status_bar = self.dock.status_bar
+        self.btn_write = self.dock.btn_write
+        self.btn_up_all = self.dock.btn_up_all
+        self.btn_status = self.dock.btn_status
+        self.btn_halt_all = self.dock.btn_halt_all
+        self.btn_destroy_all = self.dock.btn_destroy_all
+        self.btn_preflight = self.dock.btn_preflight
+
+        self.btn_yaml_designer = self.dock.btn_yaml_designer
+        self.btn_pick_yaml = self.dock.btn_pick_yaml
+        self.btn_generate_dataset = self.dock.btn_generate_dataset
+        self.btn_open_guide = self.dock.btn_open_guide
+        self.btn_open_data = self.dock.btn_open_data
+
         try:
-            host = (name or "attacker").strip().lower()
-            if host == "vitima":
-                host = "victim"
+            for b in (
+                    self.btn_write, self.btn_up_all, self.btn_status,
+                    self.btn_halt_all, self.btn_destroy_all, self.btn_preflight,
+                    self.btn_yaml_designer, self.btn_pick_yaml, self.btn_generate_dataset,
+                    self.btn_open_guide, self.btn_open_data
+            ):
+                b.setSizePolicy(QSizePolicy.Expanding, b.sizePolicy().verticalPolicy())
+        except Exception as e:
+            self._append_log(f"[UI] ajuste dock/buttons: {e}")
 
-            st = self.vagrant.status_by_name(host)
-            if st != "running":
-                self._append_log(f"[WARN] {host} não está 'running' (rode: vagrant up {host}).")
-                return
 
-            try:
-                self.vagrant.wait_ssh_ready(host, str(self.lab_dir), attempts=10, delay_s=3)
-            except Exception as e:
-                self._append_log(f"[WARN] SSH ainda não pronto em {host}: {e}")
-                return
+        board_wrap = QFrame()
+        board_wrap.setObjectName("machinesBoard")
+        board_l = QVBoxLayout(board_wrap)
+        board_l.setAlignment(Qt.AlignTop)
+        board_l.setContentsMargins(12, 12, 12, 12)
+        board_l.setSpacing(12)
 
-            session = f"guide_{host}"
+        gb = QGroupBox("Máquinas do Lab")
+        gb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-            # 1) Garante tmux instalado e sessão criada (idempotente)
-            try:
-                self.ssh.run_command(host, "which tmux || sudo apt-get update && sudo apt-get install -y tmux",
-                                     timeout=60)
-            except Exception as e:
-                self._append_log(f"[WARN] tmux não disponível em {host}: {e}")
-            try:
-                # cria se não existir; se existir, o stderr pode ter 'duplicate session' (ok)
-                self.ssh.run_command(host, f"tmux new-session -d -s {session} || true", timeout=20)
-            except Exception as e:
-                self._append_log(f"[WARN] falha ao garantir sessão tmux em {host}: {e}")
+        wrap = QWidget()
+        wrap_l = QVBoxLayout(wrap)
+        wrap_l.setSizeConstraint(QLayout.SetNoConstraint)
+        wrap_l.setAlignment(Qt.AlignTop)
+        wrap_l.setContentsMargins(0, 0, 0, 0)
+        wrap_l.setSpacing(8)
 
-            # 2) Descobre se há cliente anexado; se não houver, reabrimos o terminal
-            attached = 0
-            try:
-                out = (self.ssh.run_command(
-                    host,
-                    f'tmux display-message -p -t {session} "#{ {"session_attached"} }"',
-                    timeout=8
-                ) or "").strip()
-                # Fallback caso a forma acima não funcione
-                if not out or not out.isdigit():
-                    out = (self.ssh.run_command(
-                        host, f"tmux list-clients -t {session} 2>/dev/null | wc -l", timeout=8
-                    ) or "0").strip()
-                attached = int(out or "0")
-            except Exception as e:
-                self._append_log(f"[WARN] não foi possível consultar clientes do tmux:{session} em {host}: {e}")
-                attached = 0
+        self.cards = {}
+        for m in self.cfg.machines:
+            card = MachineCard(m.name)
+            self.cards[m.name] = card
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            wrap_l.addWidget(card)
 
-            need_open = attached <= 0
+            card.installEventFilter(self)
 
-            # 3) Decide abrir/reativar o terminal local
-            proc = None
-            try:
-                rec = self._ssh_tmux_sessions.get(host) or {}
-                old_proc = rec.get("proc")
-                if old_proc is not None:
-                    try:
-                        # Se o processo do terminal morreu, consideramos como fechado
-                        if hasattr(old_proc, "poll") and old_proc.poll() is not None:
-                            need_open = True
-                    except Exception:
-                        need_open = True
-            except Exception:
-                pass
+            card.act_up.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self._on_up_vm(n, b))
+            card.act_status.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self._run_status_by_name(n, b))
+            card.act_restart.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self._on_restart_vm(n, b))
+            card.act_halt.triggered.connect(
+                lambda _=False, n=m.name, b=card.menu_btn: self._run_vagrant(self.vagrant.halt, n, b, "Halt…", "Ações"))
+            card.act_destroy.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self._on_destroy_vm(n, b))
+            card.act_ssh.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self._ssh(n, b))
 
-            if need_open:
-                self._append_log(f"Abrindo terminal SSH (tmux:{session}) para {host}…")
+        machinesScroll = QScrollArea()
+        machinesScroll.setObjectName("machinesScroll")
+        machinesScroll.setWidgetResizable(True)
+        machinesScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        machinesScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        machinesScroll.setFrameShape(QFrame.NoFrame)
+        machinesScroll.setAlignment(Qt.AlignTop)
+        machinesScroll.setWidget(wrap)
+
+        self.machinesScroll = machinesScroll
+        self.machinesWrap = wrap
+
+        wrap.setMinimumSize(0, 0)
+        wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
+        self.machinesScroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        gb_layout = QVBoxLayout(gb)
+        gb_layout.setAlignment(Qt.AlignTop)
+        gb_layout.setContentsMargins(8, 8, 8, 8)
+        gb_layout.setSpacing(6)
+        gb_layout.addWidget(machinesScroll)
+
+        board_l.addWidget(gb, 1)
+
+        self.global_progress = QProgressBar()
+        self.global_progress.setRange(0, 0)
+        self.global_progress.setVisible(False)
+        self.global_progress.setObjectName("globalProgress")
+        board_l.addWidget(self.global_progress)
+
+        console = QGroupBox("Console")
+        cv = QVBoxLayout(console)
+        cv.setAlignment(Qt.AlignTop)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setObjectName("logConsole")
+        self.log_view.setMinimumHeight(240)
+        console.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        cv.addWidget(self.log_view)
+
+        board_l.addWidget(console, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setObjectName("boardScroll")
+        scroll.setWidget(board_wrap)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.splitter = QSplitter(Qt.Horizontal, self)
+        self.splitter.setObjectName("mainSplitter")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.dock)
+        self.splitter.addWidget(scroll)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setHandleWidth(6)
+        self.splitter.setSizes([265, 1000])
+
+        body.addWidget(self.splitter, 1)
+
+        try:
+            sizes = self.settings.value("splitter/sizes")
+            if isinstance(sizes, (list, tuple)) and len(sizes) == 2:
+                self.splitter.setSizes([int(sizes[0]), int(sizes[1])])
+        except Exception as e:
+            self._append_log(f"[UI] Falha ao restaurar splitter: {e}")
+
+        try:
+            self.splitter.splitterMoved.connect(
+                lambda *_: self._append_log(f"[UI] Splitter movido: {self.splitter.sizes()}")
+            )
+        except Exception as e:
+            self._append_log(f"[UI] Falha ao conectar splitterMoved: {e}")
+
+        self._rain = MatrixRain(self)
+        self._rain.setObjectName("matrixRain")
+        self._rain.lower()
+        self._pos_rain_timer = QTimer(self)
+        self._pos_rain_timer.setSingleShot(True)
+
+        self.btn_write.clicked.connect(self.on_write)
+        self.btn_up_all.clicked.connect(self.on_click_up_all)
+        self.btn_status.clicked.connect(self.on_status)
+        self.btn_halt_all.clicked.connect(self.on_halt_all)
+        self.btn_destroy_all.clicked.connect(self.on_destroy_all)
+        self.btn_preflight.clicked.connect(self.on_preflight)
+
+        self.btn_yaml_designer.clicked.connect(self.on_yaml_designer)
+        self.btn_pick_yaml.clicked.connect(self.on_pick_yaml)
+        self.btn_generate_dataset.clicked.connect(self.on_generate_dataset)
+        self.btn_open_guide.clicked.connect(self.on_open_guide)
+        self.btn_open_data.clicked.connect(lambda: self._open_folder(self.project_root / "data"))
+
+        self.updateGeometry()
+
+    def showEvent(self, event):
+        try:
+            if self.first_show:
+                self.first_show = False
+
                 try:
-                    # Agora open_external_terminal retorna o processo do terminal
-                    proc = self.ssh.open_external_terminal(host, tmux_session=session)
-                    # breve respiro para anexar
-                    time.sleep(1.0)
-                    # atualiza nosso registry local
-                    self._ssh_tmux_sessions[host] = {"session": session, "opened": True, "proc": proc}
-                except Exception as e:
-                    self._append_log(f"[ERRO] Falha ao abrir SSH externo: {e}")
-                    return
-            else:
-                self._append_log(f"[SSH] Terminal já anexado ao tmux:{session} em {host} (clientes={attached}).")
-
-            # 4) Envia o comando para a sessão tmux (se houver payload)
-            try:
-                cmd = (command or "").strip().replace("\r\n", "\n")
-                if cmd:
-                    quoted = shlex.quote(cmd)
-                    self.ssh.run_command(host, f"tmux send-keys -t {session} {quoted} C-m", timeout=20)
-                    self._append_log(f"[SSH] Comando enviado ao tmux:{session} em {host}.")
-                else:
-                    self._append_log(f"[SSH] Sessão tmux:{session} pronta em {host} (sem comando para enviar).")
-            except Exception as e:
-                self._append_log(f"[WARN] Falha ao enviar comando ao tmux em {host}: {e}")
+                    screen = QApplication.screenAt(QCursor.pos())
+                    geo = screen.availableGeometry()
+                    self.setGeometry(geo)
+                    self.showMaximized()
+                except Exception:
+                    screen = QApplication.primaryScreen()
+                    if screen is not None:
+                        geo = screen.availableGeometry()
+                        self.setGeometry(geo)
 
         except Exception as e:
-            self._append_log(f"[ERRO] _ssh_paste falhou: {e}")
+            self._append_log(f"[UI] showEvent: {e}")
 
-    def _with_ui_lock(self, fn, busy_msg: str):
-        """
-        Desabilita botões e mostra 'carregando' enquanto executa fn.
-        """
+    def _on_ds_started(self):
+        try:
+            self._append_log("[Dataset] Iniciando…")
+            self.global_progress.setVisible(True)
+            self.btn_generate_dataset.setText("Cancelar")
+            self._ds_spinner = getattr(self, "_ds_spinner", None)
+            if self._ds_spinner is None:
+                self._ds_spinner = _SpinnerAnimator(self.btn_generate_dataset, "Gerando dataset…")
+            self._ds_spinner.start()
+        except Exception as e:
+            self._append_log(f"[WARN] start dataset ui: {e}")
 
-        def wrapper():
-            try:
-                self._set_busy(True, busy_msg)
-                fn()
-            except Exception as e:
-                self._append_log(f"[ERRO] {busy_msg}: {e}")
-            finally:
-                self._set_busy(False)
-
-        return wrapper
-
-    def on_click_status(self):
-        """
-        Handler do botão Status — AGORA com Preflight obrigatório.
-        """
-        @_self_contained
-        def run():
-            names = ["attacker", "sensor", "victim"]
-            try:
-                self.preflight.ensure(names)
-                states = self.vagrant.status()
-                self._apply_status_to_cards(states)
-                running = [n for n in names if self.vagrant.status_by_name(n) == "running"]
-                for i, n in enumerate(running):
-                    delay_ms = 1200 * i
-                    QTimer.singleShot(delay_ms, lambda name=n: self._spawn_info_update(name, "running"))
-            except Exception as e:
-                self._append_log(f"[ERRO] Status: {e}")
-
-        self._with_ui_lock(run, "Atualizando status")()
+    def _on_ds_finished(self, status: str):
+        try:
+            self.global_progress.setVisible(False)
+            if hasattr(self, "_ds_spinner") and self._ds_spinner:
+                self._ds_spinner.stop("Gerar Dataset (YAML)")
+            self.btn_generate_dataset.setText("Gerar Dataset (YAML)")
+            self._append_log(f"[Dataset] Finalizado com status: {status}")
+        except Exception as e:
+            self._append_log(f"[WARN] finish dataset ui: {e}")
 
     def _set_busy(self, busy: bool, msg: str = ""):
         try:
-            self.btn_write.setEnabled(not busy)
-            self.btn_up_all.setEnabled(not busy)
-            self.btn_status.setEnabled(not busy)
-            self.btn_halt_all.setEnabled(not busy)
-            self.btn_destroy_all.setEnabled(not busy)
-            self.btn_preflight.setEnabled(not busy)
-            self.btn_yaml_designer.setEnabled(not busy)
-            self.btn_pick_yaml.setEnabled(not busy)
-            self.btn_generate_dataset.setEnabled(not busy)
-            self.btn_open_data.setEnabled(not busy)
+            for b in [self.btn_write, self.btn_up_all, self.btn_status,
+                      self.btn_halt_all, self.btn_destroy_all, self.btn_preflight,
+                      self.btn_yaml_designer, self.btn_pick_yaml, self.btn_generate_dataset,
+                      self.btn_open_data]:
+                b.setEnabled(not busy)
             if busy:
                 self.status_bar.setText(msg or "Aguarde...")
                 QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -373,17 +408,17 @@ class MainWindow(QWidget):
         except Exception as e:
             self._append_log(f"[WARN] _on_worker_done: {e}")
 
-    def _wire_button_with_worker(self, btn: QPushButton, worker, active_label: str, idle_label: str):
-        """
-        Coloca spinner + desabilita o botão durante o worker e restaura ao final.
-        """
+    def _wire_button_with_worker(self, btn, worker, active_label: str, idle_label: str):
         try:
-            spinner = _SpinnerAnimator(btn, active_label)
+            target = btn if not isinstance(btn, QToolButton) else self.status_bar
+            spinner = _SpinnerAnimator(target, active_label)
             spinner.start()
 
             def _restore():
                 try:
-                    spinner.stop(idle_label)
+                    spinner.stop("" if target is self.status_bar else idle_label)
+                    if target is self.status_bar and hasattr(btn, "setText"):
+                        btn.setText(idle_label)
                 except Exception as e:
                     self._append_log(f"[WARN] restore botão: {e}")
 
@@ -391,276 +426,6 @@ class MainWindow(QWidget):
             worker.error.connect(lambda msg: _restore())
         except Exception as e:
             self._append_log(f"[WARN] _wire_button_with_worker: {e}")
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-
-        self.status_bar = QLabel("")
-        self.status_bar.setObjectName("statusBar")
-        self.status_bar.setStyleSheet("padding: 4px;")
-        layout.addWidget(self.status_bar)
-
-        self.global_progress = QProgressBar()
-        self.global_progress.setRange(0, 0)
-        self.global_progress.setVisible(False)
-        layout.addWidget(self.global_progress)
-
-        # Ações principais
-        actions = QHBoxLayout()
-        self.btn_write = QPushButton("Gerar Vagrantfile")
-        self.btn_up_all = QPushButton("Subir todas")
-        self.btn_status = QPushButton("Status")
-        self.btn_halt_all = QPushButton("Halt todas")
-        self.btn_destroy_all = QPushButton("Destroy todas")
-        self.btn_preflight = QPushButton("Preflight")
-
-        for b in [self.btn_write, self.btn_up_all, self.btn_status,
-                  self.btn_halt_all, self.btn_destroy_all, self.btn_preflight]:
-            actions.addWidget(b)
-        layout.addLayout(actions)
-
-        # Bloco de Dataset & Experimentos
-        ds_actions = QHBoxLayout()
-        self.btn_yaml_designer = QPushButton("Designer (YAML)")
-        self.btn_pick_yaml = QPushButton("Escolher YAML")
-        self.btn_generate_dataset = QPushButton("Gerar Dataset (YAML)")
-        self.btn_open_guide = QPushButton("Guia do Experimento")
-        self.btn_open_data = QPushButton("Abrir pasta data")
-        for b in [self.btn_yaml_designer, self.btn_pick_yaml, self.btn_generate_dataset, self.btn_open_guide, self.btn_open_data]:
-            ds_actions.addWidget(b)
-        layout.addLayout(ds_actions)
-
-        self.btn_open_guide.setObjectName("btnOpenGuide")
-
-        # Tooltips
-        self.btn_write.setToolTip("Gera/atualiza o Vagrantfile do laboratório")
-        self.btn_up_all.setToolTip("Sobe attacker, sensor e victim (com aquecimento automático)")
-        self.btn_status.setToolTip("Consulta o status das VMs")
-        self.btn_halt_all.setToolTip("Desliga as VMs (halt)")
-        self.btn_destroy_all.setToolTip("Destrói as VMs (irreversível)")
-        self.btn_preflight.setToolTip("Roda validações essenciais do lab")
-
-        self.btn_yaml_designer.setToolTip("Abrir designer visual de experimentos (YAML)")
-        self.btn_pick_yaml.setToolTip("Escolher um arquivo YAML de experimento")
-        self.btn_generate_dataset.setToolTip("Executa o experimento e empacota o dataset")
-        self.btn_open_data.setToolTip("Abrir a pasta dos datasets gerados")
-        self.btn_open_guide.setToolTip("Mostra um passo-a-passo baseado no YAML selecionado")
-
-        # Cards por VM
-        gb = QGroupBox("Máquinas do Lab")
-        grid = QGridLayout()
-        self.cards = {}
-        for i, m in enumerate(self.cfg.machines):
-            card = self._machine_card(m.name)
-            grid.addWidget(card, i // 3, i % 3)
-            self.cards[m.name] = card
-        gb.setLayout(grid)
-        layout.addWidget(gb)
-
-        # Logs
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        layout.addWidget(self.log_view, stretch=1)
-
-        # Conexões
-        self.btn_write.clicked.connect(self.on_write)
-        self.btn_up_all.clicked.connect(self.on_click_up_all)
-        self.btn_status.clicked.connect(self.on_status)
-        self.btn_halt_all.clicked.connect(self.on_halt_all)
-        self.btn_destroy_all.clicked.connect(self.on_destroy_all)
-        self.btn_preflight.clicked.connect(self.on_preflight)
-
-        self.btn_yaml_designer.clicked.connect(self.on_yaml_designer)
-        self.btn_pick_yaml.clicked.connect(self.on_pick_yaml)
-        self.btn_generate_dataset.clicked.connect(self.on_generate_dataset)
-        self.btn_open_guide.clicked.connect(self.on_open_guide)
-        self.btn_open_data.clicked.connect(lambda: self._open_folder(self.project_root / "data"))
-
-    def _machine_card(self, name: str) -> QWidget:
-        w = QWidget()
-        v = QVBoxLayout(w)
-        title = QLabel(f"{name}")
-        title.setStyleSheet("font-size: 16pt; color:#00ffd1; font-weight:600;")
-        v.addWidget(title)
-
-        status = QLabel("●")
-        status.setObjectName("statusDot")
-        status.setProperty("status", "unknown")
-        v.addWidget(status)
-
-        pill_container = QWidget()
-        pill_flow = FlowLayout(pill_container, hspacing=8, vspacing=8)
-        pill_container.setLayout(pill_flow)
-
-        pill_so = InfoPill("SO", "—", kind="so", parent=pill_container)
-        pill_host = InfoPill("Host", "—", kind="host", parent=pill_container)
-        pill_guest = InfoPill("Guest", "—", kind="guest", parent=pill_container)
-
-        pill_flow.addWidget(pill_so)
-        pill_flow.addWidget(pill_host)
-        pill_flow.addWidget(pill_guest)
-
-        v.addWidget(pill_container)
-
-        row = QHBoxLayout()
-        b_up = QPushButton("Up")
-        b_status = QPushButton("Status")
-        b_halt = QPushButton("Halt")
-        b_restart = QPushButton("Restart")
-        b_destroy = QPushButton("Destroy")
-        b_ssh = QPushButton("SSH")
-
-        row.addWidget(b_up)
-        row.addWidget(b_status)
-        row.addWidget(b_halt)
-        row.addWidget(b_restart)
-        row.addWidget(b_destroy)
-        row.addWidget(b_ssh)
-        v.addLayout(row)
-
-        # Ligações
-        b_up.clicked.connect(lambda: self._run_vagrant(self._on_up_vm, name, b_up, "Subindo…", "Up"))
-        b_status.clicked.connect(lambda: self._run_status_by_name(name, b_status))
-        b_halt.clicked.connect(lambda: self._run_vagrant(self.vagrant.halt, name, b_halt, "Halt…", "Halt"))
-        b_restart.clicked.connect(lambda: self._on_restart_vm(name, b_restart))
-        b_destroy.clicked.connect(
-            lambda: self._run_vagrant(self.vagrant.destroy, name, b_destroy, "Destroy…", "Destroy"))
-        b_ssh.clicked.connect(lambda: self._ssh(name, b_ssh))
-
-        w.statusDot = status
-        w.pills = {"so": pill_so, "host": pill_host, "guest": pill_guest}
-        return w
-
-    def _on_up_vm(self, name: str, btn: QPushButton = None):
-        def gen():
-            yield f"[Up] Subindo {name}..."
-            for ln in self.vagrant.up(name):
-                yield ln
-            try:
-                self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=12, delay_s=3)
-                yield f"[Up] {name} está 'running' e SSH pronto."
-                self.warmup.mark_boot(name)
-                yield f"[Warmup] {name}: janela de aquecimento iniciada (30s)."
-            except Exception as e:
-                yield f"[Up] {name} 'running' porém SSH ainda não respondeu: {e}"
-
-        worker = Worker(gen)
-        worker.line.connect(self._append_log)
-
-        def finalize():
-            try:
-                out = self.vagrant.status()
-                self._apply_status_to_cards(out)
-            except Exception as e:
-                self._append_log(f"[Up] Falha ao atualizar status: {e}")
-
-        worker.done.connect(finalize)
-        worker.error.connect(lambda msg: self._append_log(f"[ERRO] Up {name}: {msg}"))
-
-        if btn is not None:
-            self._wire_button_with_worker(btn, worker, "Subindo…", "Up")
-
-        self._keep_worker(worker, tag=f"up:{name}")
-        worker.start()
-
-    def _append_log(self, text: str):
-        """
-        Log seguro para threads:
-        - Sempre escreve no logger (thread-safe).
-        - Se for GUI thread, escreve na UI direto.
-        - Se for worker thread, emite um sinal que a GUI thread consome.
-        """
-        try:
-            frame = inspect.currentframe().f_back
-            lineno = frame.f_lineno if frame else -1
-        except Exception:
-            lineno = -1
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        formatted = f"{timestamp} | linha {lineno} | {text}"
-
-        try:
-            self.logger.info(text)
-        except Exception:
-            pass
-
-        try:
-            if QThread.currentThread() is QApplication.instance().thread():
-                self._append_log_gui(formatted)
-            else:
-                self.log_line.emit(formatted)
-        except Exception:
-            pass
-
-    def _append_log_gui(self, formatted: str):
-        """Executa exclusivamente na GUI thread."""
-        try:
-            self.log_view.appendPlainText(formatted)
-        except Exception as e:
-            import logging
-            logging.error(f"Falha ao atualizar log_view: {e}")
-
-    def _run_vagrant(self, fn, name=None, btn: QPushButton | None = None, active_label: str | None = None, idle_label: str | None = None):
-        try:
-            fn_name = getattr(fn, "__name__", "").lower()
-            if fn_name in ("halt", "destroy"):
-                self._append_log(f"[Thread] Parando threads antes de '{fn_name}'…")
-                self._quiesce_background(reason=fn_name, timeout_s=6)
-        except Exception as e:
-            self._append_log(f"[WARN] _run_vagrant(quiesce): {e}")
-
-        worker = Worker(fn, name) if name else Worker(fn)
-        worker.line.connect(self._append_log)
-        worker.error.connect(lambda msg: self._append_log(f"[ERRO] {msg}"))
-        worker.done.connect(lambda: self._append_log("[OK] Finalizado."))
-        if btn is not None:
-            self._wire_button_with_worker(btn, worker, active_label or "Executando…", idle_label or btn.text())
-        self._keep_worker(worker, tag=f"vagrant:{fn.__name__}")
-        worker.start()
-
-    def _ssh(self, name: str, btn: QPushButton | None = None):
-        """
-        Abre o SSH da VM em uma thread (Worker) para não travar a UI.
-        Faz as validações mínimas (running + wait_ssh_ready) e chama o SSHManager.
-        """
-        def gen():
-            try:
-                yield f"[SSH] Preparando {name}…"
-                st = self.vagrant.status_by_name(name)
-                if st != "running":
-                    yield f"[WARN] {name} não está 'running' (rode: vagrant up {name})."
-                    return "skip"
-
-                try:
-                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
-                    yield f"[SSH] {name} com SSH pronto."
-                except Exception as e:
-                    yield f"[WARN] SSH ainda não pronto em {name}: {e}"
-                    return "skip"
-
-                yield f"Abrindo terminal SSH externo para {name}…"
-                try:
-                    self.ssh.open_external_terminal(name)
-                    return "ok"
-                except Exception as e:
-                    yield f"[ERRO] Falha ao abrir SSH externo: {e}"
-                    return "error"
-            except Exception as e:
-                yield f"[ERRO] SSH {name}: {e}"
-                return "error"
-
-        try:
-            worker = Worker(gen)
-            worker.line.connect(self._append_log)
-            worker.error.connect(lambda msg: self._append_log(f"[ERRO] SSH {name}: {msg}"))
-
-            if btn is not None:
-                self._wire_button_with_worker(btn, worker, "SSH", "SSH")
-
-            self._keep_worker(worker, tag=f"ssh:{name}")
-            worker.start()
-        except Exception as e:
-            self._append_log(f"[ERRO] _ssh: {e}")
 
     def on_write(self):
         try:
@@ -793,26 +558,15 @@ class MainWindow(QWidget):
             self._append_log(f"Erro no status de {name}: {e}")
 
     def _on_restart_vm(self, name: str, btn: QPushButton | None = None):
-        """
-        Reinicia a VM 'name' com segurança:
-        - Tenta vagrant reload (se disponível no VagrantManager).
-        - Fallback para halt + up quando reload não existir.
-        - Aguarda SSH ficar pronto e marca janela de aquecimento.
-        - Atualiza o status do card ao final.
-        """
-
         def gen():
             try:
                 self._append_log(f"[Restart] Reiniciando {name}…")
-
-                # Quiesce threads ativas (como em halt/destroy)
                 try:
                     self._append_log("[Thread] Parando threads antes de 'reload'…")
                     self._quiesce_background(reason="reload", timeout_s=6)
                 except Exception as e:
                     self._append_log(f"[WARN] reload quiesce: {e}")
 
-                # Se não está running, apenas "Up"
                 try:
                     st = self.vagrant.status_by_name(name)
                 except Exception as e:
@@ -828,7 +582,6 @@ class MainWindow(QWidget):
                         yield f"[ERRO] Up {name}: {e}"
                         return "error"
                 else:
-                    # Tenta reload nativo se existir
                     try:
                         if hasattr(self.vagrant, "reload"):
                             yield f"[Restart] Executando vagrant reload em {name}…"
@@ -844,7 +597,6 @@ class MainWindow(QWidget):
                         yield f"[ERRO] Restart {name}: {e}"
                         return "error"
 
-                # Aguarda SSH e marca janela de aquecimento
                 try:
                     self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
                     yield f"[Restart] {name} está 'running' e SSH pronto."
@@ -869,13 +621,10 @@ class MainWindow(QWidget):
             worker.line.connect(self._append_log)
             worker.error.connect(lambda msg: self._append_log(f"[ERRO] Restart {name}: {msg}"))
 
-            # spinner no botão
             if btn is not None:
                 self._wire_button_with_worker(btn, worker, "Restart…", "Restart")
 
-            # ao terminar, atualiza status/infos do card
             worker.done.connect(lambda: self.status_by_name(name))
-
             self._keep_worker(worker, tag=f"restart:{name}")
             worker.start()
         except Exception as e:
@@ -920,11 +669,6 @@ class MainWindow(QWidget):
             self._append_log(f"[ERRO] Escolher YAML: {e}")
 
     def on_generate_dataset(self):
-        """
-        Agora funciona em modo toggle:
-        - Se NÃO estiver rodando => inicia geração (usa DatasetController).
-        - Se JÁ estiver rodando => solicita cancelamento imediato.
-        """
         try:
             w = getattr(self._ds_controller, "_worker", None)
             if w and w.is_alive():
@@ -935,7 +679,6 @@ class MainWindow(QWidget):
                     self._append_log(f"[ERRO] Cancel: {e}")
                 return
 
-            # iniciar
             yaml_path = str(self.current_yaml_path)
             out_dir = str(self.project_root / "data")
             self._ds_controller.start(yaml_path, out_dir)
@@ -943,6 +686,7 @@ class MainWindow(QWidget):
         except Exception as e:
             self._append_log(f"[ERRO] Dataset: {e}")
 
+    # ========= Utilidades e compat =========
     def _open_folder(self, path: Path):
         try:
             path = Path(path)
@@ -976,13 +720,6 @@ class MainWindow(QWidget):
             return "desconhecido"
 
     def _collect_machine_details(self, name: str, state_hint: str | None = None) -> tuple[str, str, str]:
-        """
-        Retorna (os_text, host_endpoint, guest_ip)
-        - os_text: agora usa _query_os_friendly(name) quando a VM está 'running',
-                   gerando algo como 'Ubuntu 16.04 LTS (x86_64, kernel 4.15.0)'.
-        - host_endpoint: 'Host:Port' via ssh-config quando rodando; senão '—'.
-        - guest_ip: calculado do config (ip_base + octeto).
-        """
         try:
             m = self.machine_by_name[name]
         except KeyError:
@@ -1039,10 +776,17 @@ class MainWindow(QWidget):
     def _set_card_info(self, name: str, os_text: str, host_endpoint: str, guest_ip: str):
         try:
             card = self.cards[name]
+            if hasattr(card, "_set_card_info"):
+                card._set_card_info(os_text, host_endpoint, guest_ip)
+                return
+            if hasattr(card, "set_pill_values"):
+                card.set_pill_values(os_text, host_endpoint, guest_ip)
+                return
             if hasattr(card, "pills"):
                 card.pills["so"].setValue(os_text)
                 card.pills["host"].setValue(host_endpoint)
                 card.pills["guest"].setValue(guest_ip)
+            self._append_log(f"[UI] _set_card_info aplicado para {name}.")
         except Exception as e:
             self._append_log(f"[WARN] _set_card_info falhou para {name}: {e}")
 
@@ -1120,13 +864,6 @@ class MainWindow(QWidget):
         w.start()
 
     def _build_vagrant_ctx_from_yaml(self, yaml_path: Path | None) -> dict:
-        """
-        Monta o contexto usado pelo Vagrantfile a partir do config principal,
-        ajustando o IP da vítima conforme o YAML (se existir).
-        - Base: self.cfg.to_template_ctx()
-        - Se YAML tiver targets.victim_ip e corresponder ao ip_base do lab,
-          atualiza o ip_last_octet da máquina 'victim' no ctx.
-        """
         try:
             base_ctx = self.cfg.to_template_ctx()
         except Exception as e:
@@ -1190,18 +927,11 @@ class MainWindow(QWidget):
         except Exception as e:
             self._append_log(f"[WARN] Não foi possível ajustar IP da vítima: {e}")
 
-        # Finaliza o ctx para o template
         ctx["machines"] = machines
         ctx["ip_base"] = getattr(self.cfg, "ip_base", ctx.get("ip_base"))
         return ctx
 
     def _query_os_friendly(self, name: str, timeout: int = 12) -> str:
-        """
-        Retorna um nome de SO amigável, ex.:
-        - Ubuntu 16.04 LTS (x86_64, kernel 4.15.0)
-        - Kali GNU/Linux Rolling (x86_64, kernel 6.10.9)
-        - Windows Server 2019 10.0 (64-bit, build 17763)
-        """
         cmd_linux = r"""
             set -e
             get_name() {
@@ -1287,7 +1017,7 @@ class MainWindow(QWidget):
         except Exception as e:
             self._append_log(f"[WARN] Falha ao garantir presets: {e}")
 
-    def on_yaml_designer(self):  # << NOVO
+    def on_yaml_designer(self):
         try:
             dlg = YAMLDesignerDialog(
                 parent=self,
@@ -1302,9 +1032,6 @@ class MainWindow(QWidget):
             self._append_log(f"[UI] Erro ao abrir Designer (YAML): {e}")
 
     def _mark_boot_if_running(self, name: str) -> None:
-        """
-        Se a VM estiver 'running', registra o mark_boot(name) para o coordenador de warm-up.
-        """
         try:
             st = self.vagrant.status_by_name(name)
             if st == "running":
@@ -1319,10 +1046,6 @@ class MainWindow(QWidget):
             self._append_log(f"[Warmup] Falha ao checar status de {name}: {e}")
 
     def _up_vm_and_mark(self, name: str) -> None:
-        """
-        Sobe a VM 'name' e, ao detectar 'running', registra o warmup.mark_boot(name).
-        Também dá um pequeno preflight para estabilizar o sshd.
-        """
         try:
             self._append_log(f"[Up] Subindo {name}...")
             self.vagrant.up(name)
@@ -1388,10 +1111,6 @@ class MainWindow(QWidget):
             self._append_log(f"[WARN] _cancel_worker: {e}")
 
     def _quiesce_background(self, reason: str = "quiesce", timeout_s: int = 5):
-        """
-        Pede para todas as threads pararem antes de operações destrutivas (halt/destroy).
-        Espera até timeout e então força término se necessário.
-        """
         try:
             self._append_log(f"[Thread] Quiescendo background por '{reason}'…")
             with self._workers_lock:
@@ -1408,7 +1127,6 @@ class MainWindow(QWidget):
                 try:
                     remaining = max(0.0, deadline - time.time())
                     if remaining > 0:
-                        # QThread.wait recebe ms
                         w.wait(int(remaining * 1000))
                 except Exception as e:
                     self._append_log(f"[WARN] wait worker: {e}")
@@ -1433,18 +1151,78 @@ class MainWindow(QWidget):
         except Exception as e:
             self.logger.warning(f"[UI] Falha ao carregar tema: {e}")
 
-def _self_contained(fn):
-    """
-    Decorator simples para logar início/fim de ações do UI thread.
-    """
-    def inner(*args, **kwargs):
-        logger = setup_logger(LOG_DIR)
-        logger.info(f"[UI] Iniciando {fn.__name__}...")
+    # ========= SSH/Terminal (mantidos) =========
+    def _ssh(self, name: str, btn: QPushButton | None = None):
+        def gen():
+            try:
+                yield f"[SSH] Preparando {name}…"
+                st = self.vagrant.status_by_name(name)
+                if st != "running":
+                    yield f"[WARN] {name} não está 'running' (rode: vagrant up {name})."
+                    return "skip"
+
+                try:
+                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
+                    yield f"[SSH] {name} com SSH pronto."
+                except Exception as e:
+                    yield f"[WARN] SSH ainda não pronto em {name}: {e}"
+                    return "skip"
+
+                yield f"Abrindo terminal SSH externo para {name}…"
+                try:
+                    self.ssh.open_external_terminal(name)
+                    return "ok"
+                except Exception as e:
+                    yield f"[ERRO] Falha ao abrir SSH externo: {e}"
+                    return "error"
+            except Exception as e:
+                yield f"[ERRO] SSH {name}: {e}"
+                return "error"
+
         try:
-            return fn(*args, **kwargs)
-        finally:
-            logger.info(f"[UI] Finalizado {fn.__name__}.")
-    return inner
+            worker = Worker(gen)
+            worker.line.connect(self._append_log)
+            worker.error.connect(lambda msg: self._append_log(f"[ERRO] SSH {name}: {msg}"))
+
+            if btn is not None:
+                self._wire_button_with_worker(btn, worker, "SSH", "SSH")
+
+            self._keep_worker(worker, tag=f"ssh:{name}")
+            worker.start()
+        except Exception as e:
+            self._append_log(f"[ERRO] _ssh: {e}")
+
+    # ========= Logging thread-safe =========
+    def _append_log(self, text: str):
+        try:
+            frame = inspect.currentframe().f_back
+            lineno = frame.f_lineno if frame else -1
+        except Exception:
+            lineno = -1
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = f"{timestamp} | linha {lineno} | {text}"
+
+        try:
+            self.logger.info(text)
+        except Exception:
+            pass
+
+        try:
+            if QThread.currentThread() is QApplication.instance().thread():
+                self._append_log_gui(formatted)
+            else:
+                self.log_line.emit(formatted)
+        except Exception:
+            pass
+
+    def _append_log_gui(self, formatted: str):
+        try:
+            self.log_view.appendPlainText(formatted)
+        except Exception as e:
+            import logging
+            logging.error(f"Falha ao atualizar log_view: {e}")
+
 
 def main():
     app = QApplication(sys.argv)

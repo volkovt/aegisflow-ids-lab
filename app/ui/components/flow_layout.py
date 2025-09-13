@@ -7,12 +7,13 @@ from PySide6.QtWidgets import QPushButton, QLayout, QWidget, QToolTip
 _ui_logger = logging.getLogger("[FlowLayout]")
 
 class FlowLayout(QLayout):
-    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6):
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6, alignment=Qt.AlignLeft):
         super().__init__(parent)
         self._items = []
         self.setContentsMargins(margin, margin, margin, margin)
         self._hspace = hspacing
         self._vspace = vspacing
+        self._alignment = alignment
 
     def addItem(self, item):
         self._items.append(item)
@@ -50,20 +51,42 @@ class FlowLayout(QLayout):
         x = rect.x()
         y = rect.y()
         line_height = 0
+        line_items = []
+        line_width = 0
+
         for item in self._items:
             w = item.widget()
             if not w.isVisible():
                 continue
             space_x = self._hspace
             space_y = self._vspace
-            next_x = x + item.sizeHint().width() + space_x
+            item_width = item.sizeHint().width()
+            next_x = x + item_width + space_x
             if next_x - space_x > rect.right() and line_height > 0:
+                if self._alignment == Qt.AlignHCenter and line_items:
+                    offset = (rect.width() - line_width + space_x) // 2
+                    for i, it in enumerate(line_items):
+                        if not test_only:
+                            it.setGeometry(QRect(QPoint(rect.x() + offset, y), it.sizeHint()))
+                        offset += it.sizeHint().width() + space_x
+                line_items = []
+                line_width = 0
                 x = rect.x()
                 y = y + line_height + space_y
-                next_x = x + item.sizeHint().width() + space_x
+                next_x = x + item_width + space_x
                 line_height = 0
-            if not test_only:
+            line_items.append(item)
+            line_width += item_width + space_x
+            if not test_only and self._alignment != Qt.AlignHCenter:
                 item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
             x = next_x
             line_height = max(line_height, item.sizeHint().height())
-        return y + line_height - rect.y()
+        # Última linha
+        if self._alignment == Qt.AlignHCenter and line_items:
+            offset = (rect.width() - line_width + space_x) // 2
+            for i, it in enumerate(line_items):
+                if not test_only:
+                    it.setGeometry(QRect(QPoint(rect.x() + offset, y), it.sizeHint()))
+                offset += it.sizeHint().width() + space_x
+        result_height = y + line_height - rect.y()
+        return result_height

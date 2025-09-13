@@ -40,11 +40,9 @@ class InfoPill(QPushButton):
     def _update_text(self):
         try:
             fm = QFontMetrics(self.font())
-            # Reservar alguns chars para o prefixo “SO:” etc.
             base = f"{self._prefix}: "
-            # Estimativa do espaço disponível
-            avail = max(60, self.width() - fm.horizontalAdvance(base) - 16)
-            elided = fm.elidedText(self._full_value, Qt.ElideMiddle, avail)
+            avail = max(120, self.width() - fm.horizontalAdvance(base) - 16)
+            elided = fm.elidedText(self._full_value, Qt.ElideRight, avail)
             self._elided = elided
             self.setText(base + elided)
         except Exception as e:
