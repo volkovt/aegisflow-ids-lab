@@ -10,6 +10,7 @@ _ui_logger = logging.getLogger("[InfoPill]")
 class InfoPill(QPushButton):
     """
     Botão estilo 'pill' com elipse automática, tooltip completo e clique para copiar.
+    Estilização 100% em QSS via objectName 'InfoPill' + property 'kind'.
     """
     def __init__(self, label_prefix: str, value: str = "—", kind: str = "default", parent: QWidget | None = None):
         super().__init__(parent)
@@ -20,7 +21,7 @@ class InfoPill(QPushButton):
         self._elided = ""
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
-        self.setMinimumHeight(28)
+        self.setMinimumHeight(28)  # layout, não estilo
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._update_text()
         self._update_tooltip()

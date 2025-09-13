@@ -5,7 +5,7 @@ MachineCard (Matrix Edition 2.0)
 - Bloco expansível (colapsável) por máquina, empilhado verticalmente
 - Menu único de ações (Up/Status/Restart/Halt/Destroy/SSH)
 - Pills SO/Host/Guest com elipse e tooltip (sem cortes)
-- Badge de risco p/ modelo de anomalias (mantido)
+- Badge de risco p/ modelo de anomalias
 """
 import logging
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
@@ -68,7 +68,7 @@ class _CollapsibleArea(QFrame):
 
 class MachineCardWidgetExt(QFrame):
     """
-    Atributos compatíveis principais:
+    Atributos compatíveis:
     - title (QLabel)
     - statusDot (QLabel c/ property 'status': running|stopped|unknown)
     - pills['so'|'host'|'guest']  (InfoPill)
@@ -78,14 +78,14 @@ class MachineCardWidgetExt(QFrame):
     Novos:
     - menu_btn (QToolButton)  -> botão "Ações"
     - act_up/act_status/act_restart/act_halt/act_destroy/act_ssh (QAction)
-    - set_pill_values(os_text, host, guest) com elipse + tooltip
+    - set_pill_values(os_text, host, guest)
     """
     def __init__(self, name: str, parent=None):
         super().__init__(parent)
         try:
             self.setObjectName("MachineCard")
             self.setProperty("machine", name)
-            self.setFrameShape(QFrame.StyledPanel)
+            self.setFrameShape(QFrame.NoFrame)  # Borda/estética via QSS
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
             root = QVBoxLayout(self)
@@ -139,7 +139,6 @@ class MachineCardWidgetExt(QFrame):
             cv = QVBoxLayout(content)
             cv.setAlignment(Qt.AlignTop)
             cv.setContentsMargins(0, 0, 0, 0)
-            #cv.setSpacing(8)
 
             pill_container = QWidget()
             pill_flow = FlowLayout(pill_container, hspacing=10, vspacing=10, alignment=Qt.AlignHCenter)
@@ -216,10 +215,7 @@ class MachineCardWidgetExt(QFrame):
             logger.error(f"[MachineCard] set_risk_score: {e}")
 
     def _set_card_info(self, os_text: str, host_endpoint: str, guest_ip: str):
-        """
-        API compatível com chamadores antigos. Encapsula a atualização
-        das pills no próprio card (elipse + tooltip).
-        """
+        """API compatível com chamadores antigos."""
         try:
             self.set_pill_values(os_text, host_endpoint, guest_ip)
             logger.info("[MachineCard] _set_card_info aplicado.")

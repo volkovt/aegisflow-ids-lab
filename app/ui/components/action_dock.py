@@ -8,8 +8,7 @@ Mantém compatibilidade com main.py:
              status_bar
 - objectNames: "ActionDock", "dockTitle", "dockSubtitle", "statusBar"
 
-Foco TCC: agrupar ações de Infra e Dataset/Experimentos, facilitando incorporar
-indicadores de coleta (Zeek/tcpdump) e gatilhos de geração/validação de datasets.
+Foco TCC: agrupar ações de Infra e Dataset/Experimentos.
 """
 import logging
 from PySide6.QtWidgets import (
@@ -19,8 +18,7 @@ from PySide6.QtCore import Qt
 
 logger = logging.getLogger("[ActionDock]")
 if not hasattr(logger, "warn"):
-    logger.warn = logger.warning  # compat com pedido do usuário
-
+    logger.warn = logger.warning  # compat
 
 class ActionDockWidgetExt(QFrame):
     def __init__(self, parent=None):
@@ -69,7 +67,6 @@ class ActionDockWidgetExt(QFrame):
             root.addStretch(1)
             self.status_bar = QLabel("")
             self.status_bar.setObjectName("statusBar")
-            # root.addWidget(self.status_bar)
 
             logger.info("[ActionDock] Construído com sucesso.")
         except Exception as e:

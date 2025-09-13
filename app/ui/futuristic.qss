@@ -1,190 +1,198 @@
-/* Tema Futurista: neon ciano + violeta */
-QWidget {
-  background-color: #0b0f14;
-  color: #cfd8dc;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 12pt;
+/* ====== MATRIX THEME (Futuristic) ====== */
+
+/* Root */
+#matrixRoot {
+    background: #0a0f0c;
 }
 
-QPushButton {
-  background-color: #121926;
-  border: 1px solid #7a00ff;
-  border-radius: 10px;
-  padding: 8px 14px;
-}
-QPushButton:hover { border-color: #00ffd1; }
-QPushButton:pressed { background-color: #0e1420; }
-
-QGroupBox { border: 1px solid #233044; border-radius: 12px; margin-top: 12px; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #00ffd1; }
-
-QPlainTextEdit, QTextEdit {
-  background: #0e1420;
-  border: 1px solid #233044;
-  border-radius: 10px;
+#matrixBrand {
+    color: #00ffaa;
+    font-weight: 700;
+    letter-spacing: 1px;
 }
 
-QLabel#statusDot[status="running"] { color: #00ff87; }
-QLabel#statusDot[status="stopped"] { color: #ff3b3b; }
-QLabel#statusDot[status="unknown"] { color: #ffcc00; }
-
-/* Pills neon futuristas */
-QPushButton#InfoPill {
-    border-radius: 16px;
-    padding: 6px 10px;
-    font-weight: 600;
-    letter-spacing: 0.2px;
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                                stop:0 rgba(18, 26, 32, 210),
-                                stop:1 rgba(28, 38, 46, 210));
-    color: #e6fff8;
-    border: 1px solid rgba(0, 255, 209, 0.35);
+/* Splitter */
+QSplitter#mainSplitter::handle {
+    background: #10211a;
+    width: 6px; /* antes era setado no código */
+    margin: 0;
 }
-QPushButton#InfoPill:hover {
-    border: 1px solid rgba(0, 255, 209, 0.7);
-    box-shadow: 0 0 12px rgba(0, 255, 209, 0.45);
+QSplitter#mainSplitter::handle:hover {
+    background: #1a3d2e;
 }
 
-/* Cores por tipo */
-QPushButton#InfoPill[kind="so"] {
-    border-color: rgba(0, 212, 255, 0.45);
-}
-QPushButton#InfoPill[kind="host"] {
-    border-color: rgba(255, 105, 0, 0.55);
-}
-QPushButton#InfoPill[kind="guest"] {
-    border-color: rgba(168, 85, 247, 0.55);
+/* Action Dock */
+#ActionDock {
+    background: #0d1411;
+    border: 1px solid #143d2e;
+    border-radius: 10px;
 }
 
-/* A bolinha de status já existente continua, mas se quiser, dê mais glow */
-#statusDot[status="running"] {
-    color: #00ffd1;
-    text-shadow: 0 0 8px rgba(0,255,209,0.7);
+#dockTitle {
+    color: #e6fff7;
+    font-size: 16px;
+    font-weight: 700;
 }
-#statusDot[status="stopped"] { color: #ff5252; }
-#statusDot[status="unknown"] { color: #c0c0c0; }
-
-/* ===== Activity feedback ===== */
-QLabel#statusBar[loading="true"],
-QPushButton[loading="true"] {
-    /* leve glow ciano */
-    border: 1px solid rgba(0,255,209,0.65);
-    box-shadow: 0 0 12px rgba(0,255,209,0.55);
+#dockSubtitle {
+    color: #7de8c3;
+    font-size: 12px;
 }
 
-QPushButton[loading="true"] {
+/* GroupBox */
+QGroupBox {
+    color: #bfffe9;
+    border: 1px solid #123d2e;
+    border-radius: 10px;
+    margin-top: 10px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    color: #7de8c3;
+    padding: 0 4px;
+    background: transparent;
+}
+
+/* Buttons (inclui estado de loading via property) */
+QPushButton, QToolButton {
+    color: #0a0f0c;
+    background: #00ffaa;
+    border: 0px;
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+QPushButton:hover, QToolButton:hover {
+    background: #5cffc6;
+}
+QPushButton:disabled, QToolButton:disabled {
+    color: #0a0f0c;
+    background: #3a6f5b;
+    opacity: 0.7;
+}
+QPushButton[loading="true"], QToolButton[loading="true"] {
+    background: #29ffb2;
     opacity: 0.85;
 }
 
-/* Barra de progresso indeterminada com vibe neon */
-QProgressBar {
-    background: rgba(0,255,209,0.08);
-    border: 1px solid rgba(0,255,209,0.45);
-    border-radius: 8px;
-    padding: 2px;
-    height: 10px;
-}
-QProgressBar::chunk {
-    background: qlineargradient(
-        x1:0, y1:0, x2:1, y2:0,
-        stop:0 rgba(0,255,209,0.40),
-        stop:1 rgba(0,255,209,0.80)
-    );
-    border-radius: 8px;
-}
-
-/* ===== Guia do Experimento ===== */
-#GuideDialog {
-    background: #0a0f14;
-    border: 1px solid rgba(0,255,209,0.25);
-}
-#GuideHeader {
-    font-size: 18px;
-    font-weight: 600;
-    color: #e8f5f2;
-}
-#GuideYaml {
-    padding: 4px 8px;
-    border-radius: 8px;
-    background: rgba(0,255,209,0.10);
-    border: 1px solid rgba(0,255,209,0.40);
-    color: #aef7ea;
-}
-#GuideCard {
-    background: rgba(8,16,22,0.85);
-    border: 1px solid rgba(0,255,209,0.35);
+/* Info Pills */
+#InfoPill {
+    background: #0f1814;
+    color: #dfffee;
+    border: 1px solid #1b4a39;
     border-radius: 14px;
+    padding: 6px 10px;
 }
-#GuideCard:hover {
-    box-shadow: 0 0 16px rgba(0,255,209,0.25);
+#InfoPill[kind="so"]    { border-color: #1bd69b; }
+#InfoPill[kind="host"]  { border-color: #1ba6d6; }
+#InfoPill[kind="guest"] { border-color: #d6a61b; }
+#InfoPill:hover {
+    background: #13231b;
 }
-#GuideTitle {
-    color: #f0ffff;
-    font-size: 16px;
+
+/* Machines Board */
+#machinesBoard {
+    background: #0c120f;
+    border: 1px solid #123d2e;
+    border-radius: 12px;
+}
+
+/* Machine Card */
+#MachineCard {
+    background: #0d1713;
+    border: 1px solid #123d2e;
+    border-radius: 12px;
+}
+#MachineCard:hover {
+    border-color: #1bd69b;
+}
+
+/* Header bits */
+#chevron {
+    color: #7de8c3;
+    padding-right: 6px;
+}
+#machineTitle {
+    color: #e6fff7;
     font-weight: 600;
 }
-#GuideDesc, #GuideMeta, #GuideArtifacts, #GuideStatus {
-    color: #cfe9e4;
-}
-#GuideCmd {
-    background: #0d141a;
-    border: 1px dashed rgba(0,255,209,0.35);
-    color: #e1fffb;
-}
-QPushButton#btnOpenGuide {
-    border: 1px solid rgba(0,255,209,0.55);
-    color: #00ffd1;
-}
-QPushButton#btnOpenGuide:pressed {
-    background: rgba(0,255,209,0.15);
-}
-QPushButton#btnOpenGuide:hover {
-    box-shadow: 0 0 12px rgba(0,255,209,0.45);
-    border: 1px solid rgba(0,255,209,0.75);
-}
 
-/* colapsável */
-#MachineCard {
-  border: 1px solid rgba(0,255,170,0.25);
-  border-radius: 14px;
-  background: rgba(0, 20, 14, 0.55);
-}
+/* Status Dot por propriedade */
+#statusDot[status="running"] { color: #00ffaa; }
+#statusDot[status="stopped"] { color: #ff6b6b; }
+#statusDot[status="unknown"] { color: #f0c674; }
 
-#MachineCard #chevron {
-  color: #00ffaa;
-  padding-right: 6px;
-}
-
-#MachineCard #machineTitle {
-  font-size: 16px;
-  font-weight: 600;
-  color: #c7ffef;
-}
-
-#MachineCard #statusDot[status="running"] { color: #00ffaa; }
-#MachineCard #statusDot[status="stopped"] { color: #ff5e5e; }
-#MachineCard #statusDot[status="unknown"] { color: #889; }
-
-/* botão de menu de ações */
+/* Menu btn no card */
 #actionMenuBtn {
-  padding: 6px 12px;
-  border: 1px solid rgba(0,255,170,0.35);
-  border-radius: 10px;
-  color: #00ffaa;
-  background: rgba(0,255,170,0.06);
+    color: #0a0f0c;
+    background: #00ffaa;
+    border-radius: 8px;
+    padding: 6px 10px;
 }
 
-/* badge de risco */
+/* Risk badge */
+#riskBadge {
+    color: #0a0f0c;
+    background: #ffd166;
+    border-radius: 8px;
+    padding: 4px 8px;
+}
 #riskBadge[level="high"] {
-  color: #0a0;
-  border: 1px solid #0a0;
-  padding: 2px 8px;
-  border-radius: 10px;
+    background: #ff6b6b;
+    color: #0a0f0c;
 }
 #riskBadge[level="low"] {
-  color: #aa0;
-  border: 1px solid #aa0;
-  padding: 2px 8px;
-  border-radius: 10px;
+    background: #06d6a0;
+    color: #0a0f0c;
 }
 
+/* Console / Progress */
+#logConsole {
+    color: #dfffee;
+    background: #0a0f0c;
+    border: 1px solid #123d2e;
+    border-radius: 8px;
+}
+#globalProgress {
+    border: 1px solid #123d2e;
+    background: #0a0f0c;
+    height: 8px;
+    border-radius: 6px;
+}
+
+/* Scrollbars discretas */
+QScrollBar:vertical {
+    background: #0e1713;
+    width: 10px;
+    margin: 2px 0 2px 0;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical {
+    background: #1a3d2e;
+    min-height: 24px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover { background: #235844; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+QScrollBar:horizontal {
+    background: #0e1713;
+    height: 10px;
+    margin: 0 2px 0 2px;
+    border-radius: 5px;
+}
+QScrollBar::handle:horizontal {
+    background: #1a3d2e;
+    min-width: 24px;
+    border-radius: 5px;
+}
+QScrollBar::handle:horizontal:hover { background: #235844; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* Matrix Avatar cores via propriedades */
+MachineAvatarExt {
+    qproperty-baseColor: #00ffaa;
+    qproperty-glowColor: rgba(0,255,170,70);
+    qproperty-screenColor: rgb(10,30,20);
+    qproperty-baseRectColor: rgb(12,40,28);
+    qproperty-scanlineColor: rgba(0,255,170,60);
+}

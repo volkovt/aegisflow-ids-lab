@@ -1,10 +1,10 @@
 import logging
-
 from PySide6.QtCore import QTimer
 
 class _SpinnerAnimator:
     """
     Anima '⠋⠙⠹…' no texto de um QPushButton/QLabel durante execução em background.
+    Estado visual pode ser temado via QSS usando [loading="true"] no widget.
     """
     FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
 
@@ -58,7 +58,6 @@ class _SpinnerAnimator:
             self._logger.warning(f"[Spinner] tick falhou: {e}")
 
     def _set_text(self, text: str):
-        # QLabel e QPushButton ambos possuem setText
         try:
             self.widget.setText(text)
         except Exception as e:
