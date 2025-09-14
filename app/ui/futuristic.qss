@@ -193,154 +193,162 @@ MachineAvatarExt {
 }
 
 
-/* ===== Guia do Experimento – Container ===== */
+/* ========== Tema Matrix/Holográfico para o Guia do Experimento ========== */
+/* Paleta base: pretos esverdeados, neon green (#00ff95/#00ffa3), ciano (#33e0ff). */
+
 #GuideDialog {
-    background: #050a07;
-    color: #d6ffe9;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+        stop:0 #0b0f12, stop:1 #0a0f0c);
+    color: #e8fdf4;
+    font-size: 13px;
 }
 
-/* Header e YAML chip */
+/* Header */
 #GuideHeader {
-    font-size: 20px;
+    font-size: 18px;
+    letter-spacing: 1px;
     font-weight: 800;
-    letter-spacing: 0.3px;
-    color: #b5ffe1;
-}
-#GuideYaml {
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: rgba(0, 255, 170, 0.10);
-    border: 1px solid rgba(0, 255, 170, 0.28);
-    color: #b9ffe6;
+    color: #00ffa3;
+    padding: 8px 10px;
+    border: 1px solid rgba(0,255,163,0.25);
+    border-radius: 10px;
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+        stop:0 rgba(0,255,163,0.10), stop:1 rgba(51,224,255,0.08));
 }
 
-/* ===== Cards ===== */
+#GuideYaml {
+    padding: 6px 10px;
+    color: #b6ffed;
+    border: 1px dashed rgba(0,255,163,0.25);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.25);
+}
+
+#GuideTimelineBar {
+    margin: -2px 2px 4px 2px;
+    background: rgba(0,0,0,0.35);
+    border: 1px solid rgba(0,255,163,0.18);
+    border-radius: 6px;
+}
+#GuideTimelineBar::chunk {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 #00ffa3, stop:1 #33e0ff);
+    border-radius: 6px;
+}
+
+/* Área de cards / scroll */
+#GuideScroll {
+    border: none;
+}
+#GuideCardsArea {
+    background: transparent;
+}
+#GuideLoading {
+    padding: 12px 14px;
+    color: #9beed9;
+}
+
+/* Card */
 #GuideCard {
-    background: rgba(10, 20, 15, 0.75);
-    border: 1px solid rgba(0, 255, 170, 0.22);
+    background: rgba(11, 25, 20, 0.6);
+    border: 1px solid rgba(0,255,163,0.18);
     border-radius: 14px;
 }
 #GuideCard:hover {
-    border-color: rgba(0, 255, 170, 0.48);
+    border-color: rgba(51,224,255,0.35);
+    background: rgba(11, 25, 20, 0.72);
 }
 
-/* Títulos e textos */
+#GuideHeaderIcon {
+    margin-right: 6px;
+}
+
 #GuideTitle {
-    font-size: 18px;
-    font-weight: 800;
-    color: #9fffe0;
+    font-size: 15px;
+    font-weight: 700;
+    color: #cafff3;
 }
+
 #GuideDesc {
-    color: #cfeee0;
-}
-#GuideMeta, #GuideArtifacts {
-    color: #a8cdbd;
+    color: #b5ffe8;
 }
 
-/* Caixa de comando */
+#GuideMeta {
+    color: #7deccc;
+}
+
+#GuideArtifacts {
+    color: #7bffd9;
+}
+
 #GuideCmd {
-    background: #0b1410;
-    border: 1px solid rgba(0, 255, 170, 0.22);
+    background: rgba(0,0,0,0.35);
+    color: #d9fff4;
+    border: 1px solid rgba(0,255,163,0.2);
     border-radius: 10px;
-    padding: 8px;
-    font-family: "Cascadia Code", "Consolas", "Fira Code", monospace;
-    selection-background-color: #1c3a2b;
-    selection-color: #eafff6;
+    padding: 6px;
+    selection-background-color: #00ffa366;
+    selection-color: #081a14;
 }
 
-/* Status como “chip” com variação por estado (se existir propriedade state) */
+/* Status */
 #GuideStatus {
-    padding: 4px 10px;
-    border-radius: 999px;
-    background: rgba(0, 255, 170, 0.10);
-    border: 1px solid rgba(0, 255, 170, 0.28);
-    color: #b9ffe6;
-    font-weight: 600;
-}
-#GuideStatus[state="running"] {
-    background: rgba(255, 215, 0, 0.10);
-    border-color: rgba(255, 215, 0, 0.38);
-    color: #ffe27a;
-}
-#GuideStatus[state="done"] {
-    background: rgba(0, 255, 127, 0.12);
-    border-color: rgba(0, 255, 127, 0.40);
-    color: #8fffb9;
-}
-#GuideStatus[state="error"] {
-    background: rgba(255, 77, 109, 0.12);
-    border-color: rgba(255, 77, 109, 0.40);
-    color: #ff9bb0;
-}
-#GuideStatus[state="idle"] {
-    background: rgba(0, 255, 170, 0.10);
-    border-color: rgba(0, 255, 170, 0.28);
-    color: #b9ffe6;
-}
-
-/* ===== Botões do guia ===== */
-#GuideDialog QPushButton,
-#GuideDialog QToolButton {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #113c2c, stop:1 #0e2d22);
-    border: 1px solid rgba(0, 255, 170, 0.32);
-    border-radius: 10px;
-    padding: 6px 12px;
-    color: #e8fff6;
-}
-#GuideDialog QPushButton:hover,
-#GuideDialog QToolButton:hover {
-    border-color: rgba(0, 255, 170, 0.55);
-}
-#GuideDialog QPushButton:pressed,
-#GuideDialog QToolButton:pressed {
-    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0d2a1f, stop:1 #0a2018);
-}
-
-/* Menu do botão “Copiar (…)" */
-QMenu {
-    background: #0b1410;
-    border: 1px solid rgba(0, 255, 170, 0.28);
+    padding: 4px 8px;
     border-radius: 8px;
-    color: #e8fff6;
+    border: 1px solid rgba(0,255,163,0.25);
+    color: #b6ffed;
+    background: rgba(0,0,0,0.25);
 }
-QMenu::item:selected {
-    background: rgba(0, 255, 170, 0.14);
+#GuideStatus[state="idle"]   { color:#b6ffed; border-color:rgba(0,255,163,0.25); }
+#GuideStatus[state="running"]{
+    color:#081a14; background:#00ffa3; border-color:#00ffa3;
+}
+#GuideStatus[state="done"]   {
+    color:#081a14; background:#33e0ff; border-color:#33e0ff;
+}
+#GuideStatus[state="error"]  {
+    color:#ffd9d9; background:#a0142b; border-color:#ff5a7a;
 }
 
-/* Console e rodapé */
+/* Botões holográficos */
+#HoloBtn, QPushButton#HoloBtn, QPushButton {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+        stop:0 rgba(0,255,163,0.12), stop:1 rgba(51,224,255,0.10));
+    color: #d9fff4;
+    border: 1px solid rgba(0,255,163,0.25);
+    border-radius: 10px;
+    padding: 6px 10px;
+}
+#HoloBtn:hover, QPushButton:hover {
+    border-color: rgba(51,224,255,0.5);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+        stop:0 rgba(0,255,163,0.18), stop:1 rgba(51,224,255,0.18));
+}
+#HoloBtn:pressed, QPushButton:pressed {
+    background: rgba(0,255,163,0.25);
+}
+
+QToolButton#CopyModeBtn {
+    padding: 6px 10px;
+    color: #d9fff4;
+    border-radius: 10px;
+    border: 1px solid rgba(0,255,163,0.25);
+    background: rgba(0,0,0,0.25);
+}
+QToolButton#CopyModeBtn:hover {
+    border-color: rgba(51,224,255,0.5);
+}
+
+/* Console e footer */
 #GuideConsole {
-    background: #08110d;
-    border: 1px solid rgba(0, 255, 170, 0.22);
-    border-radius: 12px;
-    font-family: "Cascadia Code", "Consolas", "Fira Code", monospace;
-    selection-background-color: #133224;
-    selection-color: #d8fff2;
+    background: rgba(0,0,0,0.35);
+    color: #cbfff0;
+    border: 1px solid rgba(0,255,163,0.2);
+    border-radius: 10px;
+    selection-background-color: #00ffa366;
+    selection-color: #081a14;
 }
 #GuideFooter {
-    color: #9bb7a8;
-}
-
-/* Scrollbars do console/scroll principal */
-QScrollBar:vertical, QScrollBar:horizontal {
-    background: transparent;
-    border: none;
-    margin: 0px;
-}
-QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-    background: rgba(0, 255, 170, 0.28);
-    border-radius: 6px;
-}
-QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
-    background: rgba(0, 255, 170, 0.45);
-}
-QScrollBar::add-line, QScrollBar::sub-line {
-    height: 0px; width: 0px; background: none;
-}
-
-/* Tooltips */
-QToolTip {
-    background: #0b1410;
-    color: #dfffea;
-    border: 1px solid rgba(0, 255, 170, 0.28);
-    border-radius: 6px;
+    color: #92ffe4;
+    padding-top: 2px;
 }

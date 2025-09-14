@@ -237,5 +237,5 @@ def _dir_sha256(path: Path) -> str:
                 try:
                     h.update(p.read_bytes())
                 except Exception as e:
-                    logger.warn(f"[TemplateHash] falha lendo {p}: {e}")
+                    logger.error(f"[TemplateHash] falha lendo {p}: {e}")
     return h.hexdigest()

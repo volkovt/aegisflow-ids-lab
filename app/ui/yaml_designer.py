@@ -145,7 +145,7 @@ class YAMLDesignerDialog(QDialog):
             QMessageBox.information(self, "Válido", "YAML válido para execução.")
             logger.info("[YAMLDesigner] Validação OK.")
         except Exception as e:
-            logger.warn(f"[YAMLDesigner] Validação falhou: {e}")
+            logger.error(f"[YAMLDesigner] Validação falhou: {e}")
             QMessageBox.warning(self, "Inválido", f"Problema no YAML:\n{e}")
 
     def _on_use_preset(self):

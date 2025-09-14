@@ -45,7 +45,7 @@ class _CollapsibleArea(QFrame):
             self._content.setVisible(False)
             self.setMaximumHeight(0)
         except Exception as e:
-            logger.warn(f"[Collapsible] init (collapse) falhou: {e}")
+            logger.error(f"[Collapsible] init (collapse) falhou: {e}")
 
     def setExpanded(self, on: bool):
         try:
@@ -190,7 +190,7 @@ class MachineCardWidgetExt(QFrame):
                 self._role = "attacker" if nm == "attacker" else ("sensor" if ("sensor" in nm) else "general")
                 self.avatar.setRole(self._role)
             except Exception as e:
-                logger.warn(f"[MachineCard] setRole inicial falhou: {e}")
+                logger.error(f"[MachineCard] setRole inicial falhou: {e}")
 
             cv.addWidget(self.avatar)
 
@@ -260,7 +260,7 @@ class MachineCardWidgetExt(QFrame):
             self._refresh_header_icon()
             logger.info(f"[MachineCard] role alterado para {self._role}")
         except Exception as e:
-            logger.warn(f"[MachineCard] set_machine_role falhou: {e}")
+            logger.error(f"[MachineCard] set_machine_role falhou: {e}")
 
     # -------- API compat/extend ----------
     def set_status(self, status: str):
@@ -275,7 +275,7 @@ class MachineCardWidgetExt(QFrame):
             try:
                 self.avatar.setStatus(self._vis)
             except Exception as e:
-                logger.warn(f"[MachineCard] avatar.setStatus falhou: {e}")
+                logger.error(f"[MachineCard] avatar.setStatus falhou: {e}")
 
             self._refresh_header_icon()
         except Exception as e:

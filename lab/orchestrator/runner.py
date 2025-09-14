@@ -56,7 +56,7 @@ class ExperimentRunner:
                 return fn(*args, **kwargs)
             except Exception as e:
                 last = e
-                logger.warn(f"[Runner] Retry {i}/{tries} após falha: {e}")
+                logger.error(f"[Runner] Retry {i}/{tries} após falha: {e}")
                 time.sleep(delay_s * i)
         raise last if last else RuntimeError("Falha sem exceção?")
 
@@ -216,7 +216,7 @@ class ExperimentRunner:
 
         except CancelledError:
             aborted = True
-            logger.warn("[Runner] Execução cancelada pelo usuário.")
+            logger.error("[Runner] Execução cancelada pelo usuário.")
             raise
         except Exception as e:
             logger.error(f"[Runner] Falha geral do experimento: {e}")

@@ -45,7 +45,7 @@ class DataCollector:
             matches = [l.strip() for l in out.splitlines() if l.strip()]
             return matches
         except Exception as e:
-            logger.warn(f"[SCP] Falha ao listar glob no remoto ({host}:{pattern}): {e}")
+            logger.error(f"[SCP] Falha ao listar glob no remoto ({host}:{pattern}): {e}")
             return []
 
     def _scp_glob_optional(self, host: str, pattern: str, local_dir: Path) -> int:
@@ -58,7 +58,7 @@ class DataCollector:
             local_dir.mkdir(parents=True, exist_ok=True)
             matches = self._list_remote_glob(host, pattern)
             if not matches:
-                logger.warn(f"[SCP] Nenhum arquivo correspondente a {pattern} em {host}.")
+                logger.error(f"[SCP] Nenhum arquivo correspondente a {pattern} em {host}.")
                 return 0
             count = 0
             for remote_path in matches:
@@ -67,10 +67,10 @@ class DataCollector:
                     self._scp(host, remote_path, local_dir)
                     count += 1
                 except Exception as e:
-                    logger.warn(f"[SCP] Falha ao copiar {host}:{remote_path} -> {local_dir}: {e}")
+                    logger.error(f"[SCP] Falha ao copiar {host}:{remote_path} -> {local_dir}: {e}")
             return count
         except Exception as e:
-            logger.warn(f"[SCP] Glob opcional falhou ({host}:{pattern}): {e}")
+            logger.error(f"[SCP] Glob opcional falhou ({host}:{pattern}): {e}")
             return 0
 
     def harvest(self, exp_id: str, out_base: Path, timeline=None, run_pre_etl: bool = True) -> Path:
@@ -85,13 +85,13 @@ class DataCollector:
             copied_zeek = self._scp_glob_optional("sensor", "/var/log/zeek/*.log", sensor_zeek)
             copied_pcap = self._scp_glob_optional("sensor", "/var/log/pcap/*.pcap", sensor_pcap)
             if copied_zeek == 0 and copied_pcap == 0:
-                logger.warn("[HARVEST] Sensor sem artefatos (Zeek/PCAP). Dataset seguirá mesmo assim.")
+                logger.error("[HARVEST] Sensor sem artefatos (Zeek/PCAP). Dataset seguirá mesmo assim.")
 
             # VICTIM — auth.log (opcional)
             try:
                 self._scp("victim", "/var/log/auth.log", victim_dir / "auth.log")
             except Exception as e:
-                logger.warn(f"[HARVEST] auth.log ausente ou inacessível na vítima (seguindo): {e}")
+                logger.error(f"[HARVEST] auth.log ausente ou inacessível na vítima (seguindo): {e}")
 
             # ATTACKER — artefatos de ações (opcionais)
             self._scp_glob_optional("attacker", "~/exp_scan.nmap", attacker_dir)
@@ -115,7 +115,7 @@ class DataCollector:
                     csv_path = generate_conn_features(dataset_root=base)
                     logger.info(f"[HARVEST] Pré-ETL gerado: {csv_path}")
                 except Exception as e:
-                    logger.warn(f"[HARVEST] Pré-ETL falhou (seguindo sem bloquear): {e}")
+                    logger.error(f"[HARVEST] Pré-ETL falhou (seguindo sem bloquear): {e}")
 
             # ZIP
             zip_path = base.with_suffix(".zip")
@@ -140,7 +140,7 @@ class DataCollector:
                             h.update(chunk)
                     out.append(f"{h.hexdigest()}  {fp.relative_to(path)}")
                 except Exception as e:
-                    logger.warn(f"[SHA256] Falha ao ler {fp}: {e}")
+                    logger.error(f"[SHA256] Falha ao ler {fp}: {e}")
         return out
 
     def _metadata(self, exp_id: str, timeline=None) -> dict:
@@ -149,7 +149,7 @@ class DataCollector:
             kernel_sensor  = self.ssh.run_command("sensor",  "uname -a", timeout=5).strip()
             kernel_attacker= self.ssh.run_command("attacker","uname -a", timeout=5).strip()
         except Exception as e:
-            logger.warn(f"[META] Falha ao coletar uname: {e}")
+            logger.error(f"[META] Falha ao coletar uname: {e}")
             kernel_victim = kernel_sensor = kernel_attacker = "unknown"
         return {
             "exp_id": exp_id,

@@ -24,7 +24,7 @@ from app.ui.components.action_dock import ActionDockWidgetExt
 from app.ui.components.machine_card import MachineCardWidgetExt
 from app.ui.components.machine_avatar import MachineAvatarExt
 from app.ui.components.ui_runner_shim import UiRunnerShim
-from app.ui.step_card import ExperimentGuideDialog
+from app.ui.guide.guide_dialog import ExperimentGuideDialog
 from app.ui.yaml_designer import YAMLDesignerDialog
 
 from app.ui.services.task_manager import TaskManager
@@ -293,11 +293,14 @@ class MainWindow(QMainWindow):
                 if len(parts) >= 2:
                     states[parts[0]] = parts[1]
             for name, card in self.cards.items():
-                # usa a mesma via de atualização centralizada
                 self._set_card_status(card, states.get(name, "unknown"))
             running = [n for n, st in states.items() if st == "running"]
             for i, n in enumerate(running):
                 QTimer.singleShot(1200 * i, lambda name=n, st="running": self.ctrl.spawn_info_update(name, st))
+
+            if self._guide_dialog and hasattr(self._guide_dialog, "reflect_status_map"):
+                self._append_log("[UI] Atualizando status no Guia do Experimento.")
+                self._guide_dialog.reflect_status_map(states)
         except Exception as e:
             self._append_log(f"[WARN] _apply_status_to_cards: {e}")
 
@@ -367,9 +370,21 @@ class MainWindow(QMainWindow):
 
     def _on_open_guide(self):
         try:
-            yaml_for_guide = str(self.ctrl.current_yaml_path) if self.ctrl.yaml_selected_by_user and self.ctrl.current_yaml_path else ""
-            dlg = self.ctrl.open_guide(dialog_factory=lambda **kw: ExperimentGuideDialog(**kw), yaml_for_guide=yaml_for_guide)
+            yaml_for_guide = str(
+                self.ctrl.current_yaml_path) if self.ctrl.yaml_selected_by_user and self.ctrl.current_yaml_path else ""
+            dlg = self.ctrl.open_guide(dialog_factory=lambda **kw: ExperimentGuideDialog(**kw),
+                                       yaml_for_guide=yaml_for_guide)
             self._guide_dialog = dlg
+            try:
+                if dlg is not None:
+                    dlg.setParent(None)
+                    dlg.show()
+                    dlg.raise_()
+                    dlg.activateWindow()
+                    from PySide6.QtCore import Qt
+                    dlg.setWindowState((dlg.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            except Exception as e:
+                self._append_log(f"[UI] bring-to-front Guide falhou: {e}")
         except Exception as e:
             self._append_log(f"[ERRO] Abrir Guia: {e}")
             QMessageBox.critical(self, "Guia do Experimento", str(e))

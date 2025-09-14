@@ -40,7 +40,7 @@ class SSHManager:
         for name, procs in items:
             for p in list(procs):
                 try:
-                    logger.warn(f"[SSHManager] Matando vagrant ssh ativo em {name} (cancel).")
+                    logger.error(f"[SSHManager] Matando vagrant ssh ativo em {name} (cancel).")
                     if os.name == "nt":
                         p.send_signal(signal.CTRL_BREAK_EVENT)
                         time.sleep(0.2)

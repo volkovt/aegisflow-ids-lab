@@ -45,7 +45,7 @@ class MachineIconProvider:
                 return "sensor_01.png" if s == "online" else "sensor_02.png"
             return "general_01.png" if s == "online" else "general_02.png"
         except Exception as e:
-            logger.warn(f"[Icons] _pick_filename falhou: {e}")
+            logger.error(f"[Icons] _pick_filename falhou: {e}")
             return "general_02.png"
 
     def _load_pixmap(self, name: str) -> QPixmap:
@@ -55,7 +55,7 @@ class MachineIconProvider:
             path = self.resource_dir() / name
             pm = QPixmap(str(path))
             if pm.isNull():
-                logger.warn(f"[Icons] imagem não encontrada/ inválida: {path}")
+                logger.error(f"[Icons] imagem não encontrada/ inválida: {path}")
             self._pix_cache[name] = pm
             return pm
         except Exception as e:
