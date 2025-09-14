@@ -1,21 +1,21 @@
 # app/ui/components/machine_card.py
 # -*- coding: utf-8 -*-
 """
-MachineCard (Matrix Edition 2.0)
-- Bloco expansível (colapsável) por máquina, empilhado verticalmente
-- Menu único de ações (Up/Status/Restart/Halt/Destroy/SSH)
-- Pills SO/Host/Guest com elipse e tooltip (sem cortes)
-- Badge de risco p/ modelo de anomalias
+MachineCard (Matrix Edition 2.2)
+- Cabeçalho: chevron, ícone (pequeno) da máquina, nome, menu Ações
+- Conteúdo colapsável com animação (inicia minimizado)
+- Avatar grande sincronizado com role/status
+- Pills informativas com elipse + tooltip
 """
 import logging
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
-from PySide6.QtGui import QAction, QFontMetrics
+from PySide6.QtGui import QAction, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QLabel, QWidget, QToolButton, QMenu,
     QSizePolicy
 )
 
-from app.ui.components.machine_avatar import MachineAvatarExt
+from app.ui.components.machine_avatar import MachineAvatarExt, ICONS
 from app.ui.components.flow_layout import FlowLayout
 from app.ui.components.info_pills import InfoPill
 
@@ -23,8 +23,8 @@ logger = logging.getLogger("[MachineCardExt]")
 if not hasattr(logger, "warn"):
     logger.warn = logger.warning
 
+
 class _CollapsibleArea(QFrame):
-    """Conteúdo colapsável com animação vertical simples."""
     def __init__(self, content: QWidget, parent=None):
         super().__init__(parent)
         self._content = content
@@ -34,83 +34,112 @@ class _CollapsibleArea(QFrame):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
         v.addWidget(content)
+
         self._anim = QPropertyAnimation(self, b"maximumHeight", self)
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.InOutCubic)
-        self._expanded = True
+
+        # Agora inicia colapsado
+        self._expanded = False
+        try:
+            self._content.setVisible(False)
+            self.setMaximumHeight(0)
+        except Exception as e:
+            logger.warn(f"[Collapsible] init (collapse) falhou: {e}")
 
     def setExpanded(self, on: bool):
         try:
             if on == self._expanded:
                 return
             self._expanded = on
+
+            # Sempre garantir que o conteúdo exista e possa animar
             self._content.setVisible(True)
-            start = self.maximumHeight() if self.maximumHeight() > 0 else self.sizeHint().height()
-            end = self._content.sizeHint().height() if on else 0
+            h = max(0, self._content.sizeHint().height())
+
+            # Se vamos expandir, animar de 0 → h; se vamos recolher, animar de atual → 0
+            start = self.maximumHeight()
+            if on:
+                if start <= 0:
+                    start = 0
+                end = h
+            else:
+                if start <= 0:
+                    start = h
+                end = 0
+
             self._anim.stop()
             self._anim.setStartValue(max(0, start))
             self._anim.setEndValue(max(0, end))
             self._anim.start()
+
             if not on:
-                self._anim.finished.connect(lambda: self._content.setVisible(False))
+                # Quando finalizar recolhimento, esconder conteúdo para economizar layout
+                def _hide():
+                    try:
+                        self._content.setVisible(False)
+                    except Exception:
+                        pass
+                try:
+                    self._anim.finished.disconnect()
+                except Exception:
+                    pass
+                self._anim.finished.connect(_hide)
             else:
+                # Expandido: garantir visível e desconectar handlers antigos
                 try:
                     self._anim.finished.disconnect()
                 except Exception:
                     pass
         except Exception as e:
             logger.error(f"[Collapsible] setExpanded: {e}")
-            self._content.setVisible(on)
 
     def isExpanded(self) -> bool:
         return self._expanded
 
 
 class MachineCardWidgetExt(QFrame):
-    """
-    Atributos compatíveis:
-    - title (QLabel)
-    - statusDot (QLabel c/ property 'status': running|stopped|unknown)
-    - pills['so'|'host'|'guest']  (InfoPill)
-    - set_status(status)
-    - set_risk_score(score, threshold)
+    ICON_PX_SMALL = 22  # ícone do cabeçalho
 
-    Novos:
-    - menu_btn (QToolButton)  -> botão "Ações"
-    - act_up/act_status/act_restart/act_halt/act_destroy/act_ssh (QAction)
-    - set_pill_values(os_text, host, guest)
-    """
     def __init__(self, name: str, parent=None):
         super().__init__(parent)
         try:
             self.setObjectName("MachineCard")
             self.setProperty("machine", name)
-            self.setFrameShape(QFrame.NoFrame)  # Borda/estética via QSS
+            self.setFrameShape(QFrame.NoFrame)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+            # Estado interno para sincronizar header icon
+            self._role = "general"
+            self._vis = "offline"  # online/offline derivado do status
 
             root = QVBoxLayout(self)
             root.setAlignment(Qt.AlignTop)
             root.setContentsMargins(12, 12, 12, 12)
             root.setSpacing(10)
 
+            # ---------- HEADER ----------
             header = QHBoxLayout()
             header.setAlignment(Qt.AlignLeft)
             header.setContentsMargins(0, 0, 0, 0)
 
-            self._chevron = QLabel("▾")  # alterna para ▸ quando colapsado
+            # Chevron agora inicia apontando para a direita (colapsado)
+            self._chevron = QLabel("▸")
             self._chevron.setObjectName("chevron")
             header.addWidget(self._chevron)
+
+            # ÍCONE PEQUENO ANTES DO NOME
+            self.header_icon = QLabel()
+            self.header_icon.setObjectName("headerIcon")
+            self.header_icon.setFixedSize(self.ICON_PX_SMALL, self.ICON_PX_SMALL)
+            self.header_icon.setToolTip("estado da máquina")
+            header.addWidget(self.header_icon)
 
             self.title = QLabel(name)
             self.title.setObjectName("machineTitle")
             header.addWidget(self.title)
 
             header.addStretch(1)
-
-            self.statusDot = QLabel("●")
-            self.statusDot.setObjectName("statusDot")
-            self.statusDot.setProperty("status", "unknown")
-            header.addWidget(self.statusDot)
 
             self.menu_btn = QToolButton()
             self.menu_btn.setText("Ações")
@@ -124,7 +153,6 @@ class MachineCardWidgetExt(QFrame):
             self.act_halt = QAction("Halt", self)
             self.act_destroy = QAction("Destroy", self)
             self.act_ssh = QAction("SSH", self)
-
             for a in (self.act_up, self.act_status, self.act_restart, self.act_halt, self.act_destroy, self.act_ssh):
                 menu.addAction(a)
             self.menu_btn.setMenu(menu)
@@ -135,6 +163,7 @@ class MachineCardWidgetExt(QFrame):
             header_frame.mousePressEvent = self._toggle_collapsed
             root.addWidget(header_frame)
 
+            # ---------- CONTENT ----------
             content = QWidget()
             cv = QVBoxLayout(content)
             cv.setAlignment(Qt.AlignTop)
@@ -152,8 +181,17 @@ class MachineCardWidgetExt(QFrame):
             pill_flow.addWidget(self.pills["guest"])
             cv.addWidget(pill_container)
 
+            # Avatar grande
             self.avatar = MachineAvatarExt(self)
             self.avatar.setObjectName("machineAvatar")
+
+            try:
+                nm = (name or "").strip().lower()
+                self._role = "attacker" if nm == "attacker" else ("sensor" if ("sensor" in nm) else "general")
+                self.avatar.setRole(self._role)
+            except Exception as e:
+                logger.warn(f"[MachineCard] setRole inicial falhou: {e}")
+
             cv.addWidget(self.avatar)
 
             self._risk_badge = QLabel("")
@@ -165,18 +203,24 @@ class MachineCardWidgetExt(QFrame):
             self._collapsible.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             root.addWidget(self._collapsible)
 
-            try:
-                def _fix_initial_height():
-                    try:
-                        h0 = max(0, content.sizeHint().height())
+            def _fix_initial_height():
+                try:
+                    # Respeitar o estado inicial (colapsado)
+                    h0 = max(0, content.sizeHint().height())
+                    if self._collapsible.isExpanded():
                         self._collapsible.setMaximumHeight(h0)
-                        logger.info(f"[MachineCard] altura inicial ajustada: {h0}px")
-                    except Exception as e:
-                        logger.error(f"[MachineCard] falha ao ajustar altura inicial: {e}")
+                        content.setVisible(True)
+                        self._chevron.setText("▾")
+                    else:
+                        self._collapsible.setMaximumHeight(0)
+                        content.setVisible(False)
+                        self._chevron.setText("▸")
+                    self._refresh_header_icon()
+                    logger.info(f"[MachineCard] altura inicial ajustada (expanded={self._collapsible.isExpanded()}): {h0}px")
+                except Exception as e:
+                    logger.error(f"[MachineCard] falha ao ajustar altura inicial: {e}")
 
-                QTimer.singleShot(0, _fix_initial_height)
-            except Exception as e:
-                logger.error(f"[MachineCard] erro no setup de altura inicial: {e}")
+            QTimer.singleShot(0, _fix_initial_height)
 
             logger.info(f"[MachineCard] Bloco criado: {name}")
         except Exception as e:
@@ -191,13 +235,49 @@ class MachineCardWidgetExt(QFrame):
         except Exception as e:
             logger.error(f"[MachineCard] toggle: {e}")
 
+    # -------- Interno ----------
+    def _refresh_header_icon(self):
+        """Atualiza o ícone pequeno do header de acordo com role/vis."""
+        try:
+            pm: QPixmap = ICONS.get_icon(self._role, self._vis, self.ICON_PX_SMALL)
+            if not pm.isNull():
+                self.header_icon.setPixmap(pm)
+                self.header_icon.setToolTip(f"{self._role} | {self._vis}")
+            else:
+                self.header_icon.clear()
+        except Exception as e:
+            logger.error(f"[MachineCard] _refresh_header_icon: {e}")
+
+    # -------- API pública extra ----------
+    def set_machine_role(self, role: str):
+        """Altera dinamicamente o role do avatar e do header icon: attacker | sensor | general."""
+        try:
+            role = (role or "").lower().strip()
+            if role not in ("attacker", "sensor", "general"):
+                role = "general"
+            self._role = role
+            self.avatar.setRole(role)
+            self._refresh_header_icon()
+            logger.info(f"[MachineCard] role alterado para {self._role}")
+        except Exception as e:
+            logger.warn(f"[MachineCard] set_machine_role falhou: {e}")
+
     # -------- API compat/extend ----------
     def set_status(self, status: str):
+        """
+        Recebe 'running' | 'stopped' | outros.
+        Atualiza statusDot e avatar (online/offline) e o ícone do cabeçalho.
+        """
         try:
             st = status if status in ("running", "stopped") else "unknown"
-            self.statusDot.setProperty("status", st)
-            self.statusDot.style().unpolish(self.statusDot)
-            self.statusDot.style().polish(self.statusDot)
+
+            self._vis = "online" if st == "running" else "offline"
+            try:
+                self.avatar.setStatus(self._vis)
+            except Exception as e:
+                logger.warn(f"[MachineCard] avatar.setStatus falhou: {e}")
+
+            self._refresh_header_icon()
         except Exception as e:
             logger.error(f"[MachineCard] set_status: {e}")
 
@@ -215,7 +295,6 @@ class MachineCardWidgetExt(QFrame):
             logger.error(f"[MachineCard] set_risk_score: {e}")
 
     def _set_card_info(self, os_text: str, host_endpoint: str, guest_ip: str):
-        """API compatível com chamadores antigos."""
         try:
             self.set_pill_values(os_text, host_endpoint, guest_ip)
             logger.info("[MachineCard] _set_card_info aplicado.")
@@ -223,7 +302,6 @@ class MachineCardWidgetExt(QFrame):
             logger.error(f"[MachineCard] _set_card_info: {e}")
 
     def set_pill_values(self, os_text: str, host: str, guest: str):
-        """Aplica elipse e tooltip – evita cortes e mantém info completa acessível."""
         try:
             def _elide(pill: InfoPill, value: str):
                 if value is None:

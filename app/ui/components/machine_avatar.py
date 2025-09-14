@@ -1,142 +1,182 @@
 # app/ui/components/machine_avatar.py
+# -*- coding: utf-8 -*-
 import logging
-from PySide6.QtCore import QSize, QRectF, Qt, Property
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush
-from PySide6.QtWidgets import QStyleOption, QWidget, QStyle, QSizePolicy
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QWidget, QLabel, QSizePolicy, QVBoxLayout
 
 logger = logging.getLogger("[MachineAvatarExt]")
 if not hasattr(logger, "warn"):
     logger.warn = logger.warning
 
+
+class MachineIconProvider:
+    """
+    Provider com cache para imagens de role/status, com escala.
+    Regras de arquivo:
+      - attacker_01.png: online
+      - attacker_02.png: offline
+      - sensor_01.png:   online
+      - sensor_02.png:   offline
+      - general_01.png:  online
+      - general_02.png:  offline
+    """
+    def __init__(self):
+        self._pix_cache: dict[str, QPixmap] = {}
+        self._scaled_cache: dict[tuple[str, int], QPixmap] = {}
+
+    def resource_dir(self) -> Path:
+        try:
+            # .../app/ui/components/machine_avatar.py -> .../app/ui/resources
+            return Path(__file__).resolve().parent.parent / "resources"
+        except Exception as e:
+            logger.error(f"[Icons] resource_dir: {e}")
+            return Path("ui/resources")
+
+    def _pick_filename(self, role: str, status: str) -> str:
+        try:
+            r = (role or "general").lower().strip()
+            s = "online" if status == "online" else "offline"
+            if r == "attacker":
+                return "attacker_01.png" if s == "online" else "attacker_02.png"
+            if r == "sensor":
+                return "sensor_01.png" if s == "online" else "sensor_02.png"
+            return "general_01.png" if s == "online" else "general_02.png"
+        except Exception as e:
+            logger.warn(f"[Icons] _pick_filename falhou: {e}")
+            return "general_02.png"
+
+    def _load_pixmap(self, name: str) -> QPixmap:
+        try:
+            if name in self._pix_cache and not self._pix_cache[name].isNull():
+                return self._pix_cache[name]
+            path = self.resource_dir() / name
+            pm = QPixmap(str(path))
+            if pm.isNull():
+                logger.warn(f"[Icons] imagem não encontrada/ inválida: {path}")
+            self._pix_cache[name] = pm
+            return pm
+        except Exception as e:
+            logger.error(f"[Icons] _load_pixmap: {e}")
+            return QPixmap()
+
+    def get_icon(self, role: str, status: str, size_px: int) -> QPixmap:
+        """
+        Retorna QPixmap escalado e cacheado para (role,status,size_px)
+        """
+        try:
+            name = self._pick_filename(role, status)
+            key = (name, int(size_px))
+            if key in self._scaled_cache and not self._scaled_cache[key].isNull():
+                return self._scaled_cache[key]
+
+            base = self._load_pixmap(name)
+            if base.isNull():
+                return QPixmap()
+            scaled = base.scaled(
+                int(size_px),
+                int(size_px),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self._scaled_cache[key] = scaled
+            return scaled
+        except Exception as e:
+            logger.error(f"[Icons] get_icon: {e}")
+            return QPixmap()
+
+
+# Singleton para uso em toda a UI
+ICONS = MachineIconProvider()
+
+
 class MachineAvatarExt(QWidget):
     """
-    Desenha um 'computador' com glow + scanlines (estilo Matrix) mantendo 16:9.
-    Todas as cores são configuráveis via QSS (qproperty-*).
+    Avatar baseado em imagens quadradas (ícone).
+    Papel (role): 'attacker', 'sensor' ou 'general'
+    Status: 'online' | 'offline'
     """
-    ASPECT = 16 / 9
+    DEFAULT_ICON_PX = 256
+    MIN_ICON_PX = 96
+    MAX_ICON_PX = 512
 
     def __init__(self, parent=None):
         super().__init__(parent)
         try:
-            self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            self.setObjectName("MachineAvatar")
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
+            self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
+            self._role = "general"
+            self._status = "offline"
+            self._icon_px = self.DEFAULT_ICON_PX
+
+            self._img = QLabel(self)
+            self._img.setObjectName("MachineAvatarImage")
+            self._img.setAlignment(Qt.AlignCenter)
+            self._img.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self._img.setFixedSize(self._icon_px, self._icon_px)
+
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(0)
+            lay.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            lay.addWidget(self._img, 0, Qt.AlignHCenter)
+
+            self._refresh_pixmap()
+            logger.info(f"[MachineAvatar] inicializado com ícone {self._icon_px}px.")
         except Exception as e:
-            logger.error(f"[MachineAvatar] sizePolicy: {e}")
+            logger.error(f"[MachineAvatar] erro ao iniciar: {e}")
 
-        # Defaults (serão sobrescritos por QSS com qproperty-*)
-        self._baseColor = QColor(0, 255, 170)
-        self._glowColor = QColor(0, 255, 170, 70)
-        self._screenColor = QColor(10, 30, 20)
-        self._baseRectColor = QColor(12, 40, 28)
-        self._scanlineColor = QColor(0, 255, 170, 60)
-
-    # ---- Qt Properties para QSS (qproperty-*) ----
-    def getBaseColor(self): return self._baseColor
-    def setBaseColor(self, c: QColor):
+    # ---------- API ----------
+    def setRole(self, role: str):
         try:
-            self._baseColor = QColor(c)
-            self.update()
+            new_role = (role or "").lower().strip()
+            if new_role not in ("attacker", "sensor", "general"):
+                new_role = "general"
+            if new_role != self._role:
+                self._role = new_role
+                self._refresh_pixmap()
+                logger.info(f"[MachineAvatar] role={self._role}")
         except Exception as e:
-            logger.warn(f"[MachineAvatar] setBaseColor: {e}")
-    baseColor = Property(QColor, getBaseColor, setBaseColor)
+            logger.error(f"[MachineAvatar] setRole: {e}")
 
-    def getGlowColor(self): return self._glowColor
-    def setGlowColor(self, c: QColor):
+    def setStatus(self, status: str):
         try:
-            self._glowColor = QColor(c)
-            self.update()
+            new_st = "online" if status == "online" else "offline"
+            if new_st != self._status:
+                self._status = new_st
+                self._refresh_pixmap()
+                logger.info(f"[MachineAvatar] status={self._status}")
         except Exception as e:
-            logger.warn(f"[MachineAvatar] setGlowColor: {e}")
-    glowColor = Property(QColor, getGlowColor, setGlowColor)
+            logger.error(f"[MachineAvatar] setStatus: {e}")
 
-    def getScreenColor(self): return self._screenColor
-    def setScreenColor(self, c: QColor):
+    def setIconSize(self, px: int):
         try:
-            self._screenColor = QColor(c)
-            self.update()
+            px = int(px)
+            px = max(self.MIN_ICON_PX, min(self.MAX_ICON_PX, px))
+            if px != self._icon_px:
+                self._icon_px = px
+                self._img.setFixedSize(self._icon_px, self._icon_px)
+                self._refresh_pixmap()
+                logger.info(f"[MachineAvatar] icon_px={self._icon_px}")
         except Exception as e:
-            logger.warn(f"[MachineAvatar] setScreenColor: {e}")
-    screenColor = Property(QColor, getScreenColor, setScreenColor)
+            logger.error(f"[MachineAvatar] setIconSize: {e}")
 
-    def getBaseRectColor(self): return self._baseRectColor
-    def setBaseRectColor(self, c: QColor):
+    # ---------- Helpers ----------
+    def sizeHint(self) -> QSize:
+        return QSize(self._icon_px, self._icon_px)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self.MIN_ICON_PX, self.MIN_ICON_PX)
+
+    def _refresh_pixmap(self):
         try:
-            self._baseRectColor = QColor(c)
-            self.update()
+            pm = ICONS.get_icon(self._role, self._status, self._icon_px)
+            self._img.setPixmap(pm)
+            self._img.repaint()
+            self.repaint()
         except Exception as e:
-            logger.warn(f"[MachineAvatar] setBaseRectColor: {e}")
-    baseRectColor = Property(QColor, getBaseRectColor, setBaseRectColor)
-
-    def getScanlineColor(self): return self._scanlineColor
-    def setScanlineColor(self, c: QColor):
-        try:
-            self._scanlineColor = QColor(c)
-            self.update()
-        except Exception as e:
-            logger.warn(f"[MachineAvatar] setScanlineColor: {e}")
-    scanlineColor = Property(QColor, getScanlineColor, setScanlineColor)
-
-    # ---- Size/Aspect helpers ----
-    def sizeHint(self):
-        return QSize(320, 180)  # 16:9
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, w: int) -> int:
-        try:
-            return max(120, int(w / self.ASPECT))
-        except Exception:
-            return 180
-
-    def _fit_rect_16x9(self, rect) -> QRectF:
-        try:
-            avail_w = rect.width()
-            avail_h = rect.height()
-            target_w = min(avail_w, int(avail_h * self.ASPECT))
-            if target_w / self.ASPECT > avail_h:
-                target_w = int(avail_h * self.ASPECT)
-                target_h = avail_h
-            else:
-                target_h = int(target_w / self.ASPECT)
-            x = rect.left() + (avail_w - target_w) / 2
-            y = rect.top() + (avail_h - target_h) / 2
-            return QRectF(x, y, target_w, target_h)
-        except Exception as e:
-            logger.warn(f"[MachineAvatar] _fit_rect_16x9: {e}")
-            return QRectF(rect)
-
-    # ---- Paint ----
-    def paintEvent(self, e):
-        try:
-            opt = QStyleOption()
-            opt.initFrom(self)
-            p = QPainter(self)
-            self.style().drawPrimitive(QStyle.PE_Widget, opt, p, self)
-
-            outer = self.rect().adjusted(10, 10, -10, -10)
-            screen = self._fit_rect_16x9(outer.adjusted(0, 0, 0, -24))
-
-            base = self._baseColor
-            glow = self._glowColor
-
-            p.setRenderHint(QPainter.Antialiasing, True)
-            p.setPen(QPen(base, 2))
-            p.setBrush(QBrush(self._screenColor))
-            p.drawRoundedRect(screen, 10, 10)
-
-            p.setBrush(QBrush(glow))
-            p.setPen(Qt.NoPen)
-            p.drawRoundedRect(screen.adjusted(-6, -6, 6, 6), 14, 14)
-
-            base_rect = QRectF(outer.left() + outer.width() * 0.15, outer.bottom() - 18, outer.width() * 0.7, 10)
-            p.setBrush(QBrush(self._baseRectColor))
-            p.setPen(QPen(base, 1.5))
-            p.drawRoundedRect(base_rect, 4, 4)
-
-            p.setPen(QPen(self._scanlineColor, 1))
-            y0 = int(screen.top()) + 8
-            y1 = int(screen.bottom()) - 8
-            for y in range(y0, y1, 6):
-                p.drawLine(int(screen.left()) + 8, y, int(screen.right()) - 8, y)
-        except Exception as ex:
-            logger.warn(f"[MachineAvatar] paintEvent falhou: {ex}")
+            logger.error(f"[MachineAvatar] _refresh_pixmap: {e}")

@@ -116,11 +116,6 @@ QPushButton[loading="true"], QToolButton[loading="true"] {
     font-weight: 600;
 }
 
-/* Status Dot por propriedade */
-#statusDot[status="running"] { color: #00ffaa; }
-#statusDot[status="stopped"] { color: #ff6b6b; }
-#statusDot[status="unknown"] { color: #f0c674; }
-
 /* Menu btn no card */
 #actionMenuBtn {
     color: #0a0f0c;
@@ -195,4 +190,157 @@ MachineAvatarExt {
     qproperty-screenColor: rgb(10,30,20);
     qproperty-baseRectColor: rgb(12,40,28);
     qproperty-scanlineColor: rgba(0,255,170,60);
+}
+
+
+/* ===== Guia do Experimento – Container ===== */
+#GuideDialog {
+    background: #050a07;
+    color: #d6ffe9;
+}
+
+/* Header e YAML chip */
+#GuideHeader {
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: 0.3px;
+    color: #b5ffe1;
+}
+#GuideYaml {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(0, 255, 170, 0.10);
+    border: 1px solid rgba(0, 255, 170, 0.28);
+    color: #b9ffe6;
+}
+
+/* ===== Cards ===== */
+#GuideCard {
+    background: rgba(10, 20, 15, 0.75);
+    border: 1px solid rgba(0, 255, 170, 0.22);
+    border-radius: 14px;
+}
+#GuideCard:hover {
+    border-color: rgba(0, 255, 170, 0.48);
+}
+
+/* Títulos e textos */
+#GuideTitle {
+    font-size: 18px;
+    font-weight: 800;
+    color: #9fffe0;
+}
+#GuideDesc {
+    color: #cfeee0;
+}
+#GuideMeta, #GuideArtifacts {
+    color: #a8cdbd;
+}
+
+/* Caixa de comando */
+#GuideCmd {
+    background: #0b1410;
+    border: 1px solid rgba(0, 255, 170, 0.22);
+    border-radius: 10px;
+    padding: 8px;
+    font-family: "Cascadia Code", "Consolas", "Fira Code", monospace;
+    selection-background-color: #1c3a2b;
+    selection-color: #eafff6;
+}
+
+/* Status como “chip” com variação por estado (se existir propriedade state) */
+#GuideStatus {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(0, 255, 170, 0.10);
+    border: 1px solid rgba(0, 255, 170, 0.28);
+    color: #b9ffe6;
+    font-weight: 600;
+}
+#GuideStatus[state="running"] {
+    background: rgba(255, 215, 0, 0.10);
+    border-color: rgba(255, 215, 0, 0.38);
+    color: #ffe27a;
+}
+#GuideStatus[state="done"] {
+    background: rgba(0, 255, 127, 0.12);
+    border-color: rgba(0, 255, 127, 0.40);
+    color: #8fffb9;
+}
+#GuideStatus[state="error"] {
+    background: rgba(255, 77, 109, 0.12);
+    border-color: rgba(255, 77, 109, 0.40);
+    color: #ff9bb0;
+}
+#GuideStatus[state="idle"] {
+    background: rgba(0, 255, 170, 0.10);
+    border-color: rgba(0, 255, 170, 0.28);
+    color: #b9ffe6;
+}
+
+/* ===== Botões do guia ===== */
+#GuideDialog QPushButton,
+#GuideDialog QToolButton {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #113c2c, stop:1 #0e2d22);
+    border: 1px solid rgba(0, 255, 170, 0.32);
+    border-radius: 10px;
+    padding: 6px 12px;
+    color: #e8fff6;
+}
+#GuideDialog QPushButton:hover,
+#GuideDialog QToolButton:hover {
+    border-color: rgba(0, 255, 170, 0.55);
+}
+#GuideDialog QPushButton:pressed,
+#GuideDialog QToolButton:pressed {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0d2a1f, stop:1 #0a2018);
+}
+
+/* Menu do botão “Copiar (…)" */
+QMenu {
+    background: #0b1410;
+    border: 1px solid rgba(0, 255, 170, 0.28);
+    border-radius: 8px;
+    color: #e8fff6;
+}
+QMenu::item:selected {
+    background: rgba(0, 255, 170, 0.14);
+}
+
+/* Console e rodapé */
+#GuideConsole {
+    background: #08110d;
+    border: 1px solid rgba(0, 255, 170, 0.22);
+    border-radius: 12px;
+    font-family: "Cascadia Code", "Consolas", "Fira Code", monospace;
+    selection-background-color: #133224;
+    selection-color: #d8fff2;
+}
+#GuideFooter {
+    color: #9bb7a8;
+}
+
+/* Scrollbars do console/scroll principal */
+QScrollBar:vertical, QScrollBar:horizontal {
+    background: transparent;
+    border: none;
+    margin: 0px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background: rgba(0, 255, 170, 0.28);
+    border-radius: 6px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+    background: rgba(0, 255, 170, 0.45);
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0px; width: 0px; background: none;
+}
+
+/* Tooltips */
+QToolTip {
+    background: #0b1410;
+    color: #dfffea;
+    border: 1px solid rgba(0, 255, 170, 0.28);
+    border-radius: 6px;
 }

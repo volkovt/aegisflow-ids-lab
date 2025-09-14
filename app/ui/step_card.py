@@ -343,6 +343,18 @@ class StepCard(QFrame):
         layout.addLayout(row)
         _here(f"{self.cid}._build:end")
 
+    def _set_status_state(self, state: str):
+        import logging
+        logger = logging.getLogger("VagrantLabUI")
+        try:
+            self.status.setProperty("state", state)
+            self.status.style().unpolish(self.status)
+            self.status.style().polish(self.status)
+            self.status.update()
+            logger.info(f"[Guide][{self.cid}] status_state={state}")
+        except Exception as e:
+            logger.warning(f"[Guide][{self.cid}] status_state falhou: {e}")
+
     def _build_copy_button(self, step: dict) -> QToolButton:
         logger = logging.getLogger("VagrantLabUI")
 
@@ -489,25 +501,42 @@ class StepCard(QFrame):
             logger.error(f"[Guide] Falha ao copiar comando: {e}")
 
     def _on_done(self):
+        logger = logging.getLogger("VagrantLabUI")
         logger.warning(f"[Guide][{self.cid}] DONE marcado")
-        self.status.setText("Concluído ✓")
+        try:
+            self.status.setText("Concluído ✓")
+            self._set_status_state("done")
+        except Exception as e:
+            logger.error(f"[Guide][{self.cid}] erro ao marcar done: {e}")
         self.mark_done.emit(self.step)
 
     def set_running(self):
+        logger = logging.getLogger("VagrantLabUI")
         logger.warning(f"[Guide][{self.cid}] set_running()")
-        self.status.setText("Executando…")
-        self._spin = getattr(self, "_spin", None)
-        if not self._spin:
-            self._spin = _MiniSpinner(self.status, "Executando")
-        self._spin.start()
+        try:
+            self.status.setText("Executando…")
+            self._set_status_state("running")
+            self._spin = getattr(self, "_spin", None)
+            if not self._spin:
+                self._spin = _MiniSpinner(self.status, "Executando")
+            self._spin.start()
+        except Exception as e:
+            logger.error(f"[Guide][{self.cid}] set_running erro: {e}")
 
     def set_idle(self):
+        logger = logging.getLogger("VagrantLabUI")
         logger.warning(f"[Guide][{self.cid}] set_idle()")
-        if hasattr(self, "_spin") and self._spin:
-            try:
-                self._spin.stop("A fazer")
-            except Exception:
+        try:
+            if hasattr(self, "_spin") and self._spin:
+                try:
+                    self._spin.stop("A fazer")
+                except Exception:
+                    self.status.setText("A fazer")
+            else:
                 self.status.setText("A fazer")
+            self._set_status_state("idle")
+        except Exception as e:
+            logger.error(f"[Guide][{self.cid}] set_idle erro: {e}")
 
     def _meta_text(self):
         tags = self.step.get("tags", [])
@@ -1387,7 +1416,9 @@ class ExperimentGuideDialog(QDialog):
     def _on_step_done(self, card: StepCard | None, step: dict, ok: bool):
         logger.warning(f"[Guide] passo concluído ok={ok} step_id={step.get('id')}")
         try:
-            if card: card.status.setText("Concluído ✓" if ok else "Finalizado")
+            if card:
+                card.status.setText("Concluído ✓" if ok else "Finalizado")
+                card._set_status_state("done")
             self._append_console("[guide] Passo concluído.")
         except Exception:
             pass
@@ -1395,7 +1426,9 @@ class ExperimentGuideDialog(QDialog):
     def _on_step_fail(self, card: StepCard | None, step: dict, msg: str):
         logger.error(f"[Guide] passo falhou: {msg}")
         try:
-            if card: card.status.setText("Falhou ✖")
+            if card:
+                card.status.setText("Falhou ✖")
+                card._set_status_state("error")
             self._append_console(f"[erro] {msg}")
             QMessageBox.critical(self, "Erro no passo", msg)
         except Exception as e:

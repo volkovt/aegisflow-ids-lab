@@ -118,23 +118,34 @@ class MainWindow(QMainWindow):
         MachineCard = MachineCardWidgetExt
         MatrixRain = MachineAvatarExt
 
-        central = QWidget(); self.setCentralWidget(central)
-        root = QVBoxLayout(central); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
         self.settings = QSettings("VagrantLabUI", "MatrixEdition")
 
         # Header
         content = QWidget(); content.setObjectName("matrixRoot")
-        content_l = QVBoxLayout(content); content_l.setContentsMargins(0, 0, 0, 0); content_l.setSpacing(0)
+        content_l = QVBoxLayout(content)
+        content_l.setContentsMargins(0, 0, 0, 0)
+        content_l.setSpacing(0)
         root.addWidget(content, 1)
         top = QHBoxLayout(); top.setContentsMargins(12, 8, 12, 8)
-        lbl = QLabel("◤ MATRIX OPS"); lbl.setObjectName("matrixBrand"); top.addWidget(lbl); top.addStretch(1)
+        lbl = QLabel("◤ MATRIX OPS"); lbl.setObjectName("matrixBrand");
+        top.addWidget(lbl)
+        top.addStretch(1)
         content_l.addLayout(top)
 
         # Body split (dock | board)
-        body = QHBoxLayout(); body.setContentsMargins(12, 0, 12, 0); body.setSpacing(12)
+        body = QHBoxLayout()
+        body.setContentsMargins(12, 0, 12, 0)
+        body.setSpacing(12)
         content_l.addLayout(body, 1)
 
-        self.dock = ActionDock(); self.dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding); self.dock.setMinimumWidth(265)
+        self.dock = ActionDock()
+        self.dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        self.dock.setMinimumWidth(265)
         self.status_bar = self.dock.status_bar
         self.btn_write = self.dock.btn_write
         self.btn_up_all = self.dock.btn_up_all
@@ -150,10 +161,18 @@ class MainWindow(QMainWindow):
 
         # Board
         board_wrap = QFrame(); board_wrap.setObjectName("machinesBoard")
-        board_l = QVBoxLayout(board_wrap); board_l.setAlignment(Qt.AlignTop); board_l.setContentsMargins(12, 12, 12, 12); board_l.setSpacing(12)
-        gb = QGroupBox("Máquinas do Lab"); gb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        board_l = QVBoxLayout(board_wrap)
+        board_l.setAlignment(Qt.AlignTop)
+        board_l.setContentsMargins(12, 12, 12, 12)
+        board_l.setSpacing(12)
+        gb = QGroupBox("Máquinas do Lab")
+        gb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        wrap = QWidget(); wrap_l = QVBoxLayout(wrap); wrap_l.setSizeConstraint(QLayout.SetNoConstraint); wrap_l.setAlignment(Qt.AlignTop); wrap_l.setContentsMargins(0, 0, 0, 0); wrap_l.setSpacing(8)
+        wrap = QWidget(); wrap_l = QVBoxLayout(wrap)
+        wrap_l.setSizeConstraint(QLayout.SetNoConstraint)
+        wrap_l.setAlignment(Qt.AlignTop)
+        wrap_l.setContentsMargins(0, 0, 0, 0)
+        wrap_l.setSpacing(8)
         self.cards: dict[str, MachineCard] = {}
         for m in self.cfg.machines:
             card = MachineCard(m.name)
@@ -161,16 +180,23 @@ class MainWindow(QMainWindow):
             card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             wrap_l.addWidget(card)
 
-            card.act_up.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self.ctrl.up_all(btn=self.btn_up_all) if n=="__all__" else self.ctrl.restart_vm(n, btn=card.menu_btn))
+            card.act_up.triggered.connect(
+                lambda _=False, n=m.name, b=card.menu_btn: self.ctrl.up_vm(n, btn=b)
+            )
             card.act_status.triggered.connect(lambda _=False, n=m.name, c=card: self.ctrl.status_by_name(n, on_card_status=lambda st: self._set_card_status(c, st)))
             card.act_restart.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self.ctrl.restart_vm(n, btn=b))
             card.act_halt.triggered.connect(lambda _=False, n=m.name: self.ctrl._run_simple_vagrant(self.vagrant.halt, btn=self.btn_halt_all, active_label="Halt…", idle_label="Halt todas"))
             card.act_destroy.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self.ctrl._run_simple_vagrant(self.vagrant.destroy, btn=self.btn_destroy_all, active_label="Destroy…", idle_label="Destroy todas"))
             card.act_ssh.triggered.connect(lambda _=False, n=m.name: self.ctrl.ssh_open(n))
 
-        machinesScroll = QScrollArea(); machinesScroll.setObjectName("machinesScroll"); machinesScroll.setWidgetResizable(True)
-        machinesScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); machinesScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        machinesScroll.setFrameShape(QFrame.NoFrame); machinesScroll.setAlignment(Qt.AlignTop); machinesScroll.setWidget(wrap)
+        machinesScroll = QScrollArea()
+        machinesScroll.setObjectName("machinesScroll")
+        machinesScroll.setWidgetResizable(True)
+        machinesScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        machinesScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        machinesScroll.setFrameShape(QFrame.NoFrame)
+        machinesScroll.setAlignment(Qt.AlignTop)
+        machinesScroll.setWidget(wrap)
         self.machinesScroll = machinesScroll; self.machinesWrap = wrap
 
         gb_layout = QVBoxLayout(gb); gb_layout.setAlignment(Qt.AlignTop); gb_layout.setContentsMargins(8, 8, 8, 8); gb_layout.setSpacing(6)
@@ -180,17 +206,30 @@ class MainWindow(QMainWindow):
         self.global_progress = QProgressBar(); self.global_progress.setRange(0, 0); self.global_progress.setVisible(False); self.global_progress.setObjectName("globalProgress")
         board_l.addWidget(self.global_progress)
 
-        console = QGroupBox("Console"); cv = QVBoxLayout(console); cv.setAlignment(Qt.AlignTop)
-        self.log_view = QPlainTextEdit(); self.log_view.setReadOnly(True); self.log_view.setObjectName("logConsole"); self.log_view.setMinimumHeight(240)
+        console = QGroupBox("Console")
+        cv = QVBoxLayout(console); cv.setAlignment(Qt.AlignTop)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setObjectName("logConsole")
+        self.log_view.setMinimumHeight(240)
         console.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed); cv.addWidget(self.log_view)
         board_l.addWidget(console, 0)
 
-        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded); scroll.setObjectName("boardScroll"); scroll.setWidget(board_wrap); scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setObjectName("boardScroll")
+        scroll.setWidget(board_wrap);
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         from PySide6.QtWidgets import QSplitter
-        self.splitter = QSplitter(Qt.Horizontal, self); self.splitter.setObjectName("mainSplitter"); self.splitter.setChildrenCollapsible(False)
-        self.splitter.addWidget(self.dock); self.splitter.addWidget(scroll); self.splitter.setStretchFactor(0, 0); self.splitter.setStretchFactor(1, 1)
-        # largura do handle agora é definida em QSS (QSplitter::handle { width: ... })
+        self.splitter = QSplitter(Qt.Horizontal, self)
+        self.splitter.setObjectName("mainSplitter")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self.dock)
+        self.splitter.addWidget(scroll)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([265, 1000])
         body.addWidget(self.splitter, 1)
 
@@ -242,10 +281,7 @@ class MainWindow(QMainWindow):
     # ------------- UI helpers -------------
     def _set_card_status(self, card: MachineCardWidgetExt, state: str):
         try:
-            status = "running" if state == "running" else ("stopped" if state in ("poweroff", "powered", "aborted") else "unknown")
-            card.statusDot.setProperty("status", status)
-            card.statusDot.style().unpolish(card.statusDot)
-            card.statusDot.style().polish(card.statusDot)
+            card.set_status(state)
         except Exception as e:
             self._append_log(f"[WARN] _set_card_status: {e}")
 
@@ -257,6 +293,7 @@ class MainWindow(QMainWindow):
                 if len(parts) >= 2:
                     states[parts[0]] = parts[1]
             for name, card in self.cards.items():
+                # usa a mesma via de atualização centralizada
                 self._set_card_status(card, states.get(name, "unknown"))
             running = [n for n, st in states.items() if st == "running"]
             for i, n in enumerate(running):

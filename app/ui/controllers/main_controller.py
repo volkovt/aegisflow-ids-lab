@@ -60,6 +60,51 @@ class MainController:
         self.current_yaml_path: Path = self.project_root / "lab" / "experiments" / "exp_all.yaml"
         self.yaml_selected_by_user: bool = False
 
+    def up_vm(self, name: str, *, btn: QPushButton | None = None):
+        def gen():
+            try:
+                self.append_log(f"[Up] Garantindo {name}…")
+                template_dir = self.project_root / "app" / "templates"
+                ctx = self.vagrant_ctx.build(self.current_yaml_path)
+                try:
+                    for ln in self.vagrant.ensure_created_and_running(
+                            name, template_dir, ctx, attempts=20, delay_s=4
+                    ):
+                        yield ln
+                except AttributeError:
+                    for ln in self.vagrant.up(name):
+                        yield ln
+
+                try:
+                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
+                    yield f"[Up] {name} running + SSH pronto."
+                except Exception as e:
+                    yield f"[Up] {name} running, mas SSH não respondeu ainda: {e}"
+
+                try:
+                    self.warmup.mark_boot(name)
+                    yield f"[Warmup] {name}: janela de aquecimento iniciada (30s)."
+                except Exception as e:
+                    yield f"[Warmup] Falha ao marcar boot de {name}: {e}"
+
+                yield "[Up] Concluído."
+                return "ok"
+            except Exception as e:
+                yield f"[ERRO] Up {name}: {e}"
+                return "error"
+
+        try:
+            worker = Worker(gen)
+            worker.line.connect(self.append_log)
+            worker.error.connect(lambda msg: self.append_log(f"[ERRO] Up {name}: {msg}"))
+            if btn is not None:
+                self.tm.wire_button(btn, worker, active_label="Up…", idle_label="Up")
+            worker.done.connect(lambda: self.status_by_name(name, on_card_status=lambda _st: None))
+            self.tm.keep(worker, tag=f"up:{name}")
+            worker.start()
+        except Exception as e:
+            self.append_log(f"[ERRO] up_vm({name}): {e}")
+
     # ---------------- Dataset ----------------
     def _on_ds_started(self):
         try:
