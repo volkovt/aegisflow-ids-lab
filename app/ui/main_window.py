@@ -19,6 +19,7 @@ from app.core.vagrant_manager import VagrantManager
 from app.core.ssh_manager import SSHManager
 from app.core.preflight import run_preflight
 from app.core.data_collector import WarmupCoordinator
+from app.core.workers.os_worker import refresh_os_async
 
 from app.ui.components.action_dock import ActionDockWidgetExt
 from app.ui.components.machine_card import MachineCardWidgetExt
@@ -40,6 +41,7 @@ LOG_DIR = Path(".logs")
 
 class MainWindow(QMainWindow):
     log_line = Signal(str)
+    osTextArrived = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -52,10 +54,15 @@ class MainWindow(QMainWindow):
         self.cfg = load_config(self.cfg_path)
         self.machine_by_name = {m.name: m for m in self.cfg.machines}
 
+        self._os_threads = {}
+        try:
+            self.osTextArrived.connect(self._set_machine_os_text)
+        except Exception as e:
+            self.logger.error(f"[UI] connect osTextArrived: {e}")
+
         self.project_root = Path.cwd()
         self.lab_dir = self.project_root / self.cfg.lab_dir
 
-        # Core managers
         self.vagrant = VagrantManager(self.project_root, self.lab_dir)
         self.ssh = SSHManager(self.lab_dir)
         self.preflight = PreflightEnforcer(self.vagrant, self.lab_dir)
@@ -183,11 +190,13 @@ class MainWindow(QMainWindow):
             card.act_up.triggered.connect(
                 lambda _=False, n=m.name, b=card.menu_btn: self.ctrl.up_vm(n, btn=b)
             )
-            card.act_status.triggered.connect(lambda _=False, n=m.name, c=card: self.ctrl.status_by_name(n, on_card_status=lambda st: self._set_card_status(c, st)))
+            card.act_status.triggered.connect(lambda _=False, n=m.name, c=card: self._on_card_status(n, c))
             card.act_restart.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self.ctrl.restart_vm(n, btn=b))
             card.act_halt.triggered.connect(lambda _=False, n=m.name: self.ctrl._run_simple_vagrant(self.vagrant.halt, btn=self.btn_halt_all, active_label="Halt…", idle_label="Halt todas"))
             card.act_destroy.triggered.connect(lambda _=False, n=m.name, b=card.menu_btn: self.ctrl._run_simple_vagrant(self.vagrant.destroy, btn=self.btn_destroy_all, active_label="Destroy…", idle_label="Destroy todas"))
             card.act_ssh.triggered.connect(lambda _=False, n=m.name: self.ctrl.ssh_open(n))
+
+        self._last_state_map: dict[str, str] = {}
 
         machinesScroll = QScrollArea()
         machinesScroll.setObjectName("machinesScroll")
@@ -203,7 +212,11 @@ class MainWindow(QMainWindow):
         gb_layout.addWidget(machinesScroll)
         board_l.addWidget(gb, 1)
 
-        self.global_progress = QProgressBar(); self.global_progress.setRange(0, 0); self.global_progress.setVisible(False); self.global_progress.setObjectName("globalProgress")
+        self.global_progress = QProgressBar();
+        self.global_progress.setRange(0, 0);
+        self.global_progress.setFixedHeight(8);
+        self.global_progress.setVisible(False);
+        self.global_progress.setObjectName("globalProgress")
         board_l.addWidget(self.global_progress)
 
         console = QGroupBox("Console")
@@ -242,6 +255,35 @@ class MainWindow(QMainWindow):
 
         self._rain = MatrixRain(self); self._rain.setObjectName("matrixRain"); self._rain.lower()
 
+    def _reflect_to_guide(self, name: str, state: str):
+        try:
+            if self._guide_dialog and hasattr(self._guide_dialog, "reflect_machine_status"):
+                self._guide_dialog.reflect_machine_status(name, state)
+        except Exception as e:
+            self._append_log(f"[UI] reflect_to_guide: {e}")
+
+    def _on_card_status(self, name: str, card):
+        try:
+            def apply(st: str):
+                try:
+                    self._set_card_status(card, st)
+                    self._reflect_to_guide(name, st)
+
+                    if st == "running":
+                        QTimer.singleShot(0, lambda n=name: self._start_os_probe(n))
+                except Exception as e:
+                    self._append_log(f"[UI] _on_card_status.apply: {e}")
+
+            self.ctrl.status_by_name(name, on_card_status=apply)
+        except Exception as e:
+            self._append_log(f"[UI] _on_card_status: {e}")
+
+    def _set_global_progress(self, visible: bool):
+        try:
+            self.global_progress.setVisible(visible)
+        except Exception as e:
+            self._append_log(f"[UI] progress toggle: {e}")
+
     def _wire_actions(self):
         self.btn_write.clicked.connect(lambda: self.ctrl.write_vagrantfile(btn=self.btn_write))
         self.btn_up_all.clicked.connect(lambda: self.ctrl.up_all(btn=self.btn_up_all))
@@ -255,6 +297,54 @@ class MainWindow(QMainWindow):
         self.btn_open_guide.clicked.connect(self._on_open_guide)
         self.btn_open_data.clicked.connect(lambda: self.ctrl.open_folder(self.project_root / "data"))
 
+        try:
+            self.ds_controller.started.connect(lambda: self._set_global_progress(True))
+            self.ds_controller.progress.connect(self._append_log)
+            self.ds_controller.finished.connect(lambda _st: self._set_global_progress(False))
+        except Exception as e:
+            self._append_log(f"[UI] wire dataset progress: {e}")
+
+    def _on_os_thread_finished(self, vm_name: str, th):
+        try:
+            self._os_threads.pop(vm_name, None)
+            try:
+                th.deleteLater()
+            except Exception:
+                pass
+        except Exception as e:
+            self._append_log(f"[UI] _on_os_thread_finished: {e}")
+
+    def _kickoff_initial_os_probes(self):
+        try:
+            names = list(self.cards.keys())
+
+            if getattr(self, "_last_state_map", None):
+                names = [n for n, st in self._last_state_map.items() if st == "running"] or names
+
+            for i, n in enumerate(names):
+                QTimer.singleShot(150 * i, lambda vm=n: self._start_os_probe(vm))
+
+            self._append_log(f"[UI] OS probes inicial disparado para: {', '.join(names)}")
+        except Exception as e:
+            self._append_log(f"[UI] kickoff probes: {e}")
+
+    def _start_os_probe(self, vm_name: str):
+        """Inicia o probe de OS, guarda a thread e conecta finished -> _on_os_thread_finished."""
+        try:
+            th = refresh_os_async(self, vm_name)
+            if not th:
+                return
+            self._os_threads[vm_name] = th
+            try:
+                th.finished.connect(lambda n=vm_name, t=th: self._on_os_thread_finished(n, t))
+            except Exception:
+                try:
+                    th.done.connect(lambda n=vm_name, t=th: self._on_os_thread_finished(n, t))
+                except Exception:
+                    pass
+        except Exception as e:
+            self._append_log(f"[UI] _start_os_probe: {e}")
+
     # ------------- Window events -------------
     def showEvent(self, event):
         try:
@@ -266,6 +356,8 @@ class MainWindow(QMainWindow):
                         geo = screen.availableGeometry()
                         self.setGeometry(geo)
                         self.showMaximized()
+
+                    QTimer.singleShot(550, self._kickoff_initial_os_probes)
                 except Exception as e:
                     self._append_log(f"[UI] showEvent: {e}")
         except Exception as e:
@@ -274,6 +366,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         try:
             QSettings("VagrantLabUI", "MatrixEdition").setValue("splitter/sizes", self.splitter.sizes())
+            self.ctrl.detach_ui_log_handlers()
         except Exception as e:
             self._append_log(f"[UI] closeEvent: {e}")
         super().closeEvent(event)
@@ -292,17 +385,46 @@ class MainWindow(QMainWindow):
                 parts = line.strip().split()
                 if len(parts) >= 2:
                     states[parts[0]] = parts[1]
+
+            self._last_state_map = dict(states)
+
             for name, card in self.cards.items():
                 self._set_card_status(card, states.get(name, "unknown"))
+
             running = [n for n, st in states.items() if st == "running"]
             for i, n in enumerate(running):
                 QTimer.singleShot(1200 * i, lambda name=n, st="running": self.ctrl.spawn_info_update(name, st))
+                QTimer.singleShot(200 * i, lambda vm=n: self._start_os_probe(vm))
 
             if self._guide_dialog and hasattr(self._guide_dialog, "reflect_status_map"):
                 self._append_log("[UI] Atualizando status no Guia do Experimento.")
                 self._guide_dialog.reflect_status_map(states)
         except Exception as e:
             self._append_log(f"[WARN] _apply_status_to_cards: {e}")
+
+    def _push_status_to_guide(self, states: dict[str, str] | None = None):
+        """Empurra um snapshot de status para o Guia (cache ou inferido)."""
+        try:
+            if not self._guide_dialog:
+                return
+
+            snap = states or (getattr(self, "_last_state_map", {}) or {})
+            if not snap:
+                try:
+                    snap = {
+                        name: ("running" if getattr(card, "_vis", "offline") == "online" else "stopped")
+                        for name, card in self.cards.items()
+                    }
+                except Exception as e:
+                    self._append_log(f"[UI] infer snapshot fail: {e}")
+                    snap = {}
+
+            if snap and hasattr(self._guide_dialog, "reflect_status_map"):
+                self._guide_dialog.reflect_status_map(snap)
+                self._append_log("[UI] Snapshot inicial de status enviado ao Guia.")
+        except Exception as e:
+            self._append_log(f"[UI] push_status_to_guide: {e}")
+
 
     def _set_card_info(self, name: str, os_text: str, host_endpoint: str, guest_ip: str):
         try:
@@ -322,6 +444,27 @@ class MainWindow(QMainWindow):
             self._append_log(f"[UI] _set_card_info aplicado para {name}.")
         except Exception as e:
             self._append_log(f"[WARN] _set_card_info falhou para {name}: {e}")
+
+    def _set_machine_os_text(self, vm_name: str, os_text: str):
+        try:
+            card = self.cards.get(vm_name)
+            if not card:
+                return
+
+            if hasattr(card, "pills") and "so" in card.pills:
+                pill = card.pills["so"]
+                value = os_text or "—"
+                pill.setValue(value)
+                pill.setToolTip(value)
+            elif hasattr(card, "set_pill_values"):
+                host = card.pills["host"].toolTip() if hasattr(card, "pills") and "host" in card.pills else "—"
+                guest = card.pills["guest"].toolTip() if hasattr(card, "pills") and "guest" in card.pills else "—"
+                card.set_pill_values(os_text or "—", host, guest)
+
+            self._append_log(f"[SO] {vm_name}: {os_text}")
+        except Exception as e:
+            self._append_log(f"[UI] _set_machine_os_text: {e}")
+
 
     # ------------- Actions -------------
     def _on_preflight(self):
@@ -385,6 +528,9 @@ class MainWindow(QMainWindow):
                     dlg.setWindowState((dlg.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
             except Exception as e:
                 self._append_log(f"[UI] bring-to-front Guide falhou: {e}")
+
+            self._push_status_to_guide()
+            QTimer.singleShot(50, lambda: self.ctrl.status_all(btn=self.btn_status))
         except Exception as e:
             self._append_log(f"[ERRO] Abrir Guia: {e}")
             QMessageBox.critical(self, "Guia do Experimento", str(e))
@@ -398,10 +544,7 @@ class MainWindow(QMainWindow):
             lineno = -1
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         formatted = f"{timestamp} | linha {lineno} | {text}"
-        try:
-            self.logger.info(text)
-        except Exception:
-            pass
+
         try:
             if QThread.currentThread() is QApplication.instance().thread():
                 self._append_log_gui(formatted)
@@ -415,6 +558,7 @@ class MainWindow(QMainWindow):
             self.log_view.appendPlainText(formatted)
         except Exception as e:
             logging.getLogger("[UI]").error(f"Falha ao atualizar log_view: {e}")
+
 
 
 def run_app():

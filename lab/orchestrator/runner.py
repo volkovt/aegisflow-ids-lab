@@ -1,4 +1,5 @@
 import logging, time, json
+import random
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -39,6 +40,22 @@ except Exception:
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _resolve_workload(exp):
+    """
+    Lê exp.workload com defaults seguros.
+    """
+    wl = getattr(exp, "workload", {}) or {}
+    return {
+        "cycles": int(wl.get("cycles", 3)),
+        "cool_down_min_s": int(wl.get("cool_down_min_s", 8)),
+        "cool_down_max_s": int(wl.get("cool_down_max_s", 18)),
+        "benign_burst_s": int(wl.get("benign_burst_s", 15)),
+        "max_parallel_bruteforce": int(wl.get("max_parallel_bruteforce", 2)),
+        "ssh_attempts": int(wl.get("ssh_attempts", 150)),
+        "http_attempts": int(wl.get("http_attempts", 150)),
+        "rate_limit_per_sec": int(wl.get("rate_limit_per_sec", 8)),
+        "jitter_ms": wl.get("jitter_ms", [60, 180]),
+    }
 
 class ExperimentRunner:
     def __init__(self, ssh_manager, lab_dir: Path):
@@ -62,19 +79,42 @@ class ExperimentRunner:
 
     def _stop_sensor_capture_best_effort(self):
         """
-        Para tcpdump/zeek no sensor mesmo que o SensorAgent não tenha stop_capture().
-        Idempotente/best-effort.
+        Para tcpdump/zeek no sensor com segurança e sem derrubar o shell:
+        - valida PIDs lidos de pidfiles (kill -0)
+        - envia TERM e, se necessário, KILL
+        - usa pkill -x (nome exato), não -f
+        - limpa pidfiles (inclusive órfãos)
         """
         try:
             self.ssh.run_command(
                 "sensor",
-                "bash -lc \""
-                "for p in /var/run/tcc_*.pid; do [ -f $p ] && sudo kill $(cat $p) 2>/dev/null || true; done; "
-                "sudo pkill -f 'tcpdump -i' || true; "
-                "sudo pkill -f 'zeek -i' || true\"",
+                "bash -lc '"
+                "shopt -s nullglob; "
+                # 1ª passada: TERM em PIDs válidos
+                "for p in /var/run/tcc_*.pid; do "
+                "  [ -s \"$p\" ] || continue; "
+                "  pid=\"$(tr -cd 0-9 < \"$p\")\"; "
+                "  if [ -n \"$pid\" ] && sudo -n kill -0 \"$pid\" 2>/dev/null; then "
+                "    sudo -n kill \"$pid\" 2>/dev/null || true; "
+                "  fi; "
+                "done; "
+                # Mata por nome EXATO (não derruba o bash executor)
+                "sudo -n pkill -x tcpdump 2>/dev/null || true; "
+                "sudo -n pkill -x zeek    2>/dev/null || true; "
+                "sleep 0.3; "
+                # 2ª passada: KILL se ainda vivo + limpa pidfiles
+                "for p in /var/run/tcc_*.pid; do "
+                "  [ -e \"$p\" ] || continue; "
+                "  pid=\"$(tr -cd 0-9 < \"$p\")\"; "
+                "  if [ -n \"$pid\" ] && sudo -n kill -0 \"$pid\" 2>/dev/null; then "
+                "    sudo -n kill -9 \"$pid\" 2>/dev/null || true; "
+                "  fi; "
+                "  sudo -n rm -f \"$p\" 2>/dev/null || true; "
+                "done'"
+                ,
                 timeout=40
             )
-            logger.info("[Runner] Captura no sensor: parada (best-effort).")
+            logger.info("[Runner] Captura no sensor: parada com sucesso (TERM/KILL best-effort).")
         except Exception as e:
             logger.warning(f"[Runner] Falha ao parar captura (best-effort): {e}")
 
@@ -107,7 +147,6 @@ class ExperimentRunner:
             timeline["stages"].append(d)
 
         capture_on = False
-        guard_applied = False
         nat_off = False
 
         try:
@@ -124,11 +163,10 @@ class ExperimentRunner:
             victim = VictimAgent(self.ssh)
             attacker = AttackerAgent(self.ssh)
 
-            # PREPARE (instala ferramentas/serviços em paralelo)
+            # --- PREPARE (paralelo só para victim/attacker) ---
             self._check_cancel(cancel_event)
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            with ThreadPoolExecutor(max_workers=2) as ex:
                 futs = [
-                    ex.submit(sensor.ensure_tools),
                     ex.submit(victim.prepare_services),
                     ex.submit(attacker.ensure_tools),
                 ]
@@ -141,13 +179,46 @@ class ExperimentRunner:
             self._check_cancel(cancel_event)
             self._wait_vm_ssh("attacker", attempts=8, delay_s=5)
 
-            # ARM capture
+            # --- SENSOR: promíscuo + ferramentas em série ---
+            self._check_cancel(cancel_event)
+            logger.info("[Runner] Preparando sensor (promisc + ferramentas)...")
+            mark("sensor_promisc_start")
+            try:
+                sensor.enable_promisc(iface_hint="eth1")
+                mark("sensor_promisc_end", {"status": "ok"})
+            except Exception as e:
+                logger.warning(f"[Runner] enable_promisc falhou: {e}")
+                mark("sensor_promisc_end", {"status": "error", "error": str(e)})
+
+            mark("sensor_tools_start")
+            try:
+                sensor.ensure_tools()
+                mark("sensor_tools_end", {"status": "ok"})
+            except Exception as e:
+                logger.error(f"[Runner] ensure_tools (sensor) falhou: {e}")
+                mark("sensor_tools_end", {"status": "error", "error": str(e)})
+                raise
+
+            # --- Teste rápido de espelhamento (opcional) ---
+            victim_ip = exp.targets.get("victim_ip") if isinstance(exp.targets, dict) else None
+            try:
+                if victim_ip:
+                    ok_mirror = sensor.mirror_smoke_test(victim_ip=victim_ip, packets=6, iface_hint="eth1")
+                    if not ok_mirror:
+                        logger.warning("[Runner] mirror_smoke_test não capturou pacotes. Verifique nicpromisc no VirtualBox e gere tráfego.")
+                else:
+                    logger.warning("[Runner] victim_ip ausente no exp.targets; pulando mirror_smoke_test.")
+            except Exception as e:
+                logger.warning(f"[Runner] mirror_smoke_test falhou: {e}")
+
+            # --- ARM capture ---
             self._check_cancel(cancel_event)
             mark("arm_start")
             sensor.arm_capture(
                 rotate_sec=exp.capture_plan.rotate_seconds,
                 rotate_mb=exp.capture_plan.rotate_size_mb,
-                zeek_rotate_sec=exp.capture_plan.zeek_rotate_seconds
+                victim_ip=exp.targets.get("victim_ip"),
+                attacker_ip=exp.targets.get("attacker_ip")
             )
             capture_on = True
             time.sleep(3)
@@ -157,43 +228,63 @@ class ExperimentRunner:
 
             # SAFETY GATE: confina tráfego do atacante ao LAB
             self._check_cancel(cancel_event)
-            victim_ip = exp.targets.get("victim_ip") if isinstance(exp.targets, dict) else None
             sensor_ip = exp.targets.get("sensor_ip") if isinstance(exp.targets, dict) else None
-            hardening_enabled = bool(apply_attacker_egress_guard) or bool(toggle_attacker_nat)
 
+            hardening_enabled = bool(toggle_attacker_nat)
             if hardening_enabled:
-                if apply_attacker_egress_guard and victim_ip:
-                    mark("safety_guard_apply_start", {"victim_ip": victim_ip, "sensor_ip": sensor_ip})
-                    try:
-                        self._with_retry(
-                            tries=3, delay_s=3, fn=apply_attacker_egress_guard,
-                            ssh=self.ssh, victim_ip=victim_ip, sensor_ip=sensor_ip
-                        )
-                        guard_applied = True
-                        mark("safety_guard_apply_end", {"status": "ok"})
-                    except Exception as e:
-                        logger.error(f"[Runner] Falha ao aplicar egress guard: {e}")
-                        mark("safety_guard_apply_end", {"status": "error", "error": str(e)})
-
-                if toggle_attacker_nat:
-                    mark("nat_isolate_start")
-                    try:
-                        self._with_retry(tries=3, delay_s=2, fn=toggle_attacker_nat, ssh=self.ssh, enable=False)
-                        nat_off = True
-                        mark("nat_isolate_end", {"status": "ok"})
-                    except Exception as e:
-                        logger.warning(f"[Runner] Falha ao desativar NAT: {e}")
-                        mark("nat_isolate_end", {"status": "error", "error": str(e)})
+                mark("nat_isolate_start", {"victim_ip": victim_ip, "sensor_ip": sensor_ip})
+                try:
+                    self._with_retry(
+                        tries=3,
+                        delay_s=2,
+                        fn=toggle_attacker_nat,
+                        ssh=self.ssh,
+                        enable=False,
+                        victim_ip=victim_ip,
+                        sensor_ip=sensor_ip
+                    )
+                    nat_off = True
+                    mark("nat_isolate_end", {"status": "ok"})
+                except Exception as e:
+                    logger.warning(f"[Runner] Falha ao isolar NAT/egress: {e}")
+                    mark("nat_isolate_end", {"status": "error", "error": str(e)})
 
             # ATTACK
             self._check_cancel(cancel_event)
-            for action in exp.actions:
+            workload = _resolve_workload(exp)
+            cycles = workload["cycles"]
+            cool_min = workload["cool_down_min_s"]
+            cool_max = workload["cool_down_max_s"]
+
+            for c in range(1, cycles + 1):
                 self._check_cancel(cancel_event)
-                stage = f"attack_{action.__class__.__name__}"
-                mark(stage + "_start")
-                logger.info(f"[Runner] Ação: {action.__class__.__name__}")
-                action.run(self.ssh, victim_ip or exp.targets["victim_ip"])
-                mark(stage + "_end")
+                logger.info(f"[Runner] Iniciando ciclo {c}/{cycles}")
+
+                try:
+                    attacker.start_benign_burst(
+                        benign_cfg=getattr(exp, "benign", None),
+                        duration_s=workload["benign_burst_s"],
+                        cancel_event=cancel_event
+                    )
+                except Exception as e:
+                    logger.warning(f"[Runner] Benign burst falhou (ciclo {c}): {e}")
+
+                for action in exp.actions:
+                    self._check_cancel(cancel_event)
+                    stage = f"attack_{action.__class__.__name__}"
+                    mark(stage + "_start", {"cycle": c})
+                    logger.info(f"[Runner] Ação: {action.__class__.__name__} (ciclo {c})")
+                    action.run(
+                        self.ssh,
+                        victim_ip or exp.targets["victim_ip"],
+                        workload=workload
+                    )
+                    mark(stage + "_end", {"cycle": c})
+
+                    sleep_s = random.randint(cool_min, cool_max)
+                    time.sleep(sleep_s)
+
+                logger.info(f"[Runner] Ciclo {c} finalizado.")
 
             # VALIDATE
             self._check_cancel(cancel_event)
@@ -202,6 +293,14 @@ class ExperimentRunner:
             if auth_tail:
                 logger.info(f"[Runner] auth.log (trecho):\n{auth_tail}")
             mark("validate_end")
+
+            # --- PERSISTE TIMELINE ANTES DO ETL/harvest ---
+            try:
+                logger.info("[Runner] Persistindo timeline antes do ETL...")
+                self._write_status_marker(out_dir, exp.exp_id, timeline, status="pre_etl")
+                logger.info("[Runner] timeline.json gravado (pré-ETL).")
+            except Exception as e:
+                logger.error(f"[Runner] Falha ao persistir timeline antes do ETL: {e}")
 
             # HARVEST + PACKAGE
             self._check_cancel(cancel_event)
@@ -222,7 +321,6 @@ class ExperimentRunner:
             logger.error(f"[Runner] Falha geral do experimento: {e}")
             raise
         finally:
-            # ALWAYS ROLLBACK (idempotente)
             try:
                 if capture_on:
                     self._stop_sensor_capture_best_effort()
@@ -232,22 +330,12 @@ class ExperimentRunner:
                 if nat_off and toggle_attacker_nat:
                     try:
                         toggle_attacker_nat(self.ssh, enable=True)
-                        logger.info("[Runner] NAT restaurado.")
+                        logger.info("[Runner] NAT/egress guard restaurado (removido).")
                     except Exception as e:
-                        logger.warning(f"[Runner] Falha ao restaurar NAT: {e}")
-            except Exception:
-                pass
-            try:
-                if guard_applied and remove_attacker_egress_guard:
-                    try:
-                        remove_attacker_egress_guard(self.ssh)
-                        logger.info("[Runner] Egress guard removido.")
-                    except Exception as e:
-                        logger.warning(f"[Runner] Falha ao remover egress guard: {e}")
+                        logger.warning(f"[Runner] Falha ao restaurar NAT/egress: {e}")
             except Exception:
                 pass
 
-            # Salva marcadores/timeline mesmo em cancel/erro
             try:
                 final_status = "aborted" if aborted else status
                 self._write_status_marker(out_dir, exp.exp_id, timeline, final_status)

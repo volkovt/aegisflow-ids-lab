@@ -47,12 +47,24 @@ def load_experiment_from_yaml(path: str) -> Experiment:
         actions_bag: List[Any] = []
         for a in cfg.get("actions", []):
             try:
-                name = a["name"]
-                params: Dict[str, Any] = a.get("params", {})
+                if isinstance(a, str):
+                    name = a.strip()
+                    params = {}
+                elif isinstance(a, dict):
+                    name = a.get("name") or a.get("action")
+                    if not name:
+                        raise ValueError("Item em 'actions' sem 'name' (ou 'action').")
+                    params = a.get("params", {}) or {}
+                    if not isinstance(params, dict):
+                        raise TypeError(f"'params' deve ser dict (recebido {type(params).__name__}).")
+                else:
+                    raise TypeError(f"Item inválido em 'actions': {type(a).__name__}")
+
                 cls = _ACTIONS_REGISTRY.get(name)
                 if not cls:
                     logger.warning(f"[YAMLLoader] Ação desconhecida: {name} — ignorando.")
                     continue
+
                 actions_bag.append(cls(**params))
             except Exception as e:
                 logger.error(f"[YAMLLoader] Falha ao criar ação '{a}': {e}")

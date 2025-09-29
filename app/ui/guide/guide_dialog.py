@@ -62,8 +62,12 @@ class ExperimentGuideDialog(QDialog):
         self._rendered_real = False
         self._ignore_loader_results = False
         self._batch_running = False
+        self._cancel_requested = False
+        self._current_card = None
+        self._current_worker = None
         self._batch_queue: list[dict] = []
         self._last_states: Dict[str, str] = {}
+
 
         self._build_ui()
         self._update_yaml_header_label()
@@ -84,7 +88,7 @@ class ExperimentGuideDialog(QDialog):
         header = QHBoxLayout()
         header.setSpacing(10)
 
-        self.lbl_title = QLabel("◤ HOLO-GUIDE")
+        self.lbl_title = QLabel("◤ Guia do Experimento ◢")
         self.lbl_title.setObjectName("GuideHeader")
 
         self.lbl_yaml = QLabel("—")
@@ -102,6 +106,17 @@ class ExperimentGuideDialog(QDialog):
         self.btn_clear_tests = QPushButton("Limpar")
         self.btn_run_all = QPushButton("Rodar todos")
         self.btn_mark_all_done = QPushButton("Marcar ✓")
+
+        self.btn_pick_yaml.setToolTip("Selecionar um arquivo YAML de experimento (substitui o oficial)")
+        self.btn_reload.setToolTip("Recarregar o parser oficial (ignora qualquer YAML selecionado)")
+        self.btn_clear_tests.setToolTip("Limpar console, resetar status dos passos e apagar timeline")
+        self.btn_run_all.setToolTip("Executar todos os passos que definiram um comando")
+        self.btn_mark_all_done.setToolTip("Marcar todos os passos como concluídos (sem executar)")
+
+        try:
+            self.btn_run_all.setEnabled(False)
+        except Exception:
+            pass
 
         for b in (self.btn_pick_yaml, self.btn_reload, self.btn_clear_tests, self.btn_run_all, self.btn_mark_all_done):
             b.setObjectName("HoloBtn")
@@ -145,7 +160,6 @@ class ExperimentGuideDialog(QDialog):
 
         main.addWidget(scroll, 1)
 
-        # Console + ações
         bottom = QHBoxLayout()
         self.btn_console_clear = QPushButton("Limpar console")
         self.btn_console_save = QPushButton("Salvar log…")
@@ -153,8 +167,21 @@ class ExperimentGuideDialog(QDialog):
         self.btn_cancel = QPushButton("Cancelar")
         self.btn_run_runner = QPushButton("Gerar dataset")
 
+        self.btn_console_clear.setToolTip("Limpar todo o texto do console abaixo")
+        self.btn_console_save.setToolTip("Salvar o conteúdo do console em um arquivo de texto")
+        self.btn_isolate.setToolTip("Requer attacker ONLINE")
+        self.btn_cancel.setToolTip("Cancelar qualquer passo em execução")
+        self.btn_run_runner.setToolTip("Requer pelo menos uma máquina ONLINE")
+
         for b in (self.btn_console_clear, self.btn_console_save, self.btn_isolate, self.btn_cancel, self.btn_run_runner):
             b.setObjectName("HoloBtn")
+
+        try:
+            self.btn_isolate.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.btn_run_runner.setEnabled(False)
+        except Exception:
+            pass
 
         bottom.addWidget(self.btn_console_clear)
         bottom.addWidget(self.btn_console_save)
@@ -175,18 +202,45 @@ class ExperimentGuideDialog(QDialog):
         main.addWidget(self.console, 0)
         main.addWidget(self.lbl_footer)
 
-        # Conexões de botões de console
         self.btn_console_clear.clicked.connect(self.console.clear)
         self.btn_console_save.clicked.connect(self._save_console_to_file)
         self.btn_isolate.clicked.connect(self._toggle_isolation_async)
         self.btn_cancel.clicked.connect(lambda: self._cancel_running(wait_worker=True))
         self.btn_run_runner.clicked.connect(self._run_runner_async)
 
-        # Fade-in geral (best effort)
         try:
             self.setWindowOpacity(1.0)
         except Exception as e:
             logger.error(f"[Guide] animação inicial falhou: {e}")
+
+    def _update_footer_actions_enabled(self):
+        try:
+            states = getattr(self, "_last_states", {}) or {}
+            attacker_online = (states.get("attacker") == "running")
+            any_online = any(st == "running" for st in states.values()) if states else False
+            if hasattr(self, "btn_isolate"):
+                self.btn_isolate.setEnabled(attacker_online)
+                self.btn_isolate.setToolTip("Requer attacker ONLINE" if not attacker_online else "Isolar atacante")
+            if hasattr(self, "btn_run_runner"):
+                self.btn_run_runner.setEnabled(any_online)
+                self.btn_run_runner.setToolTip(
+                    "Requer pelo menos uma máquina ONLINE" if not any_online else "Gerar dataset com o YAML atual")
+            if hasattr(self, "btn_cancel"):
+                running = (self._stream_worker and self._stream_worker.isRunning()) or self._batch_running
+                self.btn_cancel.setEnabled(running)
+                self.btn_cancel.setToolTip("Nenhum passo em execução" if not running else "Cancelar execução em andamento")
+            if hasattr(self, "btn_run_all"):
+                has_commands = any(
+                    (c.step.get("command") or "").strip() or (c.step.get("command_normal") or "").strip() or
+                    (c.step.get("command_b64") or "").strip()
+                    for c in self.cards
+                )
+                self.btn_run_all.setEnabled(bool(self.cards) and has_commands)
+                self.btn_run_all.setToolTip(
+                    "Nenhum passo executável" if not has_commands else
+                    ("Nenhum passo no guia" if not self.cards else "Executar todos os passos com comando definido"))
+        except Exception as e:
+            logger.error(f"[Guide] _update_footer_actions_enabled: {e}")
 
     def showEvent(self, event):
         try:
@@ -202,7 +256,6 @@ class ExperimentGuideDialog(QDialog):
                     logger.error(f"[UI] showEvent: {e}")
         except Exception as e:
             logger.error(f"[UI] showEvent outer: {e}")
-
 
     def _clear_tests(self):
         """Limpa console, reseta status dos cards, zera timeline e apaga o arquivo .meta/*_timeline.json."""
@@ -627,10 +680,61 @@ class ExperimentGuideDialog(QDialog):
         w = _StreamWorker(self.ssh, host, cmd, timeout_s=timeout)
         self._stream_worker = w
         self._keep_worker(w)
+        self._current_card = card
+        self._current_worker = w
+        self._cancel_requested = False
+
+        def _is_current(worker) -> bool:
+            try:
+                return (worker is self._stream_worker) and (worker is self._current_worker)
+            except Exception:
+                return False
+
+        def _on_worker_done_guard(worker=w, c=card, s=step):
+            if not _is_current(worker):
+                logger.warn("[Guide] Sinal 'done' de worker antigo ignorado.")
+                return
+            if self._cancel_requested:
+                try:
+                    if c:
+                        c.set_cancelled()
+                    self._append_console("[guide] Passo cancelado pelo usuário.")
+                except Exception as e:
+                    logger.error(f"[Guide] marcar cancelado (done_guard): {e}")
+                return
+            self._on_step_done(c, s, ok=True)
+
+        def _on_worker_error_guard(msg: str, worker=w, c=card, s=step):
+            if not _is_current(worker):
+                logger.warn("[Guide] Sinal 'error' de worker antigo ignorado.")
+                return
+            self._on_step_fail(c, s, msg)
+
+        def _on_worker_finished_guard(worker=w, c=card, s=step):
+            if not _is_current(worker):
+                logger.warn("[Guide] Sinal 'finished' de worker antigo ignorado.")
+                return
+            try:
+                self._on_step_final(c, s)
+            finally:
+                self._cleanup_worker(worker)
+                self._current_card = None
+                self._current_worker = None
+                self._cancel_requested = False
+                try:
+                    if hasattr(self, "_update_footer_actions_enabled"):
+                        self._update_footer_actions_enabled()
+                except Exception as e:
+                    logger.warn(f"[Guide] footer actions update: {e}")
+
         w.line.connect(self._append_console)
-        w.finished_ok.connect(lambda: self._on_step_done(card, step, ok=True))
-        w.error.connect(lambda msg: self._on_step_fail(card, step, msg))
-        w.finished.connect(lambda: (self._on_step_final(card, step), self._cleanup_worker(w)))
+        w.finished_ok.connect(_on_worker_done_guard)
+        w.error.connect(_on_worker_error_guard)
+        w.finished.connect(_on_worker_finished_guard)
+        # w.line.connect(self._append_console)
+        # w.finished_ok.connect(lambda: self._on_step_done(card, step, ok=True))
+        # w.error.connect(lambda msg: self._on_step_fail(card, step, msg))
+        # w.finished.connect(lambda: (self._on_step_final(card, step), self._cleanup_worker(w)))
         self._set_footer(f"Executando passo em {host}…")
         w.start()
 
@@ -649,7 +753,15 @@ class ExperimentGuideDialog(QDialog):
             pass
 
     def _on_step_final(self, card: StepCard | None, step: dict):
-        if card: card.set_idle()
+        # Não sobrepor 'done'/'error' para 'idle'; preserve estado p/ timeline.
+        try:
+            if card is not None:
+                state = str(card.status.property("state") or "")
+                if state not in ("done", "error", "cancelled"):
+                    card.set_idle()
+        except Exception as e:
+            logger.error(f"[Guide] _on_step_final.state: {e}")
+
         self._mark_timeline(step, "end")
         self._write_timeline()
         self._refresh_timeline_bar()
@@ -666,10 +778,18 @@ class ExperimentGuideDialog(QDialog):
 
     def _cancel_running(self, wait_worker: bool = False):
         try:
+            self._cancel_requested = True
+            if self._current_card:
+                try:
+                    self._current_card.set_cancelled()
+                except Exception as e:
+                    logger.warn(f"[Guide] Falha ao marcar cartão como cancelado: {e}")
+
             if hasattr(self.ssh, "cancel_all_running"):
                 self.ssh.cancel_all_running()
         except Exception as e:
             logger.error(f"[Guide] cancel_all_running: {e}")
+
         try:
             if self._stream_worker and self._stream_worker.isRunning():
                 self._stream_worker.stop()
@@ -677,10 +797,17 @@ class ExperimentGuideDialog(QDialog):
                     self._stream_worker.wait(2000)
         except Exception:
             pass
+
         self._append_console("[guide] Cancelamento solicitado.")
         self._set_footer("Cancelamento solicitado.")
         self._batch_running = False
         self._batch_queue = []
+
+        try:
+            if hasattr(self, "_update_footer_actions_enabled"):
+                self._update_footer_actions_enabled()
+        except Exception as e:
+            logger.warn(f"[Guide] footer actions update: {e}")
 
     # ---------- SSH helpers ----------
     def _ssh_exec_or_paste(self, host: str, cmd: str, card: StepCard):
@@ -817,6 +944,8 @@ class ExperimentGuideDialog(QDialog):
             for c in self.cards:
                 if c.matches_role(role) or c.matches_host(name):
                     c.set_machine_visibility(vis)
+
+            self._update_footer_actions_enabled()
         except Exception as e:
             logger.error(f"[Guide] reflect_machine_status: {e}")
 
@@ -829,5 +958,6 @@ class ExperimentGuideDialog(QDialog):
             self._last_states.update(states or {})
             for name, st in (states or {}).items():
                 self.reflect_machine_status(name, st)
+            self._update_footer_actions_enabled()
         except Exception as e:
             logger.error(f"[Guide] reflect_status_map: {e}")

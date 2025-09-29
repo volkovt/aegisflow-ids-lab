@@ -16,14 +16,147 @@ logger = logging.getLogger("[SSHManager]")
 
 _CONNECT_GATE = threading.BoundedSemaphore(value=2)
 
+LINUX_OS_CMD = r"""
+set -e
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  printf "Linux: %s %s (id=%s) kernel %s\n" "${{NAME}}" "${{VERSION}}" "${{ID}}" "$(uname -r)"
+else
+  uname -sr
+fi
+"""
+
+WIN_OS_CMD = r"""
+powershell -NoProfile -Command "$o=Get-CimInstance Win32_OperatingSystem; Write-Output ($o.Caption + ' ' + $o.Version + ' (' + $o.OSArchitecture + ', build ' + $o.BuildNumber + ')')"
+"""
+
+
 def _null_device() -> str:
     return "NUL" if os.name == "nt" else "/dev/null"
+
+def _ensure_shell_preamble(script: str) -> str:
+    # Evita duplicar set -e; se já existe, mantém.
+    pre = "set -e\n"
+    s = script or ""
+    s = s.replace("\r\n", "\n")
+    return s if s.lstrip().startswith("set -e") else pre + s
+
+def _exec_bash_via_stdin(cli, script: str, timeout: int = 30, want_pty: bool = False, name=""):
+    """
+    Executa 'script' enviando via STDIN para bash limpo (-se), evitando problemas de quoting.
+    """
+    try:
+        chan_cmd = "bash --noprofile --norc -se"
+        stdin, stdout, stderr = cli.exec_command(chan_cmd, get_pty=want_pty, timeout=timeout)
+        safe_script = _ensure_shell_preamble(script)
+        stdin.write(safe_script)
+        try:
+            stdin.flush()
+        except Exception:
+            pass
+        try:
+            stdin.channel.shutdown_write()
+        except Exception:
+            pass
+
+        out = stdout.read().decode(errors="ignore")
+        err = stderr.read().decode(errors="ignore")
+        rc = stdout.channel.recv_exit_status()
+        if rc != 0:
+            raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
+        return out or ""
+    except Exception as e:
+        logger.error(f"-----------------------------------------------------")
+        logger.error(f"[SSHManager] Executando comando em '{name}': {script}")
+        logger.error(f"[SSHManager] _exec_bash_via_stdin falhou: {e}")
+        logger.error(f"-----------------------------------------------------")
+        raise
 
 class SSHManager:
     def __init__(self, lab_dir: Path):
         self.lab_dir = lab_dir
         self._lock = threading.Lock()
         self._running = {}
+
+        self._pool: Dict[str, paramiko.SSHClient] = {}
+        self._pool_meta: Dict[str, dict] = {}
+        self._pool_lock = threading.Lock()
+
+        self._chan_sems: Dict[str, threading.BoundedSemaphore] = {}
+
+    def _get_chan_sem(self, name: str) -> threading.BoundedSemaphore:
+        try:
+            with self._pool_lock:
+                sem = self._chan_sems.get(name)
+                if sem is None:
+                    sem = threading.BoundedSemaphore(value=1)
+                    self._chan_sems[name] = sem
+            return sem
+        except Exception as e:
+            logger.error(f"[SSHManager] _get_chan_sem falhou: {e}")
+            return threading.BoundedSemaphore(value=1)
+
+    def _purge_client(self, name: str):
+        try:
+            with self._pool_lock:
+                cli = self._pool.pop(name, None)
+                self._pool_meta.pop(name, None)
+            if cli:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+            logger.warn(f"[SSHManager] Pool: conexão de '{name}' removida.")
+        except Exception as e:
+            logger.error(f"[SSHManager] Falha ao purgar cliente '{name}': {e}")
+
+    def _get_client(self, name: str, timeout: int = 30) -> paramiko.SSHClient:
+        """
+        Retorna um SSHClient conectado e reutilizável para a VM `name`.
+        Reabre se a conexão caiu. Aplica keepalive para manter viva.
+        """
+        with self._pool_lock:
+            cli = self._pool.get(name)
+        if cli:
+            try:
+                tr = cli.get_transport()
+                if tr and tr.is_active() and tr.is_authenticated():
+                    with self._pool_lock:
+                        self._pool_meta[name]["last_used"] = time.time()
+                    return cli
+            except Exception:
+                self._purge_client(name)
+
+        f = self.get_ssh_fields(name)
+        host, port, user, key_path = f["HostName"], int(f["Port"]), f["User"], f["IdentityFile"]
+
+        self._wait_port(host, port, wait_secs=min(20, timeout + 5))
+        self._wait_ssh_banner(host, port, wait_secs=min(40, timeout + 20))
+
+        with _CONNECT_GATE:
+            cli = paramiko.SSHClient()
+            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                cli.connect(
+                    hostname=host, port=port, username=user,
+                    key_filename=key_path, look_for_keys=False, allow_agent=False,
+                    timeout=max(20, timeout + 10)
+                )
+                tr = cli.get_transport()
+                if tr:
+                    tr.set_keepalive(15)
+                with self._pool_lock:
+                    self._pool[name] = cli
+                    self._pool_meta[name] = {"created": time.time(), "last_used": time.time()}
+                logger.info(f"[SSHManager] Pool: nova conexão aberta para '{name}' ({user}@{host}:{port}).")
+                return cli
+            except Exception as e:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+                logger.error(f"[SSHManager] Falha abrindo conexão persistente em '{name}': {e}")
+                raise
 
     def _register_proc(self, name, proc: subprocess.Popen):
         with self._lock:
@@ -83,13 +216,22 @@ class SSHManager:
             raise ValueError("Nome da VM inválido.")
 
         try:
+
             proc = subprocess.run(
                 ["vagrant", "ssh-config", name],
                 cwd=self.lab_dir,
-                text=True,
-                capture_output=True,
-                timeout=timeout
+                capture_output=True, text=True, timeout=45
             )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                for tmo in (12, 24):
+                    time.sleep(3)
+                    proc = subprocess.run(
+                        ["vagrant", "ssh-config", name],
+                        cwd=self.lab_dir,
+                        capture_output=True, text=True, timeout=45
+                    )
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        break
         except FileNotFoundError as e:
             logger.error("[SSHManager] Vagrant não encontrado no PATH. Instale/configure o Vagrant.", exc_info=True)
             raise RuntimeError(
@@ -149,10 +291,10 @@ class SSHManager:
             "IdentityFile": identity_path,
         }
 
-        logger.info(
-            f"[SSHManager] ssh-config sanitizado para '{name}': "
-            f"{result['User']}@{result['HostName']}:{result['Port']} key={result['IdentityFile']}"
-        )
+        # logger.info(
+        #     f"[SSHManager] ssh-config sanitizado para '{name}': "
+        #     f"{result['User']}@{result['HostName']}:{result['Port']} key={result['IdentityFile']}"
+        # )
         return result
 
     def open_external_terminal(self, name: str, tmux_session: str | None = None):
@@ -253,107 +395,121 @@ class SSHManager:
 
     def run_command_cancellable(self, name: str, cmd: str, timeout_s: int = 300):
         """
-        Executa 'vagrant ssh name -c "bash -lc <cmd>"' de forma cancelável.
+        Executa 'vagrant ssh name -c "<wrapped>"' de forma cancelável, usando shell limpo.
         """
-        try:
-            payload = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
-            wrapped = f'bash -lc "eval \\\"$(echo {payload} | base64 -d)\\\""'
-            ssh_cmd = ["vagrant", "ssh", name, "-c", wrapped]
-            creationflags = 0
-            preexec_fn = None
-            if os.name != "nt":
-                preexec_fn = os.setsid
-            else:
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-            proc = subprocess.Popen(
-                ssh_cmd, cwd=self.lab_dir,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                preexec_fn=preexec_fn, creationflags=creationflags
-            )
-            self._register_proc(name, proc)
-            out, err = proc.communicate(timeout=timeout_s)
-            rc = proc.returncode
-            self._unregister_proc(name, proc)
-            if rc != 0:
-                raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
-            return out
-        except subprocess.TimeoutExpired:
-            self.cancel_all_running()
+        self.run_command(name, cmd, timeout=timeout_s)
+        return
+        # try:
+        #     wrapped = _wrap_no_rc_shell((cmd or "").replace("\r\n", "\n"))
+        #     ssh_cmd = ["vagrant", "ssh", name, "-c", wrapped]
+        #
+        #     creationflags = 0
+        #     preexec_fn = None
+        #     if os.name != "nt":
+        #         preexec_fn = os.setsid
+        #     else:
+        #         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        #
+        #     proc = subprocess.Popen(
+        #         ssh_cmd, cwd=self.lab_dir,
+        #         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        #         preexec_fn=preexec_fn, creationflags=creationflags
+        #     )
+        #     self._register_proc(name, proc)
+        #     out, err = proc.communicate(timeout=timeout_s)
+        #     rc = proc.returncode
+        #     self._unregister_proc(name, proc)
+        #     if rc != 0:
+        #         raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
+        #     return out
+        # except subprocess.TimeoutExpired:
+        #     self.cancel_all_running()
 
     def run_command(self, name: str, command: str, timeout: int = 15, retries: int = 5) -> str:
         """
-        Executa 'command' via SSH (Paramiko) checando código de saída.
-        Se esgotar as tentativas, cai em fallback 'vagrant ssh -c' (somente se não for heredoc).
+        Executa 'command' em bash limpo via STDIN, reaproveitando conexão persistente.
+        - Serializa abertura de canais por VM para evitar 'Timeout opening channel'.
+        - Se o canal falhar, purga o client e reconecta na próxima tentativa.
         """
-        f = self.get_ssh_fields(name)
-        host, port, user, key_path = f["HostName"], int(f["Port"]), f["User"], f["IdentityFile"]
+        raw_cmd = (command or "").replace("\r\n", "\n")
+        want_pty = ("<<'__EOF__'" in raw_cmd) or ('<<"__EOF__"' in raw_cmd) or ('<<__EOF__' in raw_cmd)
 
-        def _needs_pty(cmd: str) -> bool:
-            t = cmd or ""
-            return ("<<'__EOF__'" in t) or ('<<"__EOF__"' in t) or ('<<__EOF__' in t) or ("\n__EOF__" in t) or (
-                        len(t) > 8000)
-
-        last = None
-        cmd = (command or "").replace("\r\n", "\n")  # normaliza CRLF do Windows
-        want_pty = _needs_pty(cmd)
+        last_exc = None
+        open_timeout = max(45, timeout + 15)  # abertura de canal um pouco mais folgada
 
         for attempt in range(1, retries + 1):
-            try:
-                self._wait_port(host, port, wait_secs=min(20, timeout + 5))
-                self._wait_ssh_banner(host, port, wait_secs=min(40, timeout + 20))
+            sem = self._get_chan_sem(name)
+            with sem:
+                try:
+                    cli = self._get_client(name, timeout=timeout)
+                    out = _exec_bash_via_stdin(
+                        cli,
+                        raw_cmd,
+                        timeout=open_timeout,
+                        want_pty=want_pty,
+                        name=name
+                    )
+                    with self._pool_lock:
+                        if name in self._pool_meta:
+                            self._pool_meta[name]["last_used"] = time.time()
+                    return out or ""
 
-                with _CONNECT_GATE:
-                    client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    client.connect(
-                        hostname=host, port=port, username=user,
-                        key_filename=key_path, look_for_keys=False, allow_agent=False,
-                        timeout=max(20, timeout + 10)
+                except Exception as e:
+                    last_exc = e
+                    msg = str(e)
+                    # Sinais clássicos de falha no canal/sessão
+                    transient = (
+                            "Timeout opening channel" in msg or
+                            "Channel closed" in msg or
+                            "No existing session" in msg or
+                            "channel open failure" in msg
                     )
 
-                    # IMPORTANTE: heredoc/longos pedem PTY para não fechar o canal (evita 255)
-                    stdin, stdout, stderr = client.exec_command(cmd, get_pty=want_pty, timeout=timeout)
+                    if transient:
+                        logger.warning(
+                            f"[SSHManager] Canal falhou em '{name}' (tentativa {attempt}/{retries}): "
+                            f"{msg}. Forçando reconexão antes do retry."
+                        )
+                        try:
+                            self._purge_client(name)
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(
+                            f"[SSHManager] Tentativa {attempt}/{retries} falhou em {name}: {msg}"
+                        )
 
-                    out = stdout.read().decode(errors="ignore")
-                    err = stderr.read().decode(errors="ignore")
-                    rc = stdout.channel.recv_exit_status()
+                    sleep_s = 0.8 * attempt
+                    time.sleep(sleep_s)
 
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
+        # Fallback via vagrant ssh -c (STDIN base64 → bash -se)
+        try:
+            logger.info(f"[SSHManager] Fallback via 'vagrant ssh -c' em {name}")
+            payload = _ensure_shell_preamble(raw_cmd).encode("utf-8")
+            b64 = base64.b64encode(payload).decode("ascii")
 
-                    if rc != 0:
-                        raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
-                    return out
-            except Exception as e:
-                last = e
-                sleep_s = 0.8 * attempt
-                logger.warning(
-                    f"[SSHManager] Tentativa {attempt}/{retries} falhou em {name}: {e}. Retry em {sleep_s:.1f}s")
-                time.sleep(sleep_s)
+            remote = (
+                    "bash --noprofile --norc -lc "
+                    + shlex.quote(f"echo {b64} | base64 -d | bash --noprofile --norc -se")
+            )
 
-        # Fallback só é seguro quando NÃO é heredoc (evita a ‘sopa de aspas’ no Windows)
-        if not _needs_pty(cmd):
-            try:
-                logger.info(f"[SSHManager] Fallback via 'vagrant ssh -c' em {name}")
-                proc = subprocess.run(
-                    ["vagrant", "ssh", name, "-c", cmd],
-                    cwd=self.lab_dir, text=True, capture_output=True, timeout=max(60, timeout + 30)
+            proc = subprocess.run(
+                ["vagrant", "ssh", name, "-c", remote],
+                cwd=self.lab_dir,
+                text=True,
+                capture_output=True,
+                timeout=max(90, timeout + 60),
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"vagrant ssh retornou {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}"
                 )
-                if proc.stdout:
-                    logger.info(proc.stdout.strip())
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"vagrant ssh retornou {proc.returncode}: {proc.stderr.strip() or proc.stdout.strip()}")
-                return (proc.stdout or "").rstrip()
-            except Exception as e2:
-                logger.error(f"[SSHManager] Erro no fallback 'vagrant ssh -c' em {name}: {e2}")
+            return (proc.stdout or "").rstrip()
 
-        # Se chegou aqui, reporte a falha original (Paramiko)
-        logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last}")
-        raise RuntimeError(f"SSH falhou em {name}: {last}")
+        except Exception as e2:
+            logger.error(f"[SSHManager] Erro no fallback 'vagrant ssh -c' em {name}: {e2}")
+            logger.error(f"[SSHManager] Erro ao executar comando em {name}: {last_exc}")
+            raise RuntimeError(f"SSH falhou em {name}: {last_exc}") from e2
 
     def get_ssh_fields_safe(self, name: str) -> dict:
         try:
@@ -361,3 +517,62 @@ class SSHManager:
         except Exception as e:
             logger.warning(f"[SSHManager] get_ssh_fields_safe({name}) falhou: {e}")
             return {}
+
+    def probe_os(self, name: str, timeout: int = 20) -> str:
+        """
+        Detecção de SO focada no lab (Linux), sem usar ${VAR} para evitar colisão com .format(...).
+        - Se Linux: lê PRETTY_NAME de /etc/os-release via awk e imprime também o kernel.
+        - Fallbacks neutros se /etc/os-release não existir.
+        """
+        try:
+            logger.info(f"[SOProbe] {name}: checando Linux via uname -s")
+            script = r"""
+                set -e
+                # Detecta Linux
+                if command -v uname >/dev/null 2>&1 && [ "$(uname -s 2>/dev/null)" = "Linux" ]; then
+                    pretty="$(awk -F= '/^PRETTY_NAME=/{gsub(/"/,"",$2);print $2}' /etc/os-release 2>/dev/null || true)"
+                    if [ -z "$pretty" ]; then
+                        pretty="$(uname -sr 2>/dev/null || echo Linux)"
+                    fi
+                    printf "Linux: %s kernel %s\n" "$pretty" "$(uname -r)"
+                    exit 0
+                fi
+
+                # Fallbacks neutros (se um dia tiver Windows, trate fora deste canal bash)
+                if [ -f /proc/sys/kernel/ostype ] && grep -qi linux /proc/sys/kernel/ostype 2>/dev/null; then
+                    printf "Linux: %s\n" "$(uname -sr 2>/dev/null || cat /proc/version 2>/dev/null || echo 'kernel unknown')"
+                    exit 0
+                fi
+                echo unknown
+            """
+            out = self.run_command(name, script, timeout=timeout) or ""
+            s = out.strip() or "unknown"
+            logger.info(f"[SO] {name}: {s}")
+            return s
+        except Exception as e:
+            logger.error(f"[SOProbe] {name}: falha inesperada: {e}", exc_info=True)
+            return "error"
+
+    def close_all(self):
+        try:
+            with self._pool_lock:
+                names = list(self._pool.keys())
+            for n in names:
+                self._purge_client(n)
+            logger.info("[SSHManager] Pool: todas as conexões encerradas.")
+        except Exception as e:
+            logger.error(f"[SSHManager] close_all falhou: {e}")
+
+
+def _wrap_no_rc_shell(cmd: str) -> str:
+    """
+    Executa o comando sempre em bash limpo (sem profile/rc), sem fallback para /bin/sh.
+    Isso evita erros como: 'set: Illegal option -o pipefail'.
+    """
+    try:
+        c = (cmd or "").replace("\r\n", "\n")
+        q = shlex.quote(c)
+        return f"/bin/bash --noprofile --norc -lc {q}"
+    except Exception as e:
+        logger.error(f"[SSHManager] _wrap_no_rc_shell falhou: {e}", exc_info=True)
+        return cmd or ""

@@ -14,7 +14,6 @@ import logging
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QLabel, QGroupBox, QVBoxLayout as QV, QPushButton
 )
-from PySide6.QtCore import Qt
 
 logger = logging.getLogger("[ActionDock]")
 if not hasattr(logger, "warn"):

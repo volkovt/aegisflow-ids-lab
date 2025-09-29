@@ -67,3 +67,9 @@ config.yaml
 
 # Node (se usar front opcional)
 node_modules/
+app_log_run.txt
+conn.txt
+logs.txt
+lab/modifyvm)
+lab/victim)
+lab/.lab/Vagrantfile.hash

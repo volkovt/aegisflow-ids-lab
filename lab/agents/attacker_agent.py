@@ -10,65 +10,57 @@ class AttackerAgent:
 
     def ensure_apt_ready(self):
         """
-        Corrige mirrors/componentes, atualiza keyring e índices do Kali de forma resiliente.
-        Replica exatamente o fluxo que funcionou no seu teste manual.
+        Torna o APT do Kali funcional mesmo com rotação de chaves:
+        - Usa [trusted=yes] TEMPORÁRIO só para baixar a chave oficial.
+        - Instala ca-certificates/gnupg/curl.
+        - Grava /usr/share/keyrings/kali-archive-keyring.gpg.
+        - Restaura sources com [signed-by=...] e valida com update normal.
         """
         try:
-            logger.info("[Attacker] Preparando APT (sources.list, keyring, índices)...")
+            logger.info("[Attacker] Reparando APT/keyring (Kali)…")
 
-            # 1) sources.list canônico com signed-by e non-free-firmware
-            self._run("attacker",
-                      "sudo sh -lc \""
-                      "set -euo pipefail; "
-                      "unalias rm 2>/dev/null || true; "
-                      "cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true; "
-                      "printf 'deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] "
-                      "http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\\n' "
-                      "> /etc/apt/sources.list\"",
-                      timeout=60)
+            # Sources temporário com bypass (somente para instalar a chave)
+            self._run(
+                "attacker",
+                "sudo bash -lc \"set -euo pipefail; "
+                "cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true; "
+                "printf 'deb [trusted=yes] https://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\\n' "
+                "> /etc/apt/sources.list; "
+                "apt-get clean; rm -rf /var/lib/apt/lists/* || true; "
+                "apt-get update -o Acquire::AllowInsecureRepositories=true\"",
+                timeout=240
+            )
 
-            # 2) limpar índices antigos sem prompt do zsh
-            self._run("attacker",
-                      "sudo sh -lc \"apt-get clean; command rm -rf /var/lib/apt/lists/*\"",
-                      timeout=60)
+            # Dependências para obter/instalar a chave
+            self._run(
+                "attacker",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+                "ca-certificates gnupg curl",
+                timeout=480
+            )
 
-            # 3) tentativa normal de update + reinstalar keyring (pode falhar na 1ª)
-            try:
-                self._run("attacker", "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y", timeout=240)
-                self._run("attacker", "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall kali-archive-keyring",
-                          timeout=240)
-            except Exception as e:
-                logger.warning(f"[Attacker] update/keyring (fase normal) falhou: {e}")
+            # Grava o keyring oficial
+            self._run(
+                "attacker",
+                "sudo bash -lc \"set -e; "
+                "curl -fsSL https://archive.kali.org/archive-key.asc | "
+                "gpg --dearmor > /usr/share/keyrings/kali-archive-keyring.gpg\"",
+                timeout=180
+            )
 
-            # 4) update permissivo + reinstalar keyring sem autenticação (quebra o ciclo NO_PUBKEY)
-            try:
-                self._run("attacker",
-                          "sudo DEBIAN_FRONTEND=noninteractive apt-get update "
-                          "-o Acquire::AllowInsecureRepositories=true -y",
-                          timeout=240)
-                self._run("attacker",
-                          "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --reinstall kali-archive-keyring "
-                          "-o APT::Get::AllowUnauthenticated=true",
-                          timeout=240)
-            except Exception as e:
-                logger.warning(f"[Attacker] update/keyring (fase permissiva) falhou: {e}")
+            # Restaura sources com signed-by e valida
+            self._run(
+                "attacker",
+                "sudo bash -lc \"set -e; "
+                "printf 'deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] "
+                "https://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\\n' "
+                "> /etc/apt/sources.list; "
+                "apt-get clean; rm -rf /var/lib/apt/lists/* || true\"",
+                timeout=120
+            )
+            self._run("attacker", "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y", timeout=480)
 
-            # 5) fallback extra: grava a chave direto via curl+gpg, se disponível
-            try:
-                self._run("attacker",
-                          "sudo sh -lc \""
-                          "command -v gpg >/dev/null 2>&1 || true; "  # não tenta instalar gpg (evita loop)
-                          "command -v curl >/dev/null 2>&1 && "
-                          "curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor "
-                          "> /usr/share/keyrings/kali-archive-keyring.gpg || true\"",
-                          timeout=120)
-            except Exception as e:
-                logger.warning(f"[Attacker] fallback curl+gpg falhou (ok prosseguir se a fase acima já resolveu): {e}")
-
-            # 6) update final (verificação normal)
-            self._run("attacker", "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y", timeout=240)
             logger.info("[Attacker] APT pronto (keyring atualizado e índices válidos).")
-
         except Exception as e:
             logger.error(f"[Attacker] Falha em ensure_apt_ready: {e}")
             raise
@@ -89,14 +81,15 @@ class AttackerAgent:
 
             self._run(
                 "attacker",
-                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {pkg_list}",
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends " + pkg_list,
                 timeout=900
             )
 
             # Sanidade (mostra versões)
             out = self._run(
                 "attacker",
-                "sh -lc 'nmap --version | head -1; "
+                # TROCA: sh -> bash (por consistência)
+                "bash -lc 'nmap --version | head -1; "
                 "hydra -h | head -1; "
                 "slowhttptest -h | head -1 || true; "
                 "curl --version | head -1; "
@@ -107,3 +100,37 @@ class AttackerAgent:
         except Exception as e:
             logger.error(f"[Attacker] Erro instalando ferramentas: {e}")
             raise
+
+    # em lab/agents/attacker_agent.py
+    def start_benign_burst(self, benign_cfg, duration_s=15, cancel_event=None):
+        """
+        Gera tráfego benigno curto (curl, ping, iperf3) conforme benign_cfg do exp.
+        Não bloqueia o pipeline além do tempo previsto.
+        """
+        if not benign_cfg:
+            return
+        try:
+            urls = (benign_cfg.get("http", {}) or {}).get("urls", [])
+            for u in urls:
+                if cancel_event and cancel_event.is_set():
+                    break
+                cmd = f"bash -lc \"curl -m 3 -s -o /dev/null '{u}' || true\""
+                self.ssh.run_command("attacker", cmd, timeout=5)
+            # pequeno ping
+            ping_cnt = int((benign_cfg.get("icmp", {}) or {}).get("ping_count", 5))
+            icmp_target = benign_cfg.get('icmp_target', '192.168.56.10')  # por padrão, pinga o sensor
+            self.ssh.run_command(
+                "attacker",
+                f"bash -lc \"ping -c {ping_cnt} {icmp_target} || true\"",
+                timeout=10
+            )
+            # iperf3 (se habilitado)
+            iperf = benign_cfg.get("iperf3", {}) or {}
+            if iperf.get("enabled"):
+                dur = int(iperf.get("duration_s", 5))
+                srv = iperf.get("server")
+                rev = "--reverse" if iperf.get("reverse") else ""
+                self.ssh.run_command("attacker", f"bash -lc \"iperf3 -c {srv} -t {dur} {rev} || true\"", timeout=dur + 5)
+        except Exception as e:
+            logger = logging.getLogger("[AttackerAgent]")
+            logger.warning(f"[AttackerAgent] benign burst: {e}")

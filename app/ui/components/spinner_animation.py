@@ -54,6 +54,12 @@ class _SpinnerAnimator:
             frame = _SpinnerAnimator.FRAMES[self._i % len(_SpinnerAnimator.FRAMES)]
             self._i += 1
             self._set_text(f"{self.base_text} {frame}")
+        except KeyboardInterrupt:
+            try:
+                self.stop(self.base_text)
+            except Exception:
+                pass
+            self._logger.info("[Spinner] interrompido por KeyboardInterrupt; animação parada.")
         except Exception as e:
             self._logger.warning(f"[Spinner] tick falhou: {e}")
 

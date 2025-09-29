@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +17,8 @@ class VagrantManager:
         self.project_root = project_root
         self.lab_dir = lab_dir
         self.lab_dir.mkdir(parents=True, exist_ok=True)
+
+        self._ssh_ready_until: dict[str, float] = {}
 
     def _run(self, args: list[str]) -> Iterable[str]:
         """Executa comando do Vagrant emitindo logs por linha."""
@@ -151,11 +154,21 @@ class VagrantManager:
 
     def halt(self, name: Optional[str] = None) -> Iterable[str]:
         cmd = ["vagrant", "halt"] + ([name] if name else [])
-        return self._run(cmd)
+        try:
+            for ln in self._run(cmd):
+                yield ln
+        finally:
+            if name:
+                self._ssh_ready_until.pop(name, None)
 
     def destroy(self, name: Optional[str] = None) -> Iterable[str]:
         cmd = ["vagrant", "destroy", "-f"] + ([name] if name else [])
-        return self._run(cmd)
+        try:
+            for ln in self._run(cmd):
+                yield ln
+        finally:
+            if name:
+                self._ssh_ready_until.pop(name, None)
 
     def status(self) -> str:
         try:
@@ -205,27 +218,77 @@ class VagrantManager:
         """
         return self._run(["vagrant", "status"])
 
-    def wait_ssh_ready(self, vm_name: str, lab_dir: str, attempts: int = 12, delay_s: int = 5) -> None:
-        """
-        Usa 'vagrant ssh -c "true"' para saber quando o SSH da VM está pronto.
-        """
+    def wait_ssh_ready(self, vm_name: str, lab_dir: str, attempts: int = 20, delay_s: int = 3, ttl_s: int = 60) -> None:
+        def _parse_ssh_config(cfg: str) -> tuple[str, int]:
+            host, port = "127.0.0.1", 2222
+            for raw in cfg.splitlines():
+                line = raw.strip()
+                if not line or " " not in line:
+                    continue
+                k, v = line.split(None, 1)
+                if k == "HostName":
+                    host = v.strip().strip('"')
+                elif k == "Port":
+                    try:
+                        port = int(v.strip().strip('"'))
+                    except Exception:
+                        pass
+            return host, port
+
+        now = time.time()
+        exp = self._ssh_ready_until.get(vm_name, 0)
+        if exp > now:
+            restante = int(exp - now)
+            logger.info(f"[Preflight] {vm_name}: SSH considerado pronto (cache TTL ~{restante}s).")
+            return
+
+        try:
+            cfg = subprocess.check_output(["vagrant", "ssh-config", vm_name], cwd=lab_dir, text=True, timeout=20)
+            host, port = _parse_ssh_config(cfg)
+        except Exception as e:
+            logger.warning(f"[Preflight] ssh-config falhou ({e}); usando 127.0.0.1:2222")
+            host, port = "127.0.0.1", 2222
+
         for i in range(1, attempts + 1):
             try:
-                logger.info(f"[Preflight] Verificando SSH em {vm_name} (tentativa {i}/{attempts})...")
+                logger.info(f"[Preflight] Verificando SSH em {vm_name} ({host}:{port}) tentativa {i}/{attempts}...")
+
+                # Espera porta abrir
+                deadline = time.time() + max(2.0, delay_s)
+                last_err = None
+                while time.time() < deadline:
+                    try:
+                        with socket.create_connection((host, port), timeout=2.0):
+                            break
+                    except OSError as e:
+                        last_err = e
+                        time.sleep(0.25)
+                else:
+                    raise TimeoutError(f"Porta não abriu: {last_err}")
+
+                # Espera banner SSH
+                with socket.create_connection((host, port), timeout=3.0) as s:
+                    s.settimeout(3.0)
+                    data = s.recv(64)
+                    if not (data and data.startswith(b"SSH-")):
+                        raise RuntimeError(f"Banner inválido/reset: {data!r}")
+
+                # Teste final com shell limpo
+                wrapped = "/bin/bash --noprofile --norc -lc 'true'"
                 subprocess.check_call(
-                    ["vagrant", "ssh", vm_name, "-c", "true"],
+                    ["vagrant", "ssh", vm_name, "-c", wrapped],
                     cwd=lab_dir,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL,
                 )
                 logger.info(f"[Preflight] SSH pronto em {vm_name}.")
+                self._ssh_ready_until[vm_name] = time.time() + max(5, ttl_s)
                 return
-            except subprocess.CalledProcessError:
-                logger.warning(f"[Preflight] SSH ainda não disponível em {vm_name}. Aguardando {delay_s}s...")
-                time.sleep(delay_s)
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"[Preflight] 'vagrant ssh -c' falhou (rc={e.returncode}). Aguardando {delay_s}s...")
             except Exception as e:
-                logger.error(f"[Preflight] Erro checando SSH em {vm_name}: {e}")
-                time.sleep(delay_s)
+                logger.warning(f"[Preflight] SSH ainda não disponível em {vm_name}: {e}. Aguardando {delay_s}s...")
+            time.sleep(delay_s)
         raise RuntimeError(f"[Preflight] Timeout aguardando SSH de {vm_name}.")
 
 def _dir_sha256(path: Path) -> str:

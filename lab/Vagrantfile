@@ -1,6 +1,8 @@
 # Arquivo gerado automaticamente — NÃO editar manualmente (edite config.yaml)
 Vagrant.configure("2") do |config|
   config.vm.box_check_update = true
+
+  # escopo global do provider (mantém GUI off)
   config.vm.provider "virtualbox" do |vb|
     vb.gui = false
   end
@@ -8,92 +10,98 @@ Vagrant.configure("2") do |config|
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
   
-  config.vm.define "attacker" do |attacker|
-    attacker.vm.box = "kalilinux/rolling"
-    attacker.vm.hostname = "attacker.local"
+    config.vm.define "attacker" do |attacker|
+      attacker.vm.box = "kalilinux/rolling"
+      attacker.vm.hostname = "attacker.local"
 
-    attacker.vm.provider "virtualbox" do |vb|
-      vb.memory = 3072
-      vb.cpus = 2
-    end
+      attacker.vm.provider "virtualbox" do |vb|
+        vb.memory = 3072
+        vb.cpus   = 2
+        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
 
-    # Network (Host-Only)
-    attacker.vm.network "private_network", ip: "192.168.56.11"
+      # Network (Host-Only) = adaptador 2 na VM VirtualBox
+      attacker.vm.network "private_network", ip: "192.168.56.11"
 
-    
-    
-    attacker.vm.synced_folder "./shared/attacker", "/opt/shared", create: true
-    
-    
+      
+      
+      attacker.vm.synced_folder "./shared/attacker", "/opt/shared", create: true
+      
+      
 
-    
-    
-    attacker.vm.provision "shell", inline: <<-SHELL
-sudo apt-get update -y
+      
+      
+      attacker.vm.provision "shell", inline: <<-SHELL
+    sudo apt-get update -y
       sudo apt-get install -y nmap hping3 slowhttptest
 
-    SHELL
-    
-    
-  end
-  
-  config.vm.define "victim" do |victim|
-    victim.vm.box = "bento/ubuntu-20.04"
-    victim.vm.hostname = "victim.local"
-
-    victim.vm.provider "virtualbox" do |vb|
-      vb.memory = 2048
-      vb.cpus = 2
+      SHELL
+      
+      
     end
+    
+    config.vm.define "victim" do |victim|
+      victim.vm.box = "bento/ubuntu-20.04"
+      victim.vm.hostname = "victim.local"
 
-    # Network (Host-Only)
-    victim.vm.network "private_network", ip: "192.168.56.12"
+      victim.vm.provider "virtualbox" do |vb|
+        vb.memory = 2048
+        vb.cpus   = 2
+        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
 
-    
-    
-    victim.vm.synced_folder "./shared/victim", "/opt/shared", create: true
-    
-    
+      # Network (Host-Only) = adaptador 2 na VM VirtualBox
+      victim.vm.network "private_network", ip: "192.168.56.12"
 
-    
-    
-    victim.vm.provision "shell", inline: <<-SHELL
-sudo apt-get update -y
+      
+      
+      victim.vm.synced_folder "./shared/victim", "/opt/shared", create: true
+      
+      
+
+      
+      
+      victim.vm.provision "shell", inline: <<-SHELL
+    sudo apt-get update -y
       sudo apt-get install -y apache2
       sudo systemctl enable --now apache2
 
-    SHELL
-    
-    
-  end
-  
-  config.vm.define "sensor" do |sensor|
-    sensor.vm.box = "bento/ubuntu-20.04"
-    sensor.vm.hostname = "sensor.local"
-
-    sensor.vm.provider "virtualbox" do |vb|
-      vb.memory = 2048
-      vb.cpus = 2
+      SHELL
+      
+      
     end
+    
+    config.vm.define "sensor" do |sensor|
+      sensor.vm.box = "bento/ubuntu-20.04"
+      sensor.vm.hostname = "sensor.local"
 
-    # Network (Host-Only)
-    sensor.vm.network "private_network", ip: "192.168.56.13"
+     sensor.vm.provider "virtualbox" do |vb|
+        vb.memory = 2048
+        vb.cpus   = 2
+        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
+        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+      end
 
-    
-    
-    sensor.vm.synced_folder "./shared/sensor", "/opt/shared", create: true
-    
-    
+      # Network (Host-Only) = adaptador 2 na VM VirtualBox
+      sensor.vm.network "private_network", ip: "192.168.56.13"
 
-    
-    
-    sensor.vm.provision "shell", inline: <<-SHELL
-sudo apt-get update -y
+      
+      
+      sensor.vm.synced_folder "./shared/sensor", "/opt/shared", create: true
+      
+      
+
+      
+      
+      sensor.vm.provision "shell", inline: <<-SHELL
+    sudo apt-get update -y
       sudo apt-get install -y zeek tcpdump python3-pip
       sudo pip3 install nfstream
-    SHELL
+      SHELL
+      
+      
+    end
     
-    
-  end
-  
 end

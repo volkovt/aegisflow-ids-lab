@@ -36,21 +36,46 @@ class MachineInfoService:
             return "desconhecido"
 
     def query_os_friendly(self, name: str, timeout: int = 12) -> str:
+        """
+        Coleta amigável do SO:
+        - Apenas comandos POSIX (Linux) sem ${...} (format-safe).
+        - Se falhar, tenta PowerShell (Windows) como último recurso.
+        - Fallback final: uname -sr.
+        """
+        # Linux: sem ${…} nem funções; tudo linear e “format-safe”
         cmd_linux = (
             "set -e\n"
-            "get_name() {\n"
-            "  if command -v lsb_release >/dev/null 2>&1; then lsb_release -ds && printf ' (%s)\\n' \"$(lsb_release -cs)\"; return; fi\n"
-            "  if [ -r /etc/os-release ]; then . /etc/os-release; printf '%s\\n' \"${PRETTY_NAME:-$NAME $VERSION}\"; return; fi\n"
-            "  if [ -r /etc/redhat-release ]; then cat /etc/redhat-release; return; fi\n"
-            "  if [ -r /etc/debian_version ]; then printf 'Debian %s\\n' \"$(cat /etc/debian_version)\"; return; fi\n"
-            "  uname -sr\n"
-            "}\n"
-            "NAME=\"$(get_name || true)\"\n"
-            "ARCH=\"$(uname -m || echo '?')\"\n"
-            "KERN=\"$(uname -r || echo '?')\"\n"
-            "NAME=\"${NAME#\"}\"; NAME=\"${NAME%\"}\"\n"
-            "printf '%s (%s, kernel %s)\\n' \"$NAME\" \"$ARCH\" \"$KERN\"\n"
+            # 1) Tenta lsb_release (rápido e padronizado)
+            "name=\"\"; code=\"\"; arch=\"?\"; kern=\"?\"\n"
+            "if command -v uname >/dev/null 2>&1; then arch=\"$(uname -m 2>/dev/null || echo '?')\"; kern=\"$(uname -r 2>/dev/null || echo '?')\"; fi\n"
+            "if command -v lsb_release >/dev/null 2>&1; then\n"
+            "  name=\"$(lsb_release -ds 2>/dev/null || true)\"; code=\"$(lsb_release -cs 2>/dev/null || true)\";\n"
+            "  if [ -n \"$code\" ]; then name=\"$name ($code)\"; fi\n"
+            "fi\n"
+            # 2) /etc/os-release via awk, sem ${…}
+            "if [ -z \"$name\" ] && [ -r /etc/os-release ]; then\n"
+            "  name=\"$(awk -F= '\n"
+            "    /^PRETTY_NAME=/{ gsub(/^\"|\"$/, \"\", $2); print $2; found=1; exit }\n"
+            "    END{ if(!found){ n=\"\"; v=\"\" } }\n"
+            "  ' /etc/os-release 2>/dev/null || true)\"\n"
+            "  if [ -z \"$name\" ]; then\n"
+            "    name=\"$(awk -F= '\n"
+            "      /^NAME=/{ n=$2 }\n"
+            "      /^VERSION=/{ v=$2 }\n"
+            "      END{\n"
+            "        gsub(/^\"|\"$/, \"\", n); gsub(/^\"|\"$/, \"\", v);\n"
+            "        if(n!=\"\"){ printf(\"%s %s\\n\", n, v) }\n"
+            "      }\n"
+            "    ' /etc/os-release 2>/dev/null || true)\"\n"
+            "  fi\n"
+            "fi\n"
+            # 3) Demais distros
+            "if [ -z \"$name\" ] && [ -r /etc/redhat-release ]; then name=\"$(cat /etc/redhat-release)\"; fi\n"
+            "if [ -z \"$name\" ] && [ -r /etc/debian_version ]; then name=\"Debian $(cat /etc/debian_version)\"; fi\n"
+            "if [ -z \"$name\" ]; then name=\"$(uname -sr 2>/dev/null || echo Linux)\"; fi\n"
+            "printf '%s (%s, kernel %s)\\n' \"$name\" \"$arch\" \"$kern\"\n"
         )
+
         try:
             out = self.ssh.run_command(name, cmd_linux, timeout=timeout).strip()
             if out:
@@ -59,11 +84,12 @@ class MachineInfoService:
         except Exception as e:
             self.append_log(f"[WARN] coleta SO (Linux) falhou em {name}: {e}")
 
-        ps = (
-            r'powershell -NoProfile -Command '
-            r'"$o=Get-CimInstance Win32_OperatingSystem; '
-            r'Write-Output ($o.Caption + \" \" + $o.Version + \" (\" + $o.OSArchitecture + ", build " + $o.BuildNumber + ")\")"'
-        )
+            # Windows (só tenta se Linux falhar)
+            ps = (
+                r"powershell -NoProfile -Command "
+                r"\"$o=Get-CimInstance Win32_OperatingSystem; "
+                r"Write-Output ($o.Caption + ' ' + $o.Version + ' (' + $o.OSArchitecture + ', build ' + $o.BuildNumber + ')')\""
+            )
         try:
             outw = self.ssh.run_command(name, ps, timeout=timeout).strip()
             if outw:
@@ -72,11 +98,12 @@ class MachineInfoService:
         except Exception as e:
             self.append_log(f"[WARN] coleta SO (Windows) falhou em {name}: {e}")
 
+            # Fallback universal
         try:
             out2 = self.ssh.run_command(name, "uname -sr", timeout=8).strip()
             if out2:
                 self.append_log(f"[SO] {name} (fallback): {out2}")
-                return out2
+            return out2
         except Exception as e:
             self.append_log(f"[WARN] coleta SO fallback (uname) falhou em {name}: {e}")
         return "SO desconhecido"

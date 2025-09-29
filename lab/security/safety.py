@@ -1,72 +1,63 @@
 import logging
 logger = logging.getLogger("[Safety]")
 
-def _lab_iface(ssh, host="attacker") -> str:
-    try:
-        cmd = r"ip -br a | awk '/192\.168\.56\./{print $1; exit}'"
-        out = ssh.run_command(host, cmd, timeout=10).strip()
-        return out or "enp0s8"
-    except Exception as e:
-        logger.warning(f"[Safety] iface lab não detectada: {e}")
-        return "enp0s8"
+CHAIN = "TCC_EGRESS"
+LAB_CIDR = "192.168.56.0/24"
 
 def _run(ssh, cmd: str, **kw):
-    """
-    Executa comando no 'attacker' tentando usar a API cancelável quando existir.
-    Aceita 'timeout' ou 'timeout_s'.
-    """
-    try:
-        to_s = kw.get("timeout_s", None)
-        if to_s is None:
-            to_s = kw.get("timeout", 20)
+    return ssh.run_command("attacker", cmd, **kw)
 
-        if hasattr(ssh, "run_command_cancellable"):
-            return ssh.run_command_cancellable("attacker", cmd, timeout_s=int(to_s))
-        return ssh.run_command("attacker", cmd, timeout=int(to_s))
-    except Exception as e:
-        logger.error(f"[Safety] _run falhou: {e}")
-        raise
-
-def apply_attacker_egress_guard(ssh, victim_ip: str | None = None, sensor_ip: str | None = None):
+def apply_attacker_egress_guard(ssh, victim_ip: str = None, sensor_ip: str = None, lab_cidr: str = LAB_CIDR):
     try:
-        logger.info("[Safety] Aplicando egress guard (cadeia TCC_EGRESS)...")
-        cmd = """
-            set -e
-            sudo iptables -N TCC_EGRESS 2>/dev/null || true
-            sudo iptables -F TCC_EGRESS
-            sudo iptables -A TCC_EGRESS -o lo -j RETURN
-            sudo iptables -A TCC_EGRESS -p tcp --dport 22 -j RETURN
-            [ -n "{V}" ] && sudo iptables -A TCC_EGRESS -d "{V}" -j RETURN || true
-            [ -n "{S}" ] && sudo iptables -A TCC_EGRESS -d "{S}" -j RETURN || true
-            sudo iptables -A TCC_EGRESS -j DROP
-            sudo iptables -C OUTPUT -j TCC_EGRESS 2>/dev/null || sudo iptables -I OUTPUT 1 -j TCC_EGRESS
-            """.format(V=victim_ip or "", S=sensor_ip or "")
-        _run(ssh, cmd)
-        logger.info("[Safety] Egress guard ativo.")
+        logger.info("[Safety] Aplicando egress guard (cadeia %s)...", CHAIN)
+
+        # 1) Garante a chain e o jump uma única vez
+        _run(ssh, f"sudo iptables -w -N {CHAIN} 2>/dev/null || true", timeout=10)
+        _run(ssh, f"sudo iptables -w -F {CHAIN}", timeout=10)
+        _run(ssh, f"sudo iptables -C OUTPUT -j {CHAIN} 2>/dev/null || sudo iptables -I OUTPUT 1 -j {CHAIN}", timeout=10)
+
+        # 2) Regras de retorno seguro
+        base_rules = [
+            f"sudo iptables -w -A {CHAIN} -o lo -j RETURN",
+            f"sudo iptables -w -A {CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN",
+            f"sudo iptables -w -A {CHAIN} -d {lab_cidr} -j RETURN",   # libera toda a rede do lab
+            "sudo iptables -w -A {chain} -p udp --dport 53 -j RETURN".format(chain=CHAIN),  # DNS (se precisar)
+        ]
+
+        for r in base_rules:
+            _run(ssh, r, timeout=10)
+
+        # 3) Whitelist explícita (opcional, redundante se lab_cidr já cobre)
+        if victim_ip:
+            _run(ssh, f"sudo iptables -w -A {CHAIN} -d {victim_ip} -j RETURN", timeout=10)
+        if sensor_ip:
+            _run(ssh, f"sudo iptables -w -A {CHAIN} -d {sensor_ip} -j RETURN", timeout=10)
+
+        # 4) Política de bloqueio padrão
+        _run(ssh, f"sudo iptables -w -A {CHAIN} -j REJECT --reject-with icmp-port-unreachable", timeout=10)
+
+        logger.info("[Safety] Egress guard ativo (liberado %s / alvo(s) do lab).", lab_cidr)
     except Exception as e:
         logger.error(f"[Safety] Falha ao aplicar egress guard: {e}")
         raise
 
 def remove_attacker_egress_guard(ssh):
     try:
-        logger.info("[Safety] Removendo egress guard (TCC_EGRESS)...")
-        cmd = """bash -lc '
-            sudo iptables -D OUTPUT -j TCC_EGRESS 2>/dev/null || true
-            sudo iptables -F TCC_EGRESS 2>/dev/null || true
-            sudo iptables -X TCC_EGRESS 2>/dev/null || true
-            '"""
-        _run(ssh, cmd)
+        logger.info("[Safety] Removendo egress guard...")
+        _run(ssh, f"sudo iptables -D OUTPUT -j {CHAIN} 2>/dev/null || true", timeout=10)
+        _run(ssh, f"sudo iptables -F {CHAIN} 2>/dev/null || true", timeout=10)
+        _run(ssh, f"sudo iptables -X {CHAIN} 2>/dev/null || true", timeout=10)
         logger.info("[Safety] Egress guard removido.")
     except Exception as e:
-        logger.warning(f"[Safety] Falha ao remover egress guard: {e}")
+        logger.warn(f"[Safety] Falha ao remover egress guard: {e}")
 
-def toggle_attacker_nat(ssh, enable: bool):
+def toggle_attacker_nat(ssh, enable: bool, victim_ip: str = None, sensor_ip: str = None):
     """
-    Mantido por compatibilidade com o Runner. Aqui só chamamos o guard:
-    - enable=False -> ativa guard (isola)
-    - enable=True  -> remove guard (restaura)
+    Compatibilidade com o Runner:
+      - enable=False -> isola (aplica guard com exceções do lab)
+      - enable=True  -> restaura (remove guard)
     """
     if enable:
         remove_attacker_egress_guard(ssh)
     else:
-        apply_attacker_egress_guard(ssh, victim_ip=None, sensor_ip=None)
+        apply_attacker_egress_guard(ssh, victim_ip=victim_ip, sensor_ip=sensor_ip)

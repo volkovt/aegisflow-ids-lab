@@ -196,6 +196,55 @@ MachineAvatarExt {
 /* ========== Tema Matrix/Holográfico para o Guia do Experimento ========== */
 /* Paleta base: pretos esverdeados, neon green (#00ff95/#00ffa3), ciano (#33e0ff). */
 
+QProgressBar {
+    border: 1px solid rgba(0,255,163,0.18);
+    border-radius: 6px;
+    background: rgba(0,0,0,0.35);
+    text-align: center;
+    color: #b6ffed;
+}
+
+QProgressBar::chunk {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 #00ffa3, stop:1 #33e0ff);
+    border-radius: 6px;
+}
+
+QProgressBar:disabled {
+    background: rgba(0,0,0,0.15);
+    color: #6b7178;
+}
+QProgressBar:disabled::chunk {
+    background: rgba(51,224,255,0.25);
+    border-radius: 6px;
+}
+
+QProgressBar[loading="true"] {
+    background: rgba(0,0,0,0.25);
+    color: #92ffe4;
+}
+QProgressBar[loading="true"]::chunk {
+    background: qlineargradient(x1:0,y1:0,x2:1,y
+2:0,
+        stop:0 #00ffa3, stop:1 #33e0ff);
+    border-radius: 6px;
+    animation: loadingAnim 0.9s linear infinite;
+}
+
+QProgressBar[loading="true"]:disabled {
+    background: rgba(0,0,0,0.15);
+    color: #6b7178;
+}
+QProgressBar[loading="true"]:disabled::chunk {
+    background: rgba(51,224,255,0.25);
+    border-radius: 6px;
+    animation: none;
+}
+@keyframes loadingAnim {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 100% 50%; }
+}
+
 #GuideDialog {
     background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
         stop:0 #0b0f12, stop:1 #0a0f0c);
@@ -328,6 +377,39 @@ MachineAvatarExt {
     background: rgba(0,255,163,0.25);
 }
 
+QPushButton#HoloBtn:hover:!disabled {
+    background-color: #132025;
+    border-color: #2d3b40;
+}
+QPushButton#HoloBtn:pressed:!disabled {
+    background-color: #0c1a1f;
+    border-color: #3a4c52;
+}
+
+QPushButton#HoloBtn:disabled {
+    background-color: #0a0c0f;          /* fundo bem mais “apagado” */
+    color: #6b7178;                      /* cinza frio, sem verde */
+    border: 1px dashed #2d333a;          /* borda tracejada para reforçar o estado */
+    cursor: forbidden;                   /* cursor de “proibido” */
+}
+
+QToolButton:disabled,
+QToolButton#actionMenuBtn:disabled {
+    background: #0a0c0f;
+    color: #6b7178;
+    border: 1px dashed #2d333a;
+    cursor: forbidden;
+}
+
+QMenu::item:disabled {
+    color: #6b7178;
+    background: transparent;
+}
+
+QPushButton#HoloBtn:disabled > * {
+    opacity: 0.55; /* Qt aplica em filhos suportados */
+}
+
 QToolButton#CopyModeBtn {
     padding: 6px 10px;
     color: #d9fff4;
@@ -339,7 +421,6 @@ QToolButton#CopyModeBtn:hover {
     border-color: rgba(51,224,255,0.5);
 }
 
-/* Console e footer */
 #GuideConsole {
     background: rgba(0,0,0,0.35);
     color: #cbfff0;
@@ -351,4 +432,32 @@ QToolButton#CopyModeBtn:hover {
 #GuideFooter {
     color: #92ffe4;
     padding-top: 2px;
+}
+
+#headerIcon, #GuideHeaderIcon {
+  border-radius: 4px;
+  padding: 1px;
+}
+
+#headerIcon:hover, #GuideHeaderIcon:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+
+#MachineAvatarImg {
+  border-radius: 16px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.02); /* só um toque, o brilho vem do efeito */
+}
+
+#MachineAvatarImg[vis="online"] {
+  outline: 1px solid rgba(0, 255, 180, 0.18);
+}
+
+#MachineAvatarImg[vis="offline"] {
+  outline: 1px solid rgba(255, 80, 80, 0.14);
+}
+
+#MachineAvatarImg:hover {
+  background: rgba(255, 255, 255, 0.035);
 }

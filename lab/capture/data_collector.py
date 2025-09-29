@@ -1,6 +1,8 @@
 import logging, json, hashlib, shutil, os, subprocess
 from pathlib import Path
 
+from lab.datasets.etl_netsec import run_etl
+
 logger = logging.getLogger("[DataCollector]")
 
 class DataCollector:
@@ -10,12 +12,11 @@ class DataCollector:
 
     def _scp(self, host: str, remote: str, local: Path):
         """
-        Cópia simples (um arquivo remoto -> destino local).
-        Mantém comportamento antigo e levanta exceção se falhar.
+        Cópia (um arquivo remoto -> destino local) em modo batch (sem prompts).
+        Levanta exceção se falhar.
         """
         try:
             fields = self.ssh.get_ssh_fields(host)
-            # Garante diretório-alvo (se 'local' for arquivo) ou o próprio diretório (se existir)
             if local.exists() and local.is_dir():
                 local.mkdir(parents=True, exist_ok=True)
                 local_parent = local
@@ -23,24 +24,46 @@ class DataCollector:
                 local_parent = local.parent
                 local_parent.mkdir(parents=True, exist_ok=True)
 
-            key = fields["IdentityFile"]
-            port = fields["Port"]
-            user = fields["User"]
+            key   = fields["IdentityFile"]
+            port  = fields["Port"]
+            user  = fields["User"]
             hostn = fields["HostName"]
-            cmd = ["scp", "-P", str(port), "-i", key, f"{user}@{hostn}:{remote}", str(local)]
-            logger.info(f"[SCP] {' '.join(cmd)}")
-            subprocess.check_call(cmd, cwd=self.lab_dir)
+
+            cmd = [
+                "scp",
+                "-P", str(port),
+                "-i", key,
+                "-o", "BatchMode=yes",                        # não pedir senha
+                "-o", "StrictHostKeyChecking=no",            # não perguntar yes/no
+                "-o", "UserKnownHostsFile=/dev/null",        # não sujar known_hosts
+                "-o", "PreferredAuthentications=publickey",  # não tentar password
+                "-o", "ConnectTimeout=12",                   # não travar indefinidamente
+                f"{user}@{hostn}:{remote}",
+                str(local)
+            ]
+            logger.info("[SCP] %s", " ".join(cmd))
+            res = subprocess.run(
+                cmd, cwd=str(self.lab_dir),
+                capture_output=True, text=True, timeout=60
+            )
+            if res.returncode != 0:
+                logger.error("[SCP] Falhou (%s): %s", res.returncode, (res.stderr or "").strip())
+                raise RuntimeError(f"SCP falhou ({res.returncode})")
+            if res.stdout:
+                logger.info("[SCP] %s", res.stdout.strip())
+        except subprocess.TimeoutExpired:
+            logger.error("[SCP] TIMEOUT")
+            raise
         except Exception as e:
             logger.error(f"[SCP] Falhou: {e}")
             raise
 
     def _list_remote_glob(self, host: str, pattern: str):
         """
-        Lista, no remoto, os arquivos que correspondem ao 'pattern'.
-        Usa nullglob para que 'nenhuma correspondência' não gere erro.
+        Lista, no remoto, arquivos que casem com 'pattern' (nullglob ativado).
         """
         try:
-            cmd = f"bash -lc 'shopt -s nullglob dotglob; for f in {pattern}; do printf \"%s\\n\" \"$f\"; done'"
+            cmd = "bash -lc 'shopt -s nullglob dotglob; for f in " + pattern + "; do printf \"%s\\n\" \"$f\"; done'"
             out = self.ssh.run_command(host, cmd, timeout=10)
             matches = [l.strip() for l in out.splitlines() if l.strip()]
             return matches
@@ -51,19 +74,19 @@ class DataCollector:
     def _scp_glob_optional(self, host: str, pattern: str, local_dir: Path) -> int:
         """
         Copia zero ou mais arquivos que casem com 'pattern' no remoto.
-        Se nenhum arquivo existir, apenas loga um aviso e segue em frente.
+        Se nenhum arquivo existir, apenas loga e segue.
         Retorna a contagem de arquivos copiados.
         """
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
             matches = self._list_remote_glob(host, pattern)
             if not matches:
-                logger.error(f"[SCP] Nenhum arquivo correspondente a {pattern} em {host}.")
+                logger.warning(f"[SCP] Nenhum arquivo correspondente a {pattern} em {host}.")
                 return 0
             count = 0
             for remote_path in matches:
                 try:
-                    # Destino é o diretório local; como já existe, scp tratará como diretório
+                    # Destino é diretório local; scp tratará como diretório
                     self._scp(host, remote_path, local_dir)
                     count += 1
                 except Exception as e:
@@ -74,6 +97,9 @@ class DataCollector:
             return 0
 
     def harvest(self, exp_id: str, out_base: Path, timeline=None, run_pre_etl: bool = True) -> Path:
+        """
+        Coleta artefatos (Zeek/PCAP/auth/hydra/nmap), gera ETL e zipa o dataset.
+        """
         base = Path(out_base) / exp_id
         sensor_pcap = base / "sensor" / "pcap"
         sensor_zeek = base / "sensor" / "zeek"
@@ -93,9 +119,12 @@ class DataCollector:
             except Exception as e:
                 logger.error(f"[HARVEST] auth.log ausente ou inacessível na vítima (seguindo): {e}")
 
-            # ATTACKER — artefatos de ações (opcionais)
-            self._scp_glob_optional("attacker", "~/exp_scan.nmap", attacker_dir)
-            self._scp_glob_optional("attacker", "~/exp_brute.hydra", attacker_dir)
+            # ATTACKER — artefatos das ações
+            # nmap (ex.: ~/exp_nmap/scan, etc)
+            self._scp_glob_optional("attacker", "~/exp_nmap/*", attacker_dir)
+            # hydra (ex.: ~/exp_brute/hydra_ssh.log)
+            self._scp_glob_optional("attacker", "~/exp_brute/*", attacker_dir)
+            # outros (DoS, etc., se existirem)
             self._scp_glob_optional("attacker", "~/exp_dos*", attacker_dir)
 
             # METADATA
@@ -108,14 +137,47 @@ class DataCollector:
             checksums = self._sha256_dir(base)
             (base / "checksums.sha256").write_text("\n".join(checksums), encoding="utf-8")
 
-            # OPTIONAL: pré-ETL
+            # OPTIONAL: ETL
             if run_pre_etl:
+                etl_ok = False
                 try:
-                    from lab.datasets.pre_etl import generate_conn_features
-                    csv_path = generate_conn_features(dataset_root=base)
-                    logger.info(f"[HARVEST] Pré-ETL gerado: {csv_path}")
+                    proc_dir = Path(out_base) / "processed" / exp_id
+                    proc_dir.mkdir(parents=True, exist_ok=True)
+                    out_proc = run_etl(base, proc_dir)
+                    logger.info(f"[HARVEST] ETL completo gerado em: {out_proc}")
+                    etl_ok = True
                 except Exception as e:
-                    logger.error(f"[HARVEST] Pré-ETL falhou (seguindo sem bloquear): {e}")
+                    logger.error(f"[HARVEST] ETL completo falhou, tentando pré-ETL antigo: {e}")
+
+                if not etl_ok:
+                    try:
+                        from lab.datasets.pre_etl import generate_conn_features
+                        csv_path = generate_conn_features(dataset_root=base)
+                        logger.info(f"[HARVEST] Pré-ETL gerado: {csv_path}")
+                    except Exception as e:
+                        logger.error(f"[HARVEST] Pré-ETL falhou (seguindo sem bloquear): {e}")
+
+                # Relatório leve do run
+                try:
+                    if etl_ok:
+                        meta_dir = (Path(out_base) / "processed" / exp_id / "meta")
+                        counts_json = meta_dir / "label_counts.json"
+                        counts = {}
+                        if counts_json.exists():
+                            import json as _json
+                            counts = _json.loads(counts_json.read_text(encoding="utf-8"))
+                        report = {
+                            "exp_id": exp_id,
+                            "etl": "full" if etl_ok else "pre",
+                            "labels": counts,
+                            "artifacts": {
+                                "processed": str(Path(out_base) / "processed" / exp_id),
+                                "raw_base": str(base)
+                            }
+                        }
+                        (base / "run_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+                except Exception as e:
+                    logger.error(f"[HARVEST] Falha ao escrever run_report.json: {e}")
 
             # ZIP
             zip_path = base.with_suffix(".zip")
@@ -145,9 +207,9 @@ class DataCollector:
 
     def _metadata(self, exp_id: str, timeline=None) -> dict:
         try:
-            kernel_victim  = self.ssh.run_command("victim",  "uname -a", timeout=5).strip()
-            kernel_sensor  = self.ssh.run_command("sensor",  "uname -a", timeout=5).strip()
-            kernel_attacker= self.ssh.run_command("attacker","uname -a", timeout=5).strip()
+            kernel_victim   = self.ssh.run_command("victim",   "uname -a", timeout=5).strip()
+            kernel_sensor   = self.ssh.run_command("sensor",   "uname -a", timeout=5).strip()
+            kernel_attacker = self.ssh.run_command("attacker", "uname -a", timeout=5).strip()
         except Exception as e:
             logger.error(f"[META] Falha ao coletar uname: {e}")
             kernel_victim = kernel_sensor = kernel_attacker = "unknown"

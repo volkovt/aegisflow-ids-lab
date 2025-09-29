@@ -1,37 +1,37 @@
-# ML IDS Lab — Scan + Brute HTTP
-version: 1
-name: exp_scan_brute
-description: Nmap seguido de tentativa de força bruta HTTP via Hydra.
+exp_id: EXP_SCAN_BRUTE
+name: Scan+Brute básico
+
 targets:
-  victim_ip: "192.168.56.12"
+  victim_ip: 192.168.56.12
+  sensor: sensor
+  victim: victim
+  attacker: attacker
+
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
-
-brute:
-  users_inline: ["admin", "user", "test"]
-  pass_inline: ["123456", "password", "tcc2025"]
+  zeek_rotate_seconds: 3600
 
 actions:
-  - name: custom
-    title: "Preparar listas de usuários/senhas"
-    description: "Gera ~/users.txt e ~/passwords.txt se não existirem."
-    command: |
-      set -e
-      test -f ~/users.txt     || printf "admin\nuser\ntest\n" > ~/users.txt
-      test -f ~/passwords.txt || printf "123456\npassword\ntcc2025\n" > ~/passwords.txt
-
   - name: nmap_scan
     params:
-      flags: "-sS -sV -T4 --open"
-      ports: "1-1024"
+      flags: "-sT -sV -Pn -T3 --open"
+      ports: "22,80,8081"
       output: "~/exp_nmap/scan"
 
   - name: hydra_brute
     params:
-      service: "http-post-form"
-      port: 80
-      path: "/login:username=^USER^&password=^PASS^:F=Invalid"
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      output: "~/exp_brute/hydra_http"
+      user: "tcc"
+      pass_list: ["123456", "password", "tcc2025"]
+      threads: 2
+      output: "~/exp_brute/hydra_ssh.log"
+
+  # (Opcional) brute HTTP POST para gerar 401 e logs web:
+  # - name: hydra_http_post
+  #   params:
+  #     user: "webuser"
+  #     pass_list: "~/passwords.txt"
+  #     port: 8081
+  #     path: "/login"
+  #     extra: 'http-post-form "/login:username=^USER^&password=^PASS^:F=invalid:S=ok"'
+  #     output: "~/exp_brute/hydra_http.log"

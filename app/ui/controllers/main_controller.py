@@ -2,12 +2,32 @@ from __future__ import annotations
 from typing import Callable, Dict
 from pathlib import Path
 import logging
+import os
 
+import yaml
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QPushButton
 
+from app.core.vagrant_manager import VagrantManager
 from app.core.workers.worker import Worker
 from app.core.workers.result_worker import ResultWorker
+from lab.capture.data_collector import DataCollector
+
+
+class _QtUILogHandler(logging.Handler):
+    """
+    Envia logs do Python para a UI com segurança de thread (Qt).
+    """
+    def __init__(self, ui_append: Callable[[str], None]):
+        super().__init__()
+        self.ui_append = ui_append
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            QTimer.singleShot(0, lambda m=msg: self.ui_append(m))
+        except Exception:
+            pass
 
 class MainController:
     """
@@ -37,7 +57,7 @@ class MainController:
         self.project_root = Path(project_root)
         self.lab_dir = Path(lab_dir)
         self.cfg = cfg
-        self.vagrant = vagrant
+        self.vagrant: VagrantManager = vagrant
         self.ssh = ssh
         self.preflight = preflight
         self.warmup = warmup
@@ -57,53 +77,47 @@ class MainController:
         except Exception:
             pass
 
-        self.current_yaml_path: Path = self.project_root / "lab" / "experiments" / "exp_all.yaml"
+        self.current_yaml_path: Path = self.project_root / "lab" / "experiments" / "exp_scan_brute.yaml"
         self.yaml_selected_by_user: bool = False
 
-    def up_vm(self, name: str, *, btn: QPushButton | None = None):
-        def gen():
-            try:
-                self.append_log(f"[Up] Garantindo {name}…")
-                template_dir = self.project_root / "app" / "templates"
-                ctx = self.vagrant_ctx.build(self.current_yaml_path)
-                try:
-                    for ln in self.vagrant.ensure_created_and_running(
-                            name, template_dir, ctx, attempts=20, delay_s=4
-                    ):
-                        yield ln
-                except AttributeError:
-                    for ln in self.vagrant.up(name):
-                        yield ln
-
-                try:
-                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
-                    yield f"[Up] {name} running + SSH pronto."
-                except Exception as e:
-                    yield f"[Up] {name} running, mas SSH não respondeu ainda: {e}"
-
-                try:
-                    self.warmup.mark_boot(name)
-                    yield f"[Warmup] {name}: janela de aquecimento iniciada (30s)."
-                except Exception as e:
-                    yield f"[Warmup] Falha ao marcar boot de {name}: {e}"
-
-                yield "[Up] Concluído."
-                return "ok"
-            except Exception as e:
-                yield f"[ERRO] Up {name}: {e}"
-                return "error"
-
         try:
-            worker = Worker(gen)
-            worker.line.connect(self.append_log)
-            worker.error.connect(lambda msg: self.append_log(f"[ERRO] Up {name}: {msg}"))
-            if btn is not None:
-                self.tm.wire_button(btn, worker, active_label="Up…", idle_label="Up")
-            worker.done.connect(lambda: self.status_by_name(name, on_card_status=lambda _st: None))
-            self.tm.keep(worker, tag=f"up:{name}")
-            worker.start()
+            ui_handler = _QtUILogHandler(self.append_log)
+            ui_handler.setLevel(logging.INFO)
+            ui_handler.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%H:%M:%S"
+            ))
+
+            logger_names = (
+                "VagrantLabUI",
+                "[SensorAgent]",
+                "[AttackerAgent]",
+                "[VictimAgent]",
+                "[DataCollector]",
+            )
+            self._ui_log_handlers = []
+
+            for name in logger_names:
+                lg = logging.getLogger(name)
+                lg.setLevel(logging.INFO)
+                lg.addHandler(ui_handler)
+                lg.propagate = False
+                self._ui_log_handlers.append((lg, ui_handler))
+
+            self.append_log("[LogBridge] Logs integrados à UI.")
         except Exception as e:
-            self.append_log(f"[ERRO] up_vm({name}): {e}")
+            self.append_log(f"[WARN] Falha ao ligar logs na UI: {e}")
+
+    def detach_ui_log_handlers(self):
+        try:
+            for lg, h in getattr(self, "_ui_log_handlers", []):
+                try:
+                    lg.removeHandler(h)
+                except Exception:
+                    pass
+            self._ui_log_handlers = []
+        except Exception as e:
+            self.append_log(f"[WARN] detach_ui_log_handlers: {e}")
 
     # ---------------- Dataset ----------------
     def _on_ds_started(self):
@@ -112,9 +126,45 @@ class MainController:
         except Exception as e:
             self.append_log(f"[WARN] _on_ds_started: {e}")
 
+    def _read_exp_id_from_yaml(self, path: Path) -> str:
+        try:
+            data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "exp_id" in data and str(data["exp_id"]).strip():
+                return str(data["exp_id"]).strip()
+        except Exception as e:
+            self.append_log(f"[WARN] Não foi possível ler exp_id do YAML: {e}")
+        # fallback
+        return "EXP"
+
+    def _spawn_harvest(self, exp_id: str):
+        """
+        Dispara coleta de artefatos e ETL em thread separada.
+        """
+        def job():
+            dc = DataCollector(self.ssh, self.lab_dir)
+            out_zip = dc.harvest(exp_id, out_base=self.project_root / "data", timeline=None, run_pre_etl=True)
+            return str(out_zip)
+
+        w = ResultWorker(job)
+        w.result.connect(lambda p: self.append_log(f"[Harvest] OK: dataset empacotado em {p}"))
+        w.error.connect(lambda msg: self.append_log(f"[ERRO] Harvest: {msg}"))
+        # Ao concluir, sugere abrir a pasta do experimento
+        def _open_folder():
+            try:
+                self.open_folder(self.project_root / "data" / exp_id)
+            except Exception as e:
+                self.append_log(f"[UI] Falha ao abrir pasta do experimento: {e}")
+        w.result.connect(lambda _p: _open_folder())
+        self.tm.keep(w, tag=f"harvest:{exp_id}")
+        w.start()
+
     def _on_ds_finished(self, status: str):
         try:
             self.append_log(f"[Dataset] Finalizado com status: {status}")
+            # Ao terminar, coleta arquivos e gera ETL automaticamente
+            exp_id = self._read_exp_id_from_yaml(self.current_yaml_path)
+            self.append_log(f"[Harvest] Iniciando coleta/ETL do experimento: {exp_id}")
+            self._spawn_harvest(exp_id)
         except Exception as e:
             self.append_log(f"[WARN] _on_ds_finished: {e}")
 
@@ -129,13 +179,18 @@ class MainController:
                     self.append_log(f"[ERRO] Cancel: {e}")
                 return
             yaml_path = str(self.current_yaml_path)
+            self.append_log(f"[Dataset] Gerando dataset a partir de: {yaml_path}")
+            self.append_log(f"[Dataset] Saída em: {self.project_root / 'data'}")
             out_dir = str(self.project_root / "data")
+            toggle_cancel()
+            self.ds.finished.connect(lambda _st: toggle_cancel())
             self.ds.start(yaml_path, out_dir)
         except Exception as e:
             self.append_log(f"[ERRO] Dataset: {e}")
 
     # ---------------- Vagrantfile ----------------
     def write_vagrantfile(self, *, btn: QPushButton):
+        from app.core.workers.result_worker import ResultWorker
         def job():
             from jinja2 import Environment, FileSystemLoader
             env = Environment(loader=FileSystemLoader(str(self.project_root / "app" / "templates")))
@@ -220,6 +275,51 @@ class MainController:
         w.start()
 
     # ---------------- Up/Restart/Halt/Destroy ----------------
+    def up_vm(self, name: str, *, btn: QPushButton | None = None):
+        def gen():
+            try:
+                self.append_log(f"[Up] Garantindo {name}…")
+                template_dir = self.project_root / "app" / "templates"
+                ctx = self.vagrant_ctx.build(self.current_yaml_path)
+                try:
+                    for ln in self.vagrant.ensure_created_and_running(
+                            name, template_dir, ctx, attempts=20, delay_s=4
+                    ):
+                        yield ln
+                except AttributeError:
+                    for ln in self.vagrant.up(name):
+                        yield ln
+
+                try:
+                    self.vagrant.wait_ssh_ready(name, str(self.lab_dir), attempts=10, delay_s=3)
+                    yield f"[Up] {name} running + SSH pronto."
+                except Exception as e:
+                    yield f"[Up] {name} running, mas SSH não respondeu ainda: {e}"
+
+                try:
+                    self.warmup.mark_boot(name)
+                    yield f"[Warmup] {name}: janela de aquecimento iniciada (30s)."
+                except Exception as e:
+                    yield f"[Warmup] Falha ao marcar boot de {name}: {e}"
+
+                yield "[Up] Concluído."
+                return "ok"
+            except Exception as e:
+                yield f"[ERRO] Up {name}: {e}"
+                return "error"
+
+        try:
+            worker = Worker(gen)
+            worker.line.connect(self.append_log)
+            worker.error.connect(lambda msg: self.append_log(f"[ERRO] Up {name}: {msg}"))
+            if btn is not None:
+                self.tm.wire_button(btn, worker, active_label="Up…", idle_label="Up")
+            worker.done.connect(lambda: self.status_by_name(name, on_card_status=lambda _st: None))
+            self.tm.keep(worker, tag=f"up:{name}")
+            worker.start()
+        except Exception as e:
+            self.append_log(f"[ERRO] up_vm({name}): {e}")
+
     def up_all(self, *, btn):
         def gen():
             names = ["attacker", "sensor", "victim"]
@@ -382,7 +482,7 @@ class MainController:
 
     def open_folder(self, path: Path):
         from sys import platform as sysplat
-        import subprocess, os
+        import subprocess
         try:
             path = Path(path)
             path.mkdir(parents=True, exist_ok=True)

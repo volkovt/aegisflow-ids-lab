@@ -7,6 +7,8 @@ from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QWidget, QLabel, QSizePolicy, QVBoxLayout
 
+from app.ui.components.anim_utils import AvatarHoverAnimator
+
 logger = logging.getLogger("[MachineAvatarExt]")
 if not hasattr(logger, "warn"):
     logger.warn = logger.warning
@@ -125,8 +127,17 @@ class MachineAvatarExt(QWidget):
             lay.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
             lay.addWidget(self._img, 0, Qt.AlignHCenter)
 
-            self._refresh_pixmap()
-            logger.info(f"[MachineAvatar] inicializado com ícone {self._icon_px}px.")
+            try:
+                self._hover = AvatarHoverAnimator(
+                    self._img,
+                )
+            except Exception as e:
+                logger.error(f"[MachineAvatar] hover init: {e}")
+
+            try:
+                self._refresh_pixmap()
+            except Exception as e:
+                logger.error(f"[MachineAvatar] init refresh: {e}")
         except Exception as e:
             logger.error(f"[MachineAvatar] erro ao iniciar: {e}")
 
@@ -174,8 +185,10 @@ class MachineAvatarExt(QWidget):
 
     def _refresh_pixmap(self):
         try:
-            pm = ICONS.get_icon(self._role, self._status, self._icon_px)
-            self._img.setPixmap(pm)
+            pm: QPixmap | None = ICONS.get_icon(self._role, self._status, self._icon_px)
+            if pm and not pm.isNull():
+                self._img.setPixmap(pm)
+            self._img.setProperty("vis", self._status)
             self._img.repaint()
             self.repaint()
         except Exception as e:
