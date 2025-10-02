@@ -106,7 +106,7 @@ class SSHManager:
                     cli.close()
                 except Exception:
                     pass
-            logger.warn(f"[SSHManager] Pool: conexão de '{name}' removida.")
+            logger.warning(f"[SSHManager] Pool: conexão de '{name}' removida.")
         except Exception as e:
             logger.error(f"[SSHManager] Falha ao purgar cliente '{name}': {e}")
 

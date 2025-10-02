@@ -692,7 +692,7 @@ class ExperimentGuideDialog(QDialog):
 
         def _on_worker_done_guard(worker=w, c=card, s=step):
             if not _is_current(worker):
-                logger.warn("[Guide] Sinal 'done' de worker antigo ignorado.")
+                logger.warning("[Guide] Sinal 'done' de worker antigo ignorado.")
                 return
             if self._cancel_requested:
                 try:
@@ -706,13 +706,13 @@ class ExperimentGuideDialog(QDialog):
 
         def _on_worker_error_guard(msg: str, worker=w, c=card, s=step):
             if not _is_current(worker):
-                logger.warn("[Guide] Sinal 'error' de worker antigo ignorado.")
+                logger.warning("[Guide] Sinal 'error' de worker antigo ignorado.")
                 return
             self._on_step_fail(c, s, msg)
 
         def _on_worker_finished_guard(worker=w, c=card, s=step):
             if not _is_current(worker):
-                logger.warn("[Guide] Sinal 'finished' de worker antigo ignorado.")
+                logger.warning("[Guide] Sinal 'finished' de worker antigo ignorado.")
                 return
             try:
                 self._on_step_final(c, s)
@@ -725,7 +725,7 @@ class ExperimentGuideDialog(QDialog):
                     if hasattr(self, "_update_footer_actions_enabled"):
                         self._update_footer_actions_enabled()
                 except Exception as e:
-                    logger.warn(f"[Guide] footer actions update: {e}")
+                    logger.warning(f"[Guide] footer actions update: {e}")
 
         w.line.connect(self._append_console)
         w.finished_ok.connect(_on_worker_done_guard)
@@ -783,7 +783,7 @@ class ExperimentGuideDialog(QDialog):
                 try:
                     self._current_card.set_cancelled()
                 except Exception as e:
-                    logger.warn(f"[Guide] Falha ao marcar cartão como cancelado: {e}")
+                    logger.warning(f"[Guide] Falha ao marcar cartão como cancelado: {e}")
 
             if hasattr(self.ssh, "cancel_all_running"):
                 self.ssh.cancel_all_running()
@@ -807,7 +807,7 @@ class ExperimentGuideDialog(QDialog):
             if hasattr(self, "_update_footer_actions_enabled"):
                 self._update_footer_actions_enabled()
         except Exception as e:
-            logger.warn(f"[Guide] footer actions update: {e}")
+            logger.warning(f"[Guide] footer actions update: {e}")
 
     # ---------- SSH helpers ----------
     def _ssh_exec_or_paste(self, host: str, cmd: str, card: StepCard):

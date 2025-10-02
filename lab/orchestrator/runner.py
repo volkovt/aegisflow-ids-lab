@@ -1,372 +1,262 @@
-import logging, time, json
-import random
-import subprocess
-import threading
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Optional
+import logging
+import time
+import sys
 
-from lab.agents.attacker_agent import AttackerAgent
-from lab.agents.sensor_agent import SensorAgent
-from lab.agents.victim_agent import VictimAgent
-from lab.capture.data_collector import DataCollector
+from app.core.logger_setup import setup_logger
+from app.core.ssh_manager import SSHManager
+from lab.agents.attack import AttackExecutor
+from lab.agents.sensor import SensorAgent
 
-logger = logging.getLogger("[Runner]")
+from lab.orchestrator.yaml_loader import ExperimentSpec, resolve_profile_command, _flatten, _safe_format
 
-# ---------------------------------------------
-# SAFETY GATE (egress guard + NAT toggle)
-# tenta importar de lab.security.safety e, em fallback, security.safety
-try:
-    from lab.security.safety import (
-        apply_attacker_egress_guard,
-        remove_attacker_egress_guard,
-        toggle_attacker_nat,
-    )
-except Exception:
-    try:
-        from lab.security.safety import (
-            apply_attacker_egress_guard,
-            remove_attacker_egress_guard,
-            toggle_attacker_nat,
-        )
-    except Exception as e:
-        logger.warning(f"[Runner] safety.py não encontrado ({e}). Continuando SEM hardening de rede.")
-        apply_attacker_egress_guard = None  # type: ignore
-        remove_attacker_egress_guard = None  # type: ignore
-        toggle_attacker_nat = None  # type: ignore
-# ---------------------------------------------
+logger = setup_logger(Path('.logs'), name="[YamlLoader]")
 
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def _resolve_workload(exp):
-    """
-    Lê exp.workload com defaults seguros.
-    """
-    wl = getattr(exp, "workload", {}) or {}
-    return {
-        "cycles": int(wl.get("cycles", 3)),
-        "cool_down_min_s": int(wl.get("cool_down_min_s", 8)),
-        "cool_down_max_s": int(wl.get("cool_down_max_s", 18)),
-        "benign_burst_s": int(wl.get("benign_burst_s", 15)),
-        "max_parallel_bruteforce": int(wl.get("max_parallel_bruteforce", 2)),
-        "ssh_attempts": int(wl.get("ssh_attempts", 150)),
-        "http_attempts": int(wl.get("http_attempts", 150)),
-        "rate_limit_per_sec": int(wl.get("rate_limit_per_sec", 8)),
-        "jitter_ms": wl.get("jitter_ms", [60, 180]),
-    }
-
+@dataclass
 class ExperimentRunner:
-    def __init__(self, ssh_manager, lab_dir: Path):
+    def __init__(self, ssh_manager: SSHManager, lab_dir: Path):
         self.ssh = ssh_manager
         self.lab_dir = Path(lab_dir)
 
-    def _check_cancel(self, cancel_event: threading.Event | None):
-        if cancel_event and cancel_event.is_set():
-            raise CancelledError("cancel requested")
+    # -----------------------
+    # Utilidades internas
+    # -----------------------
+    def _guest_ip(self, name: str) -> str:
+        try:
+            script = r"""
+                set -e
+                ips=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1)
+                echo "$ips" | awk '/^192\.168\.56\./{print; found=1} END{ if(!found && NR>0) print $1 }' | head -n1
+            """
+            out = (self.ssh.run_command(name, script, timeout=25) or "").strip()
+            return out
+        except Exception as e:
+            logger.warning(f"[Runner] guest_ip({name}) falhou: {e}")
+            return ""
 
-    def _with_retry(self, tries: int, delay_s: float, fn, *args, **kwargs):
-        last = None
-        for i in range(1, tries + 1):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                last = e
-                logger.error(f"[Runner] Retry {i}/{tries} após falha: {e}")
-                time.sleep(delay_s * i)
-        raise last if last else RuntimeError("Falha sem exceção?")
+    def _resolve_ips(self, spec: ExperimentSpec) -> Dict[str, str]:
+        ips: Dict[str, str] = {}
+        for role in ("attacker", "victim", "sensor"):
+            ip = self._guest_ip(role)
+            logger.info(f"[Runner] {role} ip={ip}")
+            ips[role] = ip
+        return ips
 
-    def _stop_sensor_capture_best_effort(self):
+    def _ensure_network_mode(self, spec: ExperimentSpec):
+        mode = str((spec.network or {}).get("mode") or "").strip()
+        if mode != "host_only":
+            raise RuntimeError("network.mode != host_only — abortando por segurança.")
+        logger.info("[Runner] network.mode OK (host_only).")
+
+    # -----------------------
+    # ETL acoplado ao Runner
+    # -----------------------
+    def _run_etl(self, exp_dir: Path, etl_out_root: Path) -> Optional[Path]:
         """
-        Para tcpdump/zeek no sensor com segurança e sem derrubar o shell:
-        - valida PIDs lidos de pidfiles (kill -0)
-        - envia TERM e, se necessário, KILL
-        - usa pkill -x (nome exato), não -f
-        - limpa pidfiles (inclusive órfãos)
+        Executa pré-ETL e ETL final.
+        - pré-ETL gera features_conn_window.csv dentro de exp_dir
+        - ETL final escreve datasets prontos em etl_out_root/<exp_id>/
         """
         try:
-            self.ssh.run_command(
-                "sensor",
-                "bash -lc '"
-                "shopt -s nullglob; "
-                # 1ª passada: TERM em PIDs válidos
-                "for p in /var/run/tcc_*.pid; do "
-                "  [ -s \"$p\" ] || continue; "
-                "  pid=\"$(tr -cd 0-9 < \"$p\")\"; "
-                "  if [ -n \"$pid\" ] && sudo -n kill -0 \"$pid\" 2>/dev/null; then "
-                "    sudo -n kill \"$pid\" 2>/dev/null || true; "
-                "  fi; "
-                "done; "
-                # Mata por nome EXATO (não derruba o bash executor)
-                "sudo -n pkill -x tcpdump 2>/dev/null || true; "
-                "sudo -n pkill -x zeek    2>/dev/null || true; "
-                "sleep 0.3; "
-                # 2ª passada: KILL se ainda vivo + limpa pidfiles
-                "for p in /var/run/tcc_*.pid; do "
-                "  [ -e \"$p\" ] || continue; "
-                "  pid=\"$(tr -cd 0-9 < \"$p\")\"; "
-                "  if [ -n \"$pid\" ] && sudo -n kill -0 \"$pid\" 2>/dev/null; then "
-                "    sudo -n kill -9 \"$pid\" 2>/dev/null || true; "
-                "  fi; "
-                "  sudo -n rm -f \"$p\" 2>/dev/null || true; "
-                "done'"
-                ,
-                timeout=40
-            )
-            logger.info("[Runner] Captura no sensor: parada com sucesso (TERM/KILL best-effort).")
-        except Exception as e:
-            logger.warning(f"[Runner] Falha ao parar captura (best-effort): {e}")
+            logger.info(f"[ETL] Iniciando pipeline ETL (exp_dir={exp_dir})")
 
-    def _write_status_marker(self, out_dir: Path, exp_id: str, timeline: dict, status: str):
+            # Import dinâmico e robusto (evita falhas se módulos estiverem em outro path)
+            try:
+                from lab.datasets.pre_etl import generate_conn_features
+            except Exception as e:
+                logger.warning(f"[ETL] import pre_etl falhou: {e} — tentando ajustar sys.path")
+                sys.path.append(str(self.lab_dir))
+                from lab.datasets.pre_etl import generate_conn_features
+
+            try:
+                from lab.datasets.etl_netsec import run_etl
+            except Exception as e:
+                logger.warning(f"[ETL] import etl_netsec falhou: {e} — tentando ajustar sys.path")
+                sys.path.append(str(self.lab_dir))
+                from lab.datasets.etl_netsec import run_etl
+
+            # 1) Pré-ETL (janelas agregadas por conn.log, com timeline/heurística)
+            try:
+                out_csv = generate_conn_features(exp_dir, window_s=60)
+                logger.info(f"[ETL] Pré-ETL ok: {out_csv}")
+            except Exception as e:
+                logger.warning(f"[ETL] Pré-ETL falhou (seguindo para ETL direto do Zeek): {e}")
+
+            # 2) ETL final (datasets prontos para ML)
+            exp_id = exp_dir.name
+            etl_out_dir = Path(etl_out_root) / exp_id
+            etl_out_dir.mkdir(parents=True, exist_ok=True)
+
+            path_done = run_etl(exp_dir, etl_out_dir)
+            logger.info(f"[ETL] Finalizado em: {path_done}")
+            return Path(path_done)
+
+        except Exception as e:
+            logger.error(f"[ETL] Falha geral no ETL: {e}")
+            return None
+
+    # -----------------------
+    # Execução do experimento
+    # -----------------------
+    def run(self, spec: ExperimentSpec, out_dir: Path, run_pre_etl: bool = True, cancel_event=None) -> str:
+        t0 = time.time()
+        exp_id = str((spec.experiment or {}).get("id") or "EXP")
+        out_base = Path(out_dir) / exp_id
+        out_base.mkdir(parents=True, exist_ok=True)
+
+        sensor = SensorAgent(self.ssh, "sensor")
+        attacker = AttackExecutor(self.ssh)
+        ips: Dict[str, str] = {}
+
+        logger.info(f"[Runner] início exp_id={exp_id} out={out_base} pre_etl={run_pre_etl}")
+
+        def _cancelled() -> bool:
+            try:
+                return bool(cancel_event and cancel_event.is_set())
+            except Exception:
+                return False
+
+        marker = out_base / "_runner_done.txt"
+        err: Exception | None = None
+        etl_executado = False
+
         try:
-            base_dir = Path(out_dir) / exp_id
-            base_dir.mkdir(parents=True, exist_ok=True)
-            (base_dir / "_run_status.json").write_text(
-                json.dumps({"status": status}, indent=2), encoding="utf-8"
-            )
-            (base_dir / "timeline.json").write_text(
-                json.dumps(timeline, indent=2), encoding="utf-8"
-            )
+            for step in (spec.workflow or []):
+                if _cancelled():
+                    logger.warning("[Runner] cancelado — encerrando cedo.")
+                    break
+
+                logger.info(f"[Runner] step: {step.name}")
+                for action in (step.actions or []):
+                    if _cancelled():
+                        logger.warning("[Runner] cancelado — interrompendo ações.")
+                        break
+
+                    # --- safety ---
+                    if "ensure_network_mode" in action:
+                        self._ensure_network_mode(spec)
+                        continue
+
+                    if "resolve_ips" in action:
+                        ips = self._resolve_ips(spec)
+                        continue
+
+                    # --- sensor ---
+                    if "start_sensor" in action:
+                        logger.info("[Runner] iniciando sensor (tcpdump+zeek)…")
+                        sensor.sanitize_and_start(
+                            victim_ip=ips.get("victim", ""),
+                            attacker_ip=ips.get("attacker", "")
+                        )
+                        continue
+
+                    if "stop_sensor" in action:
+                        sensor.stop()
+                        continue
+
+                    # --- ataque ---
+                    if "run_profile" in action:
+                        profile_id = str(action["run_profile"].get("profile_id"))
+                        host, cmd, ssh_timeout = resolve_profile_command(spec, profile_id, ips)
+                        logger.info(f"[Runner] run_profile={profile_id} on={host}\n---PROFILE CMD---\n{cmd}\n---END PROFILE CMD---")
+                        attacker.run_cmd(host, cmd, timeout=ssh_timeout)
+
+                        # verificação leve de saída Hydra (se nosso template padrão foi usado)
+                        try:
+                            local_lists = str((spec.gvars or {}).get("local_lists") or "$HOME/tcc/lists")
+                            vic_ip = ips.get("victim", "")
+                            verify = (
+                                f'test -s "{local_lists}/hydra_{vic_ip}.out" '
+                                f'&& echo "[verify] hydra output ok: {local_lists}/hydra_{vic_ip}.out" '
+                                f'|| echo "[verify] hydra output MISSING"; '
+                                f'tail -n 20 "{local_lists}/hydra_{vic_ip}.out" 2>/dev/null || true'
+                            )
+                            attacker.run_cmd(host, verify, timeout=20)
+                        except Exception as e:
+                            logger.warning(f"[Runner] verificação do hydra out falhou: {e}")
+                        continue
+
+                    # --- coleta ---
+                    if "collect_artifacts" in action:
+                        try:
+                            sensor.collect_snapshot()
+                        except Exception as e:
+                            logger.warning(f"[Runner] snapshot: {e}")
+
+                        # Manifesto do experimento
+                        manifest = out_base / "manifest.txt"
+                        manifest.write_text(
+                            f"exp_id={exp_id}\nips={ips}\nstarted={t0}\nended={time.time()}\n",
+                            encoding="utf-8"
+                        )
+                        logger.info(f"[Runner] manifest: {manifest}")
+
+                        # ETL acoplado (gera datasets prontos em data/etl/<exp_id>/)
+                        if run_pre_etl:
+                            etl_root = Path(out_dir).parent / "lab" / "etl"
+                            try:
+                                etl_path = self._run_etl(out_base, etl_root)
+                                etl_executado = etl_path is not None
+                                if etl_executado:
+                                    logger.info(f"[Runner] ETL pronto em {etl_path}")
+                                else:
+                                    logger.warn("[Runner] ETL não produziu saída (veja logs acima).")
+                            except Exception as e:
+                                logger.error(f"[Runner] ETL falhou: {e}")
+                                etl_executado = False
+                        continue
+
+                    # --- cmd arbitrário pelo YAML (debug/etc) ---
+                    if "run_cmd" in action:
+                        host = str(action["run_cmd"].get("host") or "attacker")
+                        raw = str(action["run_cmd"].get("cmd") or "")
+                        ctx = {}
+                        ctx.update(spec.gvars or {})
+                        ctx.update(_flatten("experiment", spec.experiment or {}))
+                        ctx.update({
+                            "victim":   ips.get("victim", ""),
+                            "attacker": ips.get("attacker", ""),
+                            "sensor":   ips.get("sensor", "")
+                        })
+                        cmd = _safe_format(raw, ctx).replace("\r\n", "\n").replace("\r", "\n")
+                        logger.info(f"[Runner] run_cmd on={host}\n---BEGIN CMD---\n{cmd}\n---END CMD---")
+                        attacker.run_cmd(host, cmd, timeout=int((spec.gvars or {}).get("max_duration_s") or 900))
+                        continue
+
+                    logger.warning(f"[Runner] ação não reconhecida: {action}")
+
         except Exception as e:
-            logger.warning(f"[Runner] Falha ao salvar marcadores de execução: {e}")
-
-    def run(self, exp, out_dir: Path, run_pre_etl: bool = True, cancel_event: threading.Event | None = None) -> Path:
-        """
-        Executa o experimento com suporte a cancelamento e rollback.
-        - cancel_event: se setado externamente, aborta etapas com CancelledError.
-        """
-        timeline = {"exp_id": exp.exp_id, "stages": []}
-        status = "error"   # assume erro até concluir OK
-        aborted = False
-
-        def mark(stage, extra=None):
-            d = {"stage": stage, "ts": now_utc_iso()}
-            if extra:
-                d.update(extra)
-            timeline["stages"].append(d)
-
-        capture_on = False
-        nat_off = False
-
-        try:
-            logger.info(f"[Runner] Iniciando experimento: {exp.exp_id}")
-            mark("prepare_start")
-
-            # Warm-up SSH das VMs
-            mark("ssh_warm_start")
-            self._check_cancel(cancel_event)
-            self._warm_all()
-            mark("ssh_warm_end")
-
-            sensor = SensorAgent(self.ssh)
-            victim = VictimAgent(self.ssh)
-            attacker = AttackerAgent(self.ssh)
-
-            # --- PREPARE (paralelo só para victim/attacker) ---
-            self._check_cancel(cancel_event)
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                futs = [
-                    ex.submit(victim.prepare_services),
-                    ex.submit(attacker.ensure_tools),
-                ]
-                for f in as_completed(futs):
-                    self._check_cancel(cancel_event)
-                    f.result()
-            mark("prepare_end")
-
-            # Em alguns casos o SSH do attacker reinicia após installs
-            self._check_cancel(cancel_event)
-            self._wait_vm_ssh("attacker", attempts=8, delay_s=5)
-
-            # --- SENSOR: promíscuo + ferramentas em série ---
-            self._check_cancel(cancel_event)
-            logger.info("[Runner] Preparando sensor (promisc + ferramentas)...")
-            mark("sensor_promisc_start")
-            try:
-                sensor.enable_promisc(iface_hint="eth1")
-                mark("sensor_promisc_end", {"status": "ok"})
-            except Exception as e:
-                logger.warning(f"[Runner] enable_promisc falhou: {e}")
-                mark("sensor_promisc_end", {"status": "error", "error": str(e)})
-
-            mark("sensor_tools_start")
-            try:
-                sensor.ensure_tools()
-                mark("sensor_tools_end", {"status": "ok"})
-            except Exception as e:
-                logger.error(f"[Runner] ensure_tools (sensor) falhou: {e}")
-                mark("sensor_tools_end", {"status": "error", "error": str(e)})
-                raise
-
-            # --- Teste rápido de espelhamento (opcional) ---
-            victim_ip = exp.targets.get("victim_ip") if isinstance(exp.targets, dict) else None
-            try:
-                if victim_ip:
-                    ok_mirror = sensor.mirror_smoke_test(victim_ip=victim_ip, packets=6, iface_hint="eth1")
-                    if not ok_mirror:
-                        logger.warning("[Runner] mirror_smoke_test não capturou pacotes. Verifique nicpromisc no VirtualBox e gere tráfego.")
-                else:
-                    logger.warning("[Runner] victim_ip ausente no exp.targets; pulando mirror_smoke_test.")
-            except Exception as e:
-                logger.warning(f"[Runner] mirror_smoke_test falhou: {e}")
-
-            # --- ARM capture ---
-            self._check_cancel(cancel_event)
-            mark("arm_start")
-            sensor.arm_capture(
-                rotate_sec=exp.capture_plan.rotate_seconds,
-                rotate_mb=exp.capture_plan.rotate_size_mb,
-                victim_ip=exp.targets.get("victim_ip"),
-                attacker_ip=exp.targets.get("attacker_ip")
-            )
-            capture_on = True
-            time.sleep(3)
-            if not sensor.health():
-                logger.warning("[Runner] Sensor sem logs recentes — prosseguindo para gerar eventos.")
-            mark("arm_end")
-
-            # SAFETY GATE: confina tráfego do atacante ao LAB
-            self._check_cancel(cancel_event)
-            sensor_ip = exp.targets.get("sensor_ip") if isinstance(exp.targets, dict) else None
-
-            hardening_enabled = bool(toggle_attacker_nat)
-            if hardening_enabled:
-                mark("nat_isolate_start", {"victim_ip": victim_ip, "sensor_ip": sensor_ip})
-                try:
-                    self._with_retry(
-                        tries=3,
-                        delay_s=2,
-                        fn=toggle_attacker_nat,
-                        ssh=self.ssh,
-                        enable=False,
-                        victim_ip=victim_ip,
-                        sensor_ip=sensor_ip
-                    )
-                    nat_off = True
-                    mark("nat_isolate_end", {"status": "ok"})
-                except Exception as e:
-                    logger.warning(f"[Runner] Falha ao isolar NAT/egress: {e}")
-                    mark("nat_isolate_end", {"status": "error", "error": str(e)})
-
-            # ATTACK
-            self._check_cancel(cancel_event)
-            workload = _resolve_workload(exp)
-            cycles = workload["cycles"]
-            cool_min = workload["cool_down_min_s"]
-            cool_max = workload["cool_down_max_s"]
-
-            for c in range(1, cycles + 1):
-                self._check_cancel(cancel_event)
-                logger.info(f"[Runner] Iniciando ciclo {c}/{cycles}")
-
-                try:
-                    attacker.start_benign_burst(
-                        benign_cfg=getattr(exp, "benign", None),
-                        duration_s=workload["benign_burst_s"],
-                        cancel_event=cancel_event
-                    )
-                except Exception as e:
-                    logger.warning(f"[Runner] Benign burst falhou (ciclo {c}): {e}")
-
-                for action in exp.actions:
-                    self._check_cancel(cancel_event)
-                    stage = f"attack_{action.__class__.__name__}"
-                    mark(stage + "_start", {"cycle": c})
-                    logger.info(f"[Runner] Ação: {action.__class__.__name__} (ciclo {c})")
-                    action.run(
-                        self.ssh,
-                        victim_ip or exp.targets["victim_ip"],
-                        workload=workload
-                    )
-                    mark(stage + "_end", {"cycle": c})
-
-                    sleep_s = random.randint(cool_min, cool_max)
-                    time.sleep(sleep_s)
-
-                logger.info(f"[Runner] Ciclo {c} finalizado.")
-
-            # VALIDATE
-            self._check_cancel(cancel_event)
-            mark("validate_start")
-            auth_tail = victim.tail_auth(20)
-            if auth_tail:
-                logger.info(f"[Runner] auth.log (trecho):\n{auth_tail}")
-            mark("validate_end")
-
-            # --- PERSISTE TIMELINE ANTES DO ETL/harvest ---
-            try:
-                logger.info("[Runner] Persistindo timeline antes do ETL...")
-                self._write_status_marker(out_dir, exp.exp_id, timeline, status="pre_etl")
-                logger.info("[Runner] timeline.json gravado (pré-ETL).")
-            except Exception as e:
-                logger.error(f"[Runner] Falha ao persistir timeline antes do ETL: {e}")
-
-            # HARVEST + PACKAGE
-            self._check_cancel(cancel_event)
-            mark("harvest_start")
-            collector = DataCollector(self.ssh, self.lab_dir)
-            zip_path = collector.harvest(exp.exp_id, out_dir, timeline=timeline, run_pre_etl=run_pre_etl)
-            mark("harvest_end")
-
-            logger.info(f"[Runner] Experimento finalizado: {zip_path}")
-            status = "ok"
-            return zip_path
-
-        except CancelledError:
-            aborted = True
-            logger.error("[Runner] Execução cancelada pelo usuário.")
-            raise
-        except Exception as e:
-            logger.error(f"[Runner] Falha geral do experimento: {e}")
-            raise
+            err = e
+            logger.exception("[Runner] erro durante execução")
         finally:
             try:
-                if capture_on:
-                    self._stop_sensor_capture_best_effort()
-            except Exception:
-                pass
-            try:
-                if nat_off and toggle_attacker_nat:
-                    try:
-                        toggle_attacker_nat(self.ssh, enable=True)
-                        logger.info("[Runner] NAT/egress guard restaurado (removido).")
-                    except Exception as e:
-                        logger.warning(f"[Runner] Falha ao restaurar NAT/egress: {e}")
+                sensor.stop()
             except Exception:
                 pass
 
+            # Marker final
             try:
-                final_status = "aborted" if aborted else status
-                self._write_status_marker(out_dir, exp.exp_id, timeline, final_status)
+                status = "ok" if err is None else f"error:{type(err).__name__}"
+                (out_base / "_runner_done.txt").write_text(f"{status} {time.time()}", encoding="utf-8")
             except Exception:
-                pass
+                logger.warning("[Runner] não foi possível criar marker final.")
 
-    def _prepare_attacker_tools(self):
-        try:
-            logger.info("[Runner] Preparando ferramentas no atacante...")
-            attacker = AttackerAgent(self.ssh)
-            attacker.ensure_tools()
-            logger.info("[Runner] Atacante pronto (ferramentas instaladas).")
-        except Exception as e:
-            logger.error(f"[Runner] Falha preparando atacante: {e}")
-            raise
+            # Se o usuário desabilitar o run_pre_etl no futuro, ainda oferecemos um ETL ao final
+            if (err is None) and (not etl_executado) and run_pre_etl:
+                try:
+                    etl_root = Path(out_dir).parent / "etl"
+                    etl_path = self._run_etl(out_base, etl_root)
+                    if etl_path:
+                        logger.info(f"[Runner] (pós) ETL pronto em {etl_path}")
+                except Exception as e:
+                    logger.warning(f"[Runner] (pós) ETL falhou: {e}")
 
-    def _wait_vm_ssh(self, name: str, attempts: int = 12, delay_s: int = 5):
-        for i in range(1, attempts + 1):
-            try:
-                logger.info(f"[Runner] Aguardando SSH de {name} (tentativa {i}/{attempts})...")
-                subprocess.check_call(
-                    ["vagrant", "ssh", name, "-c", "true"],
-                    cwd=self.lab_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                logger.info(f"[Runner] SSH pronto em {name}.")
-                return
-            except Exception as e:
-                logger.warning(f"[Runner] SSH ainda não pronto em {name}: {e}")
-                time.sleep(delay_s)
-        raise RuntimeError(f"Timeout aguardando SSH de {name}.")
+            logger.info(f"[Runner] fim em {time.time() - t0:.1f}s — artefato: {(out_base / '_runner_done.txt')}")
 
-    def _warm_all(self):
-        for n in ("attacker", "sensor", "victim"):
-            self._wait_vm_ssh(n, attempts=12, delay_s=5)
+        if err is not None:
+            raise err
+
+        return str(out_base / "_runner_done.txt")

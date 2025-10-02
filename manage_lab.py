@@ -20,6 +20,7 @@ def _import_orchestrator():
         from lab.orchestrator.yaml_loader import load_experiment_from_yaml
         return load_experiment_from_yaml, ExperimentRunner
     except Exception as e:
+        logger.error(f"[ManageLab] Erro:': {e}")
         raise ImportError(
             "Módulos de orquestração não encontrados. "
             "Crie as pastas 'orchestrator/', 'agents/', 'actions/', 'capture/', 'datasets/' e 'experiments/' "

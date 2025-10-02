@@ -11,8 +11,6 @@ from PySide6.QtWidgets import QPushButton
 from app.core.vagrant_manager import VagrantManager
 from app.core.workers.worker import Worker
 from app.core.workers.result_worker import ResultWorker
-from lab.capture.data_collector import DataCollector
-
 
 class _QtUILogHandler(logging.Handler):
     """
@@ -77,7 +75,7 @@ class MainController:
         except Exception:
             pass
 
-        self.current_yaml_path: Path = self.project_root / "lab" / "experiments" / "exp_scan_brute.yaml"
+        self.current_yaml_path: Path = self.project_root / "lab" / "templates" / "exp_hydra_sweep.yaml"
         self.yaml_selected_by_user: bool = False
 
         try:
@@ -136,27 +134,27 @@ class MainController:
         # fallback
         return "EXP"
 
-    def _spawn_harvest(self, exp_id: str):
-        """
-        Dispara coleta de artefatos e ETL em thread separada.
-        """
-        def job():
-            dc = DataCollector(self.ssh, self.lab_dir)
-            out_zip = dc.harvest(exp_id, out_base=self.project_root / "data", timeline=None, run_pre_etl=True)
-            return str(out_zip)
-
-        w = ResultWorker(job)
-        w.result.connect(lambda p: self.append_log(f"[Harvest] OK: dataset empacotado em {p}"))
-        w.error.connect(lambda msg: self.append_log(f"[ERRO] Harvest: {msg}"))
-        # Ao concluir, sugere abrir a pasta do experimento
-        def _open_folder():
-            try:
-                self.open_folder(self.project_root / "data" / exp_id)
-            except Exception as e:
-                self.append_log(f"[UI] Falha ao abrir pasta do experimento: {e}")
-        w.result.connect(lambda _p: _open_folder())
-        self.tm.keep(w, tag=f"harvest:{exp_id}")
-        w.start()
+    # def _spawn_harvest(self, exp_id: str):
+    #     """
+    #     Dispara coleta de artefatos e ETL em thread separada.
+    #     """
+    #     def job():
+    #         dc = DataCollector(self.ssh, self.lab_dir)
+    #         out_zip = dc.harvest(exp_id, out_base=self.project_root / "data", timeline=None, run_pre_etl=True)
+    #         return str(out_zip)
+    #
+    #     w = ResultWorker(job)
+    #     w.result.connect(lambda p: self.append_log(f"[Harvest] OK: dataset empacotado em {p}"))
+    #     w.error.connect(lambda msg: self.append_log(f"[ERRO] Harvest: {msg}"))
+    #     # Ao concluir, sugere abrir a pasta do experimento
+    #     def _open_folder():
+    #         try:
+    #             self.open_folder(self.project_root / "data" / exp_id)
+    #         except Exception as e:
+    #             self.append_log(f"[UI] Falha ao abrir pasta do experimento: {e}")
+    #     w.result.connect(lambda _p: _open_folder())
+    #     self.tm.keep(w, tag=f"harvest:{exp_id}")
+    #     w.start()
 
     def _on_ds_finished(self, status: str):
         try:
@@ -164,7 +162,7 @@ class MainController:
             # Ao terminar, coleta arquivos e gera ETL automaticamente
             exp_id = self._read_exp_id_from_yaml(self.current_yaml_path)
             self.append_log(f"[Harvest] Iniciando coleta/ETL do experimento: {exp_id}")
-            self._spawn_harvest(exp_id)
+            # self._spawn_harvest(exp_id)
         except Exception as e:
             self.append_log(f"[WARN] _on_ds_finished: {e}")
 

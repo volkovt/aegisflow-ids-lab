@@ -23,7 +23,7 @@ class OSWorker(QObject):
                 os_text = os_text.get("text", "—")
             self.done.emit(self.vm, (os_text or "—").strip())
         except Exception as e:
-            logger.warn(f"[ColetaSO] Erro em {self.vm}: {e}")
+            logger.warning(f"[ColetaSO] Erro em {self.vm}: {e}")
             self.done.emit(self.vm, "—")
 
 def refresh_os_async(self, vm_name: str):
@@ -43,7 +43,7 @@ def refresh_os_async(self, vm_name: str):
         worker.done.connect(worker.deleteLater)
         th.finished.connect(lambda: self._on_os_thread_finished(vm_name, th))
 
-        th.start(QThread.LowPriority)
+        th.start(QThread.TimeCriticalPriority)
 
         if hasattr(self, "_os_threads"):
             self._os_threads[vm_name] = th

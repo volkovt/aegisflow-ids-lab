@@ -1,56 +1,23 @@
-# ML IDS Lab — Experimento completo (scan + brute + DoS)
-# Uso exclusivo dentro do laboratório. Ajuste 'targets.victim_ip' se necessário.
-version: 1
-name: exp_all
-description: Varredura de serviços, força bruta HTTP e DoS controlado.
+exp_id: "EXP_ALL"
 targets:
-  victim_ip: "192.168.56.12"
+  victim_ip: "192.168.56.20"
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
-
-# Listas padrão para brute (serão usadas por passos customizados abaixo)
-brute:
-  users_inline: ["admin", "user", "test", "tcc"]
-  pass_inline: ["123456", "password", "tcc2025", "admin"]
-
+  zeek_rotate_seconds: 3600
 actions:
-  - name: custom
-    title: "Preparar listas de usuários/senhas"
-    description: "Gera ~/users.txt e ~/passwords.txt se não existirem."
-    command: |
-      set -e
-      test -f ~/users.txt     || printf "admin\nuser\ntest\ntcc\n" > ~/users.txt
-      test -f ~/passwords.txt || printf "123456\npassword\ntcc2025\nadmin\n" > ~/passwords.txt
-      wc -l ~/users.txt ~/passwords.txt
-
-  - name: nmap_scan
+  - name: "nmap_scan"
     params:
-      flags: "-sS -sV -T4 --open"
-      ports: "1-1024"
-      output: "~/exp_nmap/scan"
-
-  - name: Brute force HTTP (Hydra http-post-form)
-    host: attacker
-    shell: bash
-    cmd: |
-      set -euo pipefail
-      IP="192.168.56.12"  # ajuste aqui se necessário
-      mkdir -p ~/exp_brute
-      test -f ~/users.txt     || printf "admin\nuser\ntest\ntcc\n" > ~/users.txt
-      test -f ~/passwords.txt || printf "123456\npassword\nwrongpass\ntcc2025\n" > ~/passwords.txt
-      command -v hydra >/dev/null 2>&1 || { [ -x /usr/bin/hydra ] && sudo ln -sf /usr/bin/hydra /usr/local/bin/hydra || true; }
-
-      python3 -c 'import random,time; time.sleep(random.randint(60,180)/1000.0)'
-
-      hydra -L ~/users.txt -P ~/passwords.txt -s 80 -t 2 -f -I \
-        "$IP" http-post-form "/login:username=^USER^&password=^PASS^:F=Invalid" \
-        -o ~/exp_brute/hydra_http
-
-  - name: slowhttp_dos
+      output: "exp_scan.nmap"
+  - name: "hydra_brute"
     params:
-      port: 80
-      duration_s: 60
+      user: "tcc"
+      pass_list: ["123456", "wrongpass"]
+      output: "exp_brute.hydra"
+  - name: "slowhttp_dos"
+    params:
+      port: 8080
+      duration_s: 120
       concurrency: 400
-      rate: 50
-      output_prefix: "~/exp_dos/slowhttp"
+      rate: 150
+      output_prefix: "exp_dos"

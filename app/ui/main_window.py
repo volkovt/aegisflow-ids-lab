@@ -8,8 +8,7 @@ from PySide6.QtCore import Qt, Signal, QThread, QTimer, QSettings
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox, QPlainTextEdit,
-    QMainWindow, QFrame, QSizePolicy, QScrollArea, QLayout, QMessageBox, QFileDialog, QProgressBar, QToolButton,
-)
+    QMainWindow, QFrame, QSizePolicy, QScrollArea, QLayout, QMessageBox, QFileDialog, QProgressBar, )
 
 from app.core.logger_setup import setup_logger
 from app.core.config_loader import load_config
@@ -67,7 +66,7 @@ class MainWindow(QMainWindow):
         self.ssh = SSHManager(self.lab_dir)
         self.preflight = PreflightEnforcer(self.vagrant, self.lab_dir)
         try:
-            from app.core.dataset_controller import DatasetController
+            from app.ui.controllers.dataset_controller import DatasetController
         except Exception:
             raise ImportError("Módulos do DatasetController não encontrados em app/core/dataset_controller.py")
         self._ds_shim = UiRunnerShim(self.ssh, self.lab_dir, self.project_root, self.preflight, self._append_log)

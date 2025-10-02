@@ -49,7 +49,7 @@ def remove_attacker_egress_guard(ssh):
         _run(ssh, f"sudo iptables -X {CHAIN} 2>/dev/null || true", timeout=10)
         logger.info("[Safety] Egress guard removido.")
     except Exception as e:
-        logger.warn(f"[Safety] Falha ao remover egress guard: {e}")
+        logger.warning(f"[Safety] Falha ao remover egress guard: {e}")
 
 def toggle_attacker_nat(ssh, enable: bool, victim_ip: str = None, sensor_ip: str = None):
     """

@@ -1,37 +1,16 @@
-exp_id: EXP_SCAN_BRUTE
-name: Scan+Brute básico
-
+exp_id: "EXP_SCAN_BRUTE"
 targets:
-  victim_ip: 192.168.56.12
-  sensor: sensor
-  victim: victim
-  attacker: attacker
-
+  victim_ip: "192.168.56.20"
 capture:
   rotate_seconds: 300
   rotate_size_mb: 100
   zeek_rotate_seconds: 3600
-
 actions:
-  - name: nmap_scan
+  - name: "nmap_scan"
     params:
-      flags: "-sT -sV -Pn -T3 --open"
-      ports: "22,80,8081"
-      output: "~/exp_nmap/scan"
-
-  - name: hydra_brute
+      output: "exp_scan.nmap"
+  - name: "hydra_brute"
     params:
       user: "tcc"
-      pass_list: ["123456", "password", "tcc2025"]
-      threads: 2
-      output: "~/exp_brute/hydra_ssh.log"
-
-  # (Opcional) brute HTTP POST para gerar 401 e logs web:
-  # - name: hydra_http_post
-  #   params:
-  #     user: "webuser"
-  #     pass_list: "~/passwords.txt"
-  #     port: 8081
-  #     path: "/login"
-  #     extra: 'http-post-form "/login:username=^USER^&password=^PASS^:F=invalid:S=ok"'
-  #     output: "~/exp_brute/hydra_http.log"
+      pass_list: ["123456", "wrongpass"]
+      output: "exp_brute.hydra"
