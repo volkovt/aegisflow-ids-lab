@@ -1,5 +1,7 @@
 # lab/orchestrator/yaml_loader.py
 from __future__ import annotations
+
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,18 +57,44 @@ def _to_templates(obj: Dict[str, Any]) -> Dict[str, TemplateSpec]:
         )
     return out
 
-def _to_profiles(lst: List[Dict[str, Any]]) -> Dict[str, ProfileSpec]:
+
+def _to_profiles(obj: Any) -> Dict[str, ProfileSpec]:
     out: Dict[str, ProfileSpec] = {}
-    for p in (lst or []):
-        pid = str(p.get("id"))
-        if not pid:
-            logger.warning("[YAML] Profile sem 'id' ignorado.")
-            continue
-        out[pid] = ProfileSpec(
-            id=pid,
-            template=str(p.get("template") or ""),
-            params=(p.get("params") or {}) or {}
-        )
+    try:
+        if isinstance(obj, dict):
+            # aceita profiles como mapa: { brute_small: {id:..., template:..., params:...}, ... }
+            for key, val in (obj or {}).items():
+                pd = val or {}
+                pid = str(pd.get("id") or key)
+                if not pid:
+                    logger.warning("[YAML] Profile sem 'id' e sem chave, ignorado.")
+                    continue
+                out[pid] = ProfileSpec(
+                    id=pid,
+                    template=str(pd.get("template") or ""),
+                    params=(pd.get("params") or {}) or {}
+                )
+        elif isinstance(obj, list):
+            for p in (obj or []):
+                if not isinstance(p, dict):
+                    logger.warning(f"[YAML] Profile inválido (não-dict): {p!r}")
+                    continue
+                pid = str(p.get("id") or "")
+                if not pid:
+                    logger.warning("[YAML] Profile sem 'id' ignorado.")
+                    continue
+                out[pid] = ProfileSpec(
+                    id=pid,
+                    template=str(p.get("template") or ""),
+                    params=(p.get("params") or {}) or {}
+                )
+        elif obj is None:
+            return {}
+        else:
+            logger.error(f"[YAML] Campo 'profiles' com tipo inesperado: {type(obj).__name__}")
+    except Exception as e:
+        logger.error(f"[YAML] Falha ao processar 'profiles': {e}")
+        raise
     return out
 
 def _to_workflow(lst: List[Dict[str, Any]]) -> List[WorkflowStep]:
@@ -121,44 +149,109 @@ def load_experiment_from_yaml(path: str | Path) -> ExperimentSpec:
         logger.error(f"[YAML] Erro lendo YAML: {e}")
         raise
 
-def resolve_profile_command(
-    spec: ExperimentSpec,
-    profile_id: str,
-    ips: Dict[str, str],
-) -> Tuple[str, str, int]:
-    prof = spec.profiles.get(profile_id)
-    if not prof:
-        raise ValueError(f"Profile '{profile_id}' não encontrado.")
-    tmpl = spec.templates.get(prof.template)
-    if not tmpl:
-        raise ValueError(f"Template '{prof.template}' (do profile '{profile_id}') não encontrado.")
+def _join_shell_lines(script: str) -> str:
+    r"""
+    Junta linhas de shell sem corromper estruturas de controle.
+    Regras:
+      - NÃO insere ';' após abridores: do, then, else, elif, {, (
+      - Mantém conectores: &&, ||, |, &, \  (continuação)
+      - Normaliza padrões como '& ;' -> '& '
+    """
+    import logging
+    try:
+        lines = [ln.strip() for ln in (script or "")
+                 .replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                 if ln.strip()]
+        if not lines:
+            return ""
 
-    ctx: Dict[str, Any] = {}
+        openers = {"do", "then", "else", "elif", "{", "("}
+        connectors = ("&&", "||", "|", "\\")
+        res = lines[0]
+
+        for seg in lines[1:]:
+            prev = res.rstrip()
+            # último token "visível" do acumulado
+            tail_tokens = prev.replace(";", " ").split()
+            last = (tail_tokens[-1] if tail_tokens else "")
+
+            # regra do separador
+            sep = " ; "
+            if last in openers:
+                sep = " "                  # ex.: '... do ' + 'curl ...'
+            elif (prev.endswith('&') and not prev.endswith('&&')) or \
+                 any(prev.endswith(t) for t in connectors) or \
+                 prev.endswith(("{", "(")):
+                sep = " "                  # ex.: 'cmd &&' + 'next', '\' + 'next'
+
+            res = f"{prev}{sep}{seg}"
+
+        # limpeza de artefatos comuns
+        res = res.replace("& ;", "& ")
+        return res
+    except Exception as e:
+        logger = logging.getLogger("[YamlLoader]")
+        logger.warning(f"[YAML] _join_shell_lines falhou: {e}")
+        return script or ""
+
+
+
+def resolve_profile_command(spec: ExperimentSpec, profile_id: str, ips: Dict[str, str]) -> tuple[str, str, int]:
+    """
+    Monta o comando final de um profile:
+    - Preenche template com params + gvars + IPs (victim/attacker/sensor)
+    - Normaliza em uma única linha
+    - Envolve com 'bash -lc' (para built-ins como 'set -e')
+    - Aplica 'timeout <duration>' se houver
+    Retorna: (run_on, cmd_final, ssh_timeout)
+    """
+    if profile_id not in spec.profiles:
+        raise ValueError(f"Profile '{profile_id}' não encontrado.")
+
+    prof = spec.profiles[profile_id]
+    tmpl_id = prof.template
+    if tmpl_id not in spec.templates:
+        raise ValueError(f"Template '{tmpl_id}' não encontrado para o profile '{profile_id}'.")
+
+    tmpl = spec.templates[tmpl_id]
+
+    # Contexto para format()
+    ctx = {}
     ctx.update(spec.gvars or {})
-    ctx.update(_flatten("experiment", spec.experiment or {}))
-    ctx.update(prof.params or {})
     ctx.update({
-        "victim":   ips.get("victim", ""),
-        "attacker": ips.get("attacker", ""),
-        "sensor":   ips.get("sensor", ""),
+        "victim":   (ips or {}).get("victim", ""),
+        "attacker": (ips or {}).get("attacker", ""),
+        "sensor":   (ips or {}).get("sensor", "")
     })
 
-    cmd = _safe_format(tmpl.cmd_template, ctx).strip()
-    # normaliza CRLF -> LF para evitar surpresas no host remoto
-    cmd = cmd.replace("\r\n", "\n").replace("\r", "\n")
+    # Render do template
+    raw_cmd = tmpl.cmd_template or ""
+    try:
+        rendered = _safe_format(raw_cmd, {**(prof.params or {}), **ctx})
+    except Exception as e:
+        logger.error(f"[YAML] falha no format do profile '{profile_id}': {e}")
+        raise
 
+    # Uma linha para shell
+    cmd_one_line = _join_shell_lines(rendered)
+
+    # Executa com shell explícito
+    shell_wrapped = f"bash -lc {shlex.quote(cmd_one_line)}"
+
+    # Timeout externo
     duration = None
     try:
-        if "duration_s" in prof.params:
+        if "duration_s" in (prof.params or {}):
             duration = int(prof.params["duration_s"])
     except Exception:
         duration = None
 
-    if duration and "{duration_s}" not in tmpl.cmd_template and not cmd.startswith("timeout "):
-        cmd = f"timeout {duration} {cmd}"
+    if duration and not shell_wrapped.startswith("timeout "):
+        shell_wrapped = f"timeout {duration} {shell_wrapped}"
 
-    ssh_timeout = max(30, int(duration) + 30) if duration else int(spec.gvars.get("max_duration_s") or 900)
+    # ssh_timeout coerente
+    ssh_timeout = max(30, int(duration) + 30) if duration else int((spec.gvars or {}).get("max_duration_s") or 900)
     run_on = tmpl.run_on or "attacker"
 
-    logger.info(f"[YAML] profile={profile_id} run_on={run_on} ssh_timeout={ssh_timeout}s cmd_len={len(cmd)}")
-    return run_on, cmd, ssh_timeout
+    logger.info(f"[YAML] profile={profile_id} run_on={run_on} ssh_timeout={ssh_timeout}s cmd_len={len(shell_wrapped)}")
+    return run_on, shell_wrapped, ssh_timeout

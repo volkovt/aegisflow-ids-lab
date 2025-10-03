@@ -1,5 +1,12 @@
 from __future__ import annotations
+
+import base64
+import io
+import json
+import shlex
+import tarfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 import logging
@@ -20,23 +27,11 @@ class ExperimentRunner:
     def __init__(self, ssh_manager: SSHManager, lab_dir: Path):
         self.ssh = ssh_manager
         self.lab_dir = Path(lab_dir)
+        self.timeline: list[dict] = []
 
     # -----------------------
     # Utilidades internas
     # -----------------------
-    def _guest_ip(self, name: str) -> str:
-        try:
-            script = r"""
-                set -e
-                ips=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1)
-                echo "$ips" | awk '/^192\.168\.56\./{print; found=1} END{ if(!found && NR>0) print $1 }' | head -n1
-            """
-            out = (self.ssh.run_command(name, script, timeout=25) or "").strip()
-            return out
-        except Exception as e:
-            logger.warning(f"[Runner] guest_ip({name}) falhou: {e}")
-            return ""
-
     def _resolve_ips(self, spec: ExperimentSpec) -> Dict[str, str]:
         ips: Dict[str, str] = {}
         for role in ("attacker", "victim", "sensor"):
@@ -50,6 +45,75 @@ class ExperimentRunner:
         if mode != "host_only":
             raise RuntimeError("network.mode != host_only — abortando por segurança.")
         logger.info("[Runner] network.mode OK (host_only).")
+
+    def _guest_ip(self, name: str) -> str:
+        try:
+            script = r"""
+                set -e
+                ips=$(ip -o -4 addr show scope global | awk '{print $4}' | cut -d/ -f1)
+                echo "$ips" | awk '/^192\.168\.56\./{print; found=1} END{ if(!found && NR>0) print $1 }' | head -n1
+            """.strip().replace("\n", "; ")
+            wrapped = f"bash -lc {shlex.quote(script)}"
+            out = (self.ssh.run_command(name, wrapped, timeout=25) or "").strip()
+            return out
+        except Exception as e:
+            logger.warning(f"[Runner] guest_ip({name}) falhou: {e}")
+            return ""
+
+    def _pull_tree_b64(self, host: str, remote_dir: str, includes: list[str], local_dst: Path, timeout: int = 180):
+        try:
+            local_dst.mkdir(parents=True, exist_ok=True)
+            inc = " ".join([f"\"{x}\"" for x in (includes or [])]) if includes else "."
+
+            # Monta o script SEM adicionar ';' em duplicidade.
+            script_lines = [
+                "set -e",
+                "set -o pipefail",
+                f'REMOTEDIR="{remote_dir}"',
+                'if [ -d "$REMOTEDIR" ]; then cd "$REMOTEDIR";',
+                'elif [ -d "$HOME/tcc" ]; then cd "$HOME/tcc";',
+                'elif [ -d "/home/vagrant/tcc" ]; then cd "/home/vagrant/tcc";',
+                'elif [ -d "/tmp/tcc" ]; then cd "/tmp/tcc";',
+                'else echo "::EMPTY::"; exit 0; fi',
+                f'tar -czf - {inc} 2>/dev/null | (base64 -w0 2>/dev/null || base64)'
+            ]
+
+            # Junta com '; ' garantindo que não criamos ';;'
+            script = "; ".join([ln.rstrip("; ") for ln in script_lines])
+
+            wrapped = f"bash -lc {shlex.quote(script)}"
+            logger.info(f"[Runner] pull {host}:{remote_dir} -> {local_dst}")
+
+            b64 = self.ssh.run_command(host, wrapped, timeout=timeout) or ""
+            if not b64.strip() or b64.strip() == "::EMPTY::":
+                logger.warning(f"[Runner] nada para copiar de {host}:{remote_dir} (diretório remoto vazio/inexistente)")
+                return
+
+            data = base64.b64decode(b64.encode("utf-8"))
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+                tf.extractall(local_dst)
+
+            logger.info(f"[Runner] ok: {local_dst}")
+        except Exception as e:
+            logger.error(f"[Runner] falha no pull {host}:{remote_dir} -> {local_dst}: {e}")
+
+    def _write_metadata_and_timeline(self, out_base: Path, ips: dict, stages: list[dict]):
+        try:
+            meta = {
+                "targets": {
+                    "attacker_ip": ips.get("attacker", ""),
+                    "victim_ip": ips.get("victim", ""),
+                    "scan_ports": [22, 80, 8081]
+                },
+                "timeline": {"stages": stages},
+                "generated_at": datetime.now(timezone.utc).isoformat()
+            }
+            (out_base / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            # timeline.json é útil para ETL relabel
+            (out_base / "timeline.json").write_text(json.dumps({"stages": stages}, indent=2), encoding="utf-8")
+            logger.info(f"[Runner] metadata/timeline escritos em {out_base}")
+        except Exception as e:
+            logger.warning(f"[Runner] metadata/timeline: {e}")
 
     # -----------------------
     # ETL acoplado ao Runner
@@ -80,7 +144,7 @@ class ExperimentRunner:
 
             # 1) Pré-ETL (janelas agregadas por conn.log, com timeline/heurística)
             try:
-                out_csv = generate_conn_features(exp_dir, window_s=60)
+                out_csv = generate_conn_features(exp_dir, window_s=int(getattr(self, "pre_etl_window_s", 60)))
                 logger.info(f"[ETL] Pré-ETL ok: {out_csv}")
             except Exception as e:
                 logger.warning(f"[ETL] Pré-ETL falhou (seguindo para ETL direto do Zeek): {e}")
@@ -106,6 +170,12 @@ class ExperimentRunner:
         exp_id = str((spec.experiment or {}).get("id") or "EXP")
         out_base = Path(out_dir) / exp_id
         out_base.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self.pre_etl_window_s = int((spec.gvars or {}).get("pre_etl_window_s", 60))
+            logger.info(f"[Runner] pre_etl_window_s={self.pre_etl_window_s}")
+        except Exception:
+            self.pre_etl_window_s = 60
 
         sensor = SensorAgent(self.ssh, "sensor")
         attacker = AttackExecutor(self.ssh)
@@ -161,22 +231,49 @@ class ExperimentRunner:
                     if "run_profile" in action:
                         profile_id = str(action["run_profile"].get("profile_id"))
                         host, cmd, ssh_timeout = resolve_profile_command(spec, profile_id, ips)
-                        logger.info(f"[Runner] run_profile={profile_id} on={host}\n---PROFILE CMD---\n{cmd}\n---END PROFILE CMD---")
-                        attacker.run_cmd(host, cmd, timeout=ssh_timeout)
+                        tmpl_id = spec.profiles[profile_id].template
+                        tmpl = spec.templates.get(tmpl_id)
+                        label_base = (tmpl.label if tmpl and getattr(tmpl, "label", None) else f"profile_{profile_id}")
 
-                        # verificação leve de saída Hydra (se nosso template padrão foi usado)
+                        logger.info(
+                            f"[Runner] run_profile={profile_id} on={host}\n---PROFILE CMD---\n{cmd}\n---END PROFILE CMD---")
+
+                        t_start = datetime.now(timezone.utc).isoformat()
+                        attacker.run_cmd(host, cmd, timeout=ssh_timeout)
+                        t_end = datetime.now(timezone.utc).isoformat()
+
+                        # timeline com base no label do template (sem forçar "Hydra" para tudo)
+                        # Adiciona estágios no timeline com rótulo do template e, quando aplicável, um token padronizado
+                        token = None
                         try:
-                            local_lists = str((spec.gvars or {}).get("local_lists") or "$HOME/tcc/lists")
-                            vic_ip = ips.get("victim", "")
-                            verify = (
-                                f'test -s "{local_lists}/hydra_{vic_ip}.out" '
-                                f'&& echo "[verify] hydra output ok: {local_lists}/hydra_{vic_ip}.out" '
-                                f'|| echo "[verify] hydra output MISSING"; '
-                                f'tail -n 20 "{local_lists}/hydra_{vic_ip}.out" 2>/dev/null || true'
-                            )
-                            attacker.run_cmd(host, verify, timeout=20)
+                            if ("Hydra" in label_base) or profile_id.lower().startswith("hydra"):
+                                token = "HydraBruteAction"
+                            elif ("Nmap" in label_base) or profile_id.lower().startswith("nmap"):
+                                token = "NmapScanAction"
+                        except Exception:
+                            token = None
+
+                        base_stage = label_base if label_base else f"profile_{profile_id}"
+                        self.timeline.append({"stage": f"{base_stage}_start", "ts": t_start})
+                        self.timeline.append({"stage": f"{base_stage}_end", "ts": t_end})
+                        if token:
+                            self.timeline.append({"stage": f"{token}_start", "ts": t_start})
+                            self.timeline.append({"stage": f"{token}_end", "ts": t_end})
+# verificação do Hydra apenas quando for Hydra
+                        try:
+                            is_hydra = ("Hydra" in label_base) or profile_id.lower().startswith("hydra")
+                            if is_hydra:
+                                local_lists = str((spec.gvars or {}).get("local_lists") or "$HOME/tcc/lists")
+                                vic_ip = ips.get("victim", "")
+                                verify = (
+                                    f'test -s "{local_lists}/hydra_{vic_ip}.out" '
+                                    f'&& echo "[verify] hydra output ok: {local_lists}/hydra_{vic_ip}.out" '
+                                    f'|| echo "[verify] hydra output MISSING"; '
+                                    f'tail -n 20 "{local_lists}/hydra_{vic_ip}.out" 2>/dev/null || true'
+                                )
+                                attacker.run_cmd(host, verify, timeout=20)
                         except Exception as e:
-                            logger.warning(f"[Runner] verificação do hydra out falhou: {e}")
+                            logger.warning(f"[Runner] verificação do hydra out falhou/ignorada: {e}")
                         continue
 
                     # --- coleta ---
@@ -186,7 +283,7 @@ class ExperimentRunner:
                         except Exception as e:
                             logger.warning(f"[Runner] snapshot: {e}")
 
-                        # Manifesto do experimento
+                        # Manifesto
                         manifest = out_base / "manifest.txt"
                         manifest.write_text(
                             f"exp_id={exp_id}\nips={ips}\nstarted={t0}\nended={time.time()}\n",
@@ -194,19 +291,58 @@ class ExperimentRunner:
                         )
                         logger.info(f"[Runner] manifest: {manifest}")
 
+                        # === NOVO: copiar artefatos das VMs ===
+                        # Sensor: Zeek e PCAP (onde o sensor grava por padrão)
+                        self._pull_tree_b64("sensor", "$HOME/tcc", ["zeek", "pcap", "run"], out_base / "sensor")
+                        # Attacker: saída do Hydra (se existir)
+                        try:
+                            vic_ip = ips.get("victim", "")
+                            self._pull_tree_b64("attacker", "$HOME/tcc",
+                                                [f"lists/hydra_{vic_ip}.out", "lists/users.txt",
+                                                 "lists/small_wordlist.txt"], out_base / "attacker")
+                        except Exception as e:
+                            logger.warning(f"[Runner] hydra logs: {e}")
+                        # Victim: auth.log para reforçar brute/ssh
+                        try:
+                            self._pull_tree_b64("victim", "/var/log", ["auth.log", "auth.log.1"], out_base / "victim")
+                        except Exception as e:
+                            logger.warning(f"[Runner] auth.log: {e}")
+
+                        # === NOVO: metadata/timeline para pré-ETL/ETL ===
+                        self._write_metadata_and_timeline(out_base, ips, self.timeline)
+
                         # ETL acoplado (gera datasets prontos em data/etl/<exp_id>/)
                         if run_pre_etl:
-                            etl_root = Path(out_dir).parent / "lab" / "etl"
+                            # padronize a raiz de saída do ETL (use 'data/etl', não 'data/lab/etl')
+                            etl_root = Path(out_dir).parent / "etl"
                             try:
                                 etl_path = self._run_etl(out_base, etl_root)
-                                etl_executado = etl_path is not None
-                                if etl_executado:
+                                if etl_path:
                                     logger.info(f"[Runner] ETL pronto em {etl_path}")
+                                try:
+                                    import json
+                                    meta = Path(etl_path) / "meta" / "label_counts.json"
+                                    if meta.exists():
+                                        counts = json.loads(meta.read_text(encoding="utf-8"))
+                                        logger.info(f"[Runner] Labels finais: {counts}")
+                                except Exception as _e:
+                                    logger.warning(f"[Runner] Falha lendo label_counts.json: {_e}")
                                 else:
-                                    logger.warn("[Runner] ETL não produziu saída (veja logs acima).")
+                                    logger.warning("[Runner] ETL não produziu saída (veja logs acima).")
                             except Exception as e:
                                 logger.error(f"[Runner] ETL falhou: {e}")
-                                etl_executado = False
+                        continue
+
+                    if "wait_seconds" in action:
+                        try:
+                            secs = int(action["wait_seconds"].get("seconds", 15))
+                        except Exception:
+                            secs = 15
+                        logger.info(f"[Runner] aguardando {secs}s para consolidar logs…")
+                        try:
+                            time.sleep(secs)
+                        except Exception as e:
+                            logger.warning(f"[Runner] falha ao aguardar: {e}")
                         continue
 
                     # --- cmd arbitrário pelo YAML (debug/etc) ---
@@ -243,6 +379,7 @@ class ExperimentRunner:
                 (out_base / "_runner_done.txt").write_text(f"{status} {time.time()}", encoding="utf-8")
             except Exception:
                 logger.warning("[Runner] não foi possível criar marker final.")
+
 
             # Se o usuário desabilitar o run_pre_etl no futuro, ainda oferecemos um ETL ao final
             if (err is None) and (not etl_executado) and run_pre_etl:

@@ -57,69 +57,153 @@
 #      - collect_artifacts: { save_to: "experiments/{experiment.id}" }
 
 experiment:
-  id: exp_hydra_ssh
-  description: "Hydra contra SSH (victim). IPs por papel são resolvidos pelo Runner."
-  created_by: "diego"
-  created_at: "2025-09-30T22:00:00-03:00"
+  id: exp_hydra_sweep
 
 network:
   mode: host_only
-  ntp_sync: true
+
+targets:
+  attacker: {}
+  victim: {}
+  sensor: {}
 
 global:
   max_duration_s: 900
-  wordlists_dir: "/vagrant/wordlists"     # se existir, faremos staging a partir daqui
-  local_lists: "$HOME/tcc/lists"          # staging local no attacker
-  hydra_wait: 120
-
-targets:
-  attacker: { role: attacker }
-  victim:   { role: victim }
-  sensor:   { role: sensor }
+  pre_etl_window_s: 90
+  local_lists: "$HOME/tcc/lists"
 
 templates:
-  # Template do Hydra propositalmente simples (1 linha) para evitar CRLF.
+  wait_http:
+    run_on: attacker
+    label: benign_WaitHttp
+    cmd_template: |
+      set -e
+      for i in $(seq 1 20); do
+        curl -s "http://{victim}:8081/" >/dev/null 2>&1 && echo "HTTP OK" && exit 0
+        sleep 0.5
+      done
+      echo "HTTP indisponível em 10s"; exit 1
+
   hydra_ssh:
     run_on: attacker
-    cmd_template: "hydra -L {local_lists}/users.txt -P {local_lists}/small_wordlist.txt -t {threads} ssh://{victim}:22 -w {hydra_wait} -o {local_lists}/hydra_{victim}.out"
-    label: brute_ssh
-    metadata: { tool: hydra, category: brute_force }
+    label: attack_HydraBruteAction
+    cmd_template: |
+      set -e
+      mkdir -p "$HOME/tcc/lists"
+      test -s "$HOME/tcc/lists/users.txt" || echo "vagrant" > "$HOME/tcc/lists/users.txt"
+      test -s "$HOME/tcc/lists/small_wordlist.txt" || echo "vagrant" > "$HOME/tcc/lists/small_wordlist.txt"
+      echo "[hydra] iniciando: users=$HOME/tcc/lists/{users} passlist=$HOME/tcc/lists/{passlist} threads={threads}"
+      hydra -I -V -L "$HOME/tcc/lists/{users}" -P "$HOME/tcc/lists/{passlist}" -t {threads} -o "$HOME/tcc/lists/hydra_{victim}.out" ssh://{victim}:22
+
+  http_server:
+    run_on: victim
+    label: benign_HttpServer
+    cmd_template: |
+      set -e
+      nohup python3 -m http.server 8081 >/tmp/http.out 2>&1 &
+      echo "[httpd] iniciado em :8081"
+
+  http_client_noise:
+    run_on: attacker
+    label: benign_HttpNoiseAction
+    cmd_template: |
+      set -e
+      for i in $(seq 1 {http_reqs}); do
+        curl -m {curl_timeout_s} -s "http://{victim}:8081/?q=$i" >/dev/null || true
+        sleep {http_sleep}
+      done
+      echo "[http] noise concluído: {http_reqs} reqs"
+
+  nmap_syn:
+    run_on: attacker
+    label: attack_SynScan
+    cmd_template: |
+      set -e
+      nmap -Pn -sS -p 1-1024 -T4 {victim} -oN "$HOME/tcc/nmap_{victim}_syn.txt" || true
+      tail -n 5 "$HOME/tcc/nmap_{victim}_syn.txt" || true
 
 profiles:
-  - id: brute_small
+  wait_http:
+    id: wait_http
+    template: wait_http
+
+  brute_small:
+    id: brute_small
     template: hydra_ssh
     params:
+      users: "users.txt"
+      passlist: "small_wordlist.txt"
       threads: 4
-      duration_s: 120       # Runner adiciona 'timeout 120' no começo do cmd
+      duration_s: 120
+
+  brute_heavy:
+    id: brute_heavy
+    template: hydra_ssh
+    params:
+      users: "users.txt"
+      passlist: "small_wordlist.txt"
+      threads: 8
+      duration_s: 180
+
+  http_server:
+    id: http_server
+    template: http_server
+
+  http_noise_fast:
+    id: http_noise_fast
+    template: http_client_noise
+    params:
+      http_reqs: 120
+      http_sleep: 0.05
+      curl_timeout_s: 2
+      duration_s: 30
+
+  http_noise_slow:
+    id: http_noise_slow
+    template: http_client_noise
+    params:
+      http_reqs: 60
+      http_sleep: 0.25
+      curl_timeout_s: 1
+      duration_s: 50
+
+  syn_scan:
+    id: syn_scan
+    template: nmap_syn
+    params: {}
 
 workflow:
   - name: safety
     actions:
       - ensure_network_mode: {}
       - resolve_ips: {}
-      - start_sensor: { target: sensor }
 
-  - name: stage_lists
+  - name: start
     actions:
-      - run_cmd:
-          host: attacker
-          cmd: >
-            set -e;
-            mkdir -p {local_lists};
-            if [ -f "{wordlists_dir}/users.txt" ]; then cp -f "{wordlists_dir}/users.txt" "{local_lists}/"; fi;
-            if [ -f "{wordlists_dir}/small_wordlist.txt" ]; then cp -f "{wordlists_dir}/small_wordlist.txt" "{local_lists}/"; fi;
-            [ -s "{local_lists}/users.txt" ] || printf "vagrant\nroot\nubuntu\n" > "{local_lists}/users.txt";
-            [ -s "{local_lists}/small_wordlist.txt" ] || printf "vagrant\n123456\nadmin\npassword\n" > "{local_lists}/small_wordlist.txt";
-            ls -lh {local_lists}; head -n 5 {local_lists}/users.txt; head -n 5 {local_lists}/small_wordlist.txt
+      - start_sensor: {}
+      - run_profile: { profile_id: http_server }
+      - run_profile: { profile_id: wait_http }
+      - wait_seconds: { seconds: 1 }
 
-  - name: attack
+  - name: warmup_benign
+    actions:
+      - run_profile: { profile_id: http_noise_fast }
+      - wait_seconds: { seconds: 5 }
+
+  - name: attack_hydra
     actions:
       - run_profile: { profile_id: brute_small }
+      - wait_seconds: { seconds: 5 }
 
-  - name: collect
+  - name: post_noise
     actions:
-      - stop_sensor: { target: sensor }
-      - collect_artifacts: { save_to: "experiments/{experiment.id}" }
+      - run_profile: { profile_id: http_noise_slow }
+      - wait_seconds: { seconds: 5 }
+
+  - name: finalize
+    actions:
+      - collect_artifacts: {}
+      - stop_sensor: {}
 
 
   # (Opcional) Passo de debug para inspecionar listas no atacante
