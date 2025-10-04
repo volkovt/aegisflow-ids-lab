@@ -1,61 +1,3 @@
-##exp_hydra_sweep.yaml
-#experiment:
-#  id: exp_hydra_single
-#  description: "Execução única: hydra contra serviço SSH do victim. Runner resolve IPs por papel."
-#  created_by: "diego"
-#  created_at: "2025-09-30T22:00:00-03:00"
-#
-#network:
-#  mode: host_only          # Runner fará preflight e recusará outro modo por segurança
-#  ntp_sync: true
-#
-#global:
-#  repetitions: 1
-#  seed: 20250930
-#  max_duration_s: 900
-#
-#targets:
-#  # O usuário informa apenas os papéis; o runner resolve os IPs automaticamente.
-#  attacker: { role: attacker }
-#  victim:   { role: victim }
-#  sensor:   { role: sensor }
-#
-#templates:
-#  hydra_brute:
-#    run_on: attacker
-#    # cmd_template deve conter placeholders: {victim}, {victim_port}, {wordlist}, {concurrency}
-#    cmd_template: "hydra -L users.txt -P {wordlist} -t {concurrency} ssh://{victim}:{victim_port} -w {timeout_s}"
-#    label: brute_ssh
-#    metadata:
-#      tool: hydra
-#      category: brute_force
-#
-#profiles:
-#  - id: default_hydra
-#    template: hydra_brute
-#    params:
-#      victim_port: 22
-#      wordlist: small_wordlist.txt
-#      concurrency: 4
-#      timeout_s: 120
-#      duration_s: 120     # duração esperada da ação (runner deve impor timeout)
-#
-#workflow:
-#  - name: preflight_checks
-#    actions:
-#      - ensure_network_mode: {}
-#      - resolve_ips: {}
-#      - start_sensor: { target: sensor }
-#
-#  - name: execute_hydra
-#    actions:
-#      - run_profile: { profile_id: default_hydra }
-#
-#  - name: post_actions
-#    actions:
-#      - stop_sensor: { target: sensor }
-#      - collect_artifacts: { save_to: "experiments/{experiment.id}" }
-
 experiment:
   id: exp_hydra_sweep
 
@@ -133,8 +75,8 @@ profiles:
     params:
       users: "users.txt"
       passlist: "small_wordlist.txt"
-      threads: 4
-      duration_s: 120
+      threads: 8
+      duration_s: 300     # antes: 120
 
   brute_heavy:
     id: brute_heavy
@@ -142,8 +84,8 @@ profiles:
     params:
       users: "users.txt"
       passlist: "small_wordlist.txt"
-      threads: 8
-      duration_s: 180
+      threads: 12
+      duration_s: 420     # antes: 180
 
   http_server:
     id: http_server
@@ -170,7 +112,8 @@ profiles:
   syn_scan:
     id: syn_scan
     template: nmap_syn
-    params: {}
+    params:
+      duration_s: 45
 
 workflow:
   - name: safety
@@ -190,20 +133,22 @@ workflow:
       - run_profile: { profile_id: http_noise_fast }
       - wait_seconds: { seconds: 5 }
 
+  - name: pre_attack_scan
+    actions:
+      - run_profile: { profile_id: syn_scan }
+      - wait_seconds: { seconds: 3 }
+
   - name: attack_hydra
     actions:
       - run_profile: { profile_id: brute_small }
+      - wait_seconds: { seconds: 3 }
+      - run_profile: { profile_id: brute_heavy }
       - wait_seconds: { seconds: 5 }
 
   - name: post_noise
     actions:
       - run_profile: { profile_id: http_noise_slow }
       - wait_seconds: { seconds: 5 }
-
-  - name: finalize
-    actions:
-      - collect_artifacts: {}
-      - stop_sensor: {}
 
 
   # (Opcional) Passo de debug para inspecionar listas no atacante

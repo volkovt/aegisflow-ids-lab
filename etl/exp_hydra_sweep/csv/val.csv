@@ -1,2 +1,2 @@
 bytes_fwd,bytes_rev,bytes_total,bytes_ratio,pkts_fwd,pkts_rev,pkts_total,pkts_ratio,duration,proto,sport,dport,service,label
-0,0,0,0,0,0,0,0,0,0,0,0,,brute_ssh
+0,0,0,0,0,0,0,0,0,0,0,0,,benign
