@@ -1,107 +1,150 @@
 # Arquivo gerado automaticamente — NÃO editar manualmente (edite config.yaml)
 Vagrant.configure("2") do |config|
   config.vm.box_check_update = true
+  # Evita regenerar chaves e mudanças desnecessárias no SSH
+  config.ssh.insert_key = false
 
-  # escopo global do provider (mantém GUI off)
+  # Escopo global do provider (mantém GUI off)
   config.vm.provider "virtualbox" do |vb|
     vb.gui = false
   end
 
+  # Desativa o /vagrant padrão (usaremos apenas os synced_folders declarados por VM)
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
   
-    config.vm.define "attacker" do |attacker|
-      attacker.vm.box = "kalilinux/rolling"
-      attacker.vm.hostname = "attacker.local"
+  config.vm.define "attacker" do |attacker|
+    attacker.vm.box = "kalilinux/rolling"
+    attacker.vm.hostname = "attacker.local"
 
-      attacker.vm.provider "virtualbox" do |vb|
-        vb.memory = 3072
-        vb.cpus   = 2
-        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
-        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
-      end
+    # Recursos por VM
+    attacker.vm.provider "virtualbox" do |vb|
+      vb.memory = 3072
+      vb.cpus   = 2
 
-      # Network (Host-Only) = adaptador 2 na VM VirtualBox
-      attacker.vm.network "private_network", ip: "192.168.56.11"
-
+      # Garante que a NIC2 (host-only) aceite quadros de todos (sensor precisa disso).
+      # Se quiser limitar, defina m.promisc=false no contexto.
       
-      
-      attacker.vm.synced_folder "./shared/attacker", "/opt/shared", create: true
-      
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
       
 
-      
-      
-      attacker.vm.provision "shell", inline: <<-SHELL
-    sudo apt-get update -y
+      # Evita "cabo desconectado" na NIC2 em alguns hosts
+      vb.customize ["modifyvm", :id, "--cableconnected2", "on"]
+    end
+
+    # Network:
+    # - NIC1 (default) = NAT (internet) — Vagrant cria por padrão.
+    # - NIC2 = Host-Only na sub-rede ip_base (ex.: 192.168.56.X)
+    #   -> essencial para attacker/victim/sensor se verem e para o Zeek capturar.
+    attacker.vm.network "private_network",
+      ip: "192.168.56.11"
+
+    
+    
+    attacker.vm.synced_folder "./shared/attacker", "/opt/shared", create: true
+    
+    attacker.vm.synced_folder "./data", "/vagrant/data", create: true
+    
+    
+
+    
+    
+    attacker.vm.provision "shell", inline: <<-SHELL
+sudo apt-get update -y
       sudo apt-get install -y nmap hping3 slowhttptest
 
-      SHELL
-      
-      
-    end
+    SHELL
     
-    config.vm.define "victim" do |victim|
-      victim.vm.box = "bento/ubuntu-20.04"
-      victim.vm.hostname = "victim.local"
+    
+  end
+  
+  config.vm.define "victim" do |victim|
+    victim.vm.box = "bento/ubuntu-20.04"
+    victim.vm.hostname = "victim.local"
 
-      victim.vm.provider "virtualbox" do |vb|
-        vb.memory = 2048
-        vb.cpus   = 2
-        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
-        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
-      end
+    # Recursos por VM
+    victim.vm.provider "virtualbox" do |vb|
+      vb.memory = 2048
+      vb.cpus   = 2
 
-      # Network (Host-Only) = adaptador 2 na VM VirtualBox
-      victim.vm.network "private_network", ip: "192.168.56.12"
-
+      # Garante que a NIC2 (host-only) aceite quadros de todos (sensor precisa disso).
+      # Se quiser limitar, defina m.promisc=false no contexto.
       
-      
-      victim.vm.synced_folder "./shared/victim", "/opt/shared", create: true
-      
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
       
 
-      
-      
-      victim.vm.provision "shell", inline: <<-SHELL
-    sudo apt-get update -y
+      # Evita "cabo desconectado" na NIC2 em alguns hosts
+      vb.customize ["modifyvm", :id, "--cableconnected2", "on"]
+    end
+
+    # Network:
+    # - NIC1 (default) = NAT (internet) — Vagrant cria por padrão.
+    # - NIC2 = Host-Only na sub-rede ip_base (ex.: 192.168.56.X)
+    #   -> essencial para attacker/victim/sensor se verem e para o Zeek capturar.
+    victim.vm.network "private_network",
+      ip: "192.168.56.12"
+
+    
+    
+    victim.vm.synced_folder "./shared/victim", "/opt/shared", create: true
+    
+    
+
+    
+    
+    victim.vm.provision "shell", inline: <<-SHELL
+sudo apt-get update -y
       sudo apt-get install -y apache2
       sudo systemctl enable --now apache2
 
-      SHELL
-      
-      
-    end
+    SHELL
     
-    config.vm.define "sensor" do |sensor|
-      sensor.vm.box = "bento/ubuntu-20.04"
-      sensor.vm.hostname = "sensor.local"
+    
+  end
+  
+  config.vm.define "sensor" do |sensor|
+    sensor.vm.box = "bento/ubuntu-20.04"
+    sensor.vm.hostname = "sensor.local"
 
-      sensor.vm.provider "virtualbox" do |vb|
-        vb.memory = 2048
-        vb.cpus   = 2
-        # >>> permite que a NIC 2 (host-only) entre em modo promíscuo e receba quadros de todos
-        vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
-      end
+    # Recursos por VM
+    sensor.vm.provider "virtualbox" do |vb|
+      vb.memory = 2048
+      vb.cpus   = 2
 
-      # Network (Host-Only) = adaptador 2 na VM VirtualBox
-      sensor.vm.network "private_network", ip: "192.168.56.13"
-
+      # Garante que a NIC2 (host-only) aceite quadros de todos (sensor precisa disso).
+      # Se quiser limitar, defina m.promisc=false no contexto.
       
-      
-      sensor.vm.synced_folder "./shared/sensor", "/opt/shared", create: true
-      
+      vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
       
 
-      
-      
-      sensor.vm.provision "shell", inline: <<-SHELL
-    sudo apt-get update -y
+      # Evita "cabo desconectado" na NIC2 em alguns hosts
+      vb.customize ["modifyvm", :id, "--cableconnected2", "on"]
+    end
+
+    # Network:
+    # - NIC1 (default) = NAT (internet) — Vagrant cria por padrão.
+    # - NIC2 = Host-Only na sub-rede ip_base (ex.: 192.168.56.X)
+    #   -> essencial para attacker/victim/sensor se verem e para o Zeek capturar.
+    sensor.vm.network "private_network",
+      ip: "192.168.56.13"
+
+    
+    
+    sensor.vm.synced_folder "./shared/sensor", "/opt/shared", create: true
+    
+    sensor.vm.synced_folder "./data", "/vagrant/data", create: true
+    
+    
+
+    
+    
+    sensor.vm.provision "shell", inline: <<-SHELL
+sudo apt-get update -y
       sudo apt-get install -y zeek tcpdump python3-pip
       sudo pip3 install nfstream
-      SHELL
-      
-      
-    end
+    SHELL
     
+    
+  end
+  
 end

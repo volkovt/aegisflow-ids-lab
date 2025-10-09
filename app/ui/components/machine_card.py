@@ -8,6 +8,8 @@ MachineCard (Matrix Edition 2.2)
 - Pills informativas com elipse + tooltip
 """
 import logging
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QTimer
 from PySide6.QtGui import QAction, QFontMetrics, QPixmap, QColor
 from PySide6.QtWidgets import (
@@ -15,15 +17,13 @@ from PySide6.QtWidgets import (
     QSizePolicy
 )
 
+from app.core.logger_setup import setup_logger
 from app.ui.components.anim_utils import HoverGlowFilter, crossfade_label_pixmap
 from app.ui.components.machine_avatar import MachineAvatarExt, ICONS
 from app.ui.components.flow_layout import FlowLayout
 from app.ui.components.info_pills import InfoPill
 
-logger = logging.getLogger("[MachineCardExt]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
-
+logger = setup_logger(Path('.logs'), name="[MachineCard]")
 
 class _CollapsibleArea(QFrame):
     def __init__(self, content: QWidget, parent=None):

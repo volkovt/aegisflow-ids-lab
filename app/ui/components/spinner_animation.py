@@ -1,5 +1,9 @@
 import logging
+from pathlib import Path
+
 from PySide6.QtCore import QTimer
+
+from app.core.logger_setup import setup_logger
 
 class _SpinnerAnimator:
     """
@@ -15,7 +19,7 @@ class _SpinnerAnimator:
         self._timer.setInterval(120)
         self._timer.timeout.connect(self._tick)
         self._i = 0
-        self._logger = logging.getLogger("[Spinner]")
+        self._logger = setup_logger(Path('.logs'), name="[SpinnerAnimation]")
 
     def start(self):
         try:

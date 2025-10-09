@@ -1,4 +1,3 @@
-import logging
 import shutil
 import socket
 import subprocess
@@ -12,7 +11,7 @@ from app.core.config_loader import LabConfig
 from app.core.vagrant_manager import VagrantManager
 from app.core.ssh_manager import SSHManager
 
-logger = logging.getLogger("[Preflight]")
+logger = setup_logger(Path('.logs'), name="[Preflight]")
 
 def _run_cmd(cmd: list[str]) -> Tuple[bool, str]:
     try:

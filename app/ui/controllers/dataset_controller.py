@@ -1,10 +1,14 @@
 import threading
 import logging
+from pathlib import Path
+
 from PySide6 import QtCore
 from PySide6.QtCore import Signal
 from concurrent.futures import CancelledError
 
-logger = logging.getLogger("VagrantLabUI")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[DatasetController]")
 
 class DatasetController(QtCore.QObject):
     started = Signal()

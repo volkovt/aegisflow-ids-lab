@@ -3,6 +3,7 @@ from __future__ import annotations
 import json, logging, time, sys, subprocess
 from pathlib import Path
 from typing import List, Dict
+from shiboken6 import isValid as shiboken_is_valid
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtGui import QCursor
@@ -11,16 +12,15 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QProgressBar, QApplication
 )
 
+import qtawesome as qta
+
+from app.core.logger_setup import setup_logger
 from app.core.yaml_parser import parse_yaml_to_steps
 from app.ui.guide.step_card_widget import StepCard, role_from_host
 from app.ui.guide.spinner import _MiniSpinner
 from app.ui.guide.workers.workers import _FnWorker, _StreamWorker
-from app.ui.guide.guide_utils import naive_yaml_quick_parse
 
-logger = logging.getLogger("[Guide]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
-
+logger = setup_logger(Path('.logs'), name="[GuideDialog]")
 
 class ExperimentGuideDialog(QDialog):
     """Janela principal do Guia (Matrix/Holo Edition) sincronizada com os ícones do MachineCard."""
@@ -68,16 +68,71 @@ class ExperimentGuideDialog(QDialog):
         self._batch_queue: list[dict] = []
         self._last_states: Dict[str, str] = {}
 
+        self._step_watchdog: QTimer | None = None
+        self._step_sent_done: bool = False
 
         self._build_ui()
-        self._update_yaml_header_label()
-
         QTimer.singleShot(0, self._start_loading_with_watchdog)
+
+    def _arm_step_watchdog(self, seconds: int, card: StepCard | None, step: dict, worker: QThread):
+        try:
+            if self._step_watchdog:
+                try:
+                    self._step_watchdog.stop()
+                except Exception:
+                    pass
+            self._step_sent_done = False
+
+            self._step_watchdog = QTimer(self)
+            self._step_watchdog.setSingleShot(True)
+
+            # margem de 3s além do timeout nominal p/ latências
+            ms = max(1000, int((seconds + 3) * 1000))
+            self._step_watchdog.timeout.connect(lambda: self._on_step_watchdog_timeout(card, step, worker))
+            self._step_watchdog.start(ms)
+            logger.info(f"[Guide] Watchdog armado para {seconds}s (+3s).")
+        except Exception as e:
+            logger.error(f"[Guide] _arm_step_watchdog: {e}")
+
+    def _on_step_watchdog_timeout(self, card: StepCard | None, step: dict, worker: QThread):
+        try:
+            if self._step_sent_done:
+                # já finalizamos por sentinela; nada a fazer
+                return
+            logger.warning("[Guide] Watchdog disparou — forçando finalização do passo.")
+            try:
+                if hasattr(self.ssh, "cancel_all_running"):
+                    self.ssh.cancel_all_running()
+            except Exception as e:
+                logger.warning(f"[Guide] watchdog cancel: {e}")
+            try:
+                if worker and worker.isRunning():
+                    # tenta interromper com gentileza
+                    worker.requestInterruption() if hasattr(worker, "requestInterruption") else None
+                    worker.quit()
+                    worker.wait(1200)
+            except Exception:
+                pass
+
+            # Finalização visual forçada:
+            if card:
+                try:
+                    st = str(card.status.property("state") or "")
+                    if st not in ("done", "error", "cancelled"):
+                        card.set_done(True)
+                except Exception as e:
+                    logger.warning(f"[Guide] watchdog: set_done falhou: {e}")
+            self._append_console("[guide] Watchdog: passo encerrado por timeout (UI).")
+
+            # Fecha timeline e progresso para não travar
+            self._on_step_final(card, step)
+        except Exception as e:
+            logger.error(f"[Guide] _on_step_watchdog_timeout: {e}")
 
     # ---------- UI ----------
     def _build_ui(self):
         self.setObjectName("GuideDialog")
-        self.setWindowTitle("Guia do Experimento — Matrix/Holo")
+        self.setWindowTitle("Guia do Experimento")
         self.setMinimumSize(1040, 760)
         self._apply_window_flags()
 
@@ -102,10 +157,15 @@ class ExperimentGuideDialog(QDialog):
         self.timeline_bar.setFixedHeight(8)
 
         self.btn_pick_yaml = QPushButton("Escolher YAML…")
+        self.btn_pick_yaml.setIcon(qta.icon("fa5s.file"))
         self.btn_reload = QPushButton("Recarregar (oficial)")
+        self.btn_reload.setIcon(qta.icon("fa5s.sync"))
         self.btn_clear_tests = QPushButton("Limpar")
+        self.btn_clear_tests.setIcon(qta.icon("fa5s.eraser"))
         self.btn_run_all = QPushButton("Rodar todos")
+        self.btn_run_all.setIcon(qta.icon("fa5s.play"))
         self.btn_mark_all_done = QPushButton("Marcar ✓")
+        self.btn_mark_all_done.setIcon(qta.icon("fa5s.check"))
 
         self.btn_pick_yaml.setToolTip("Selecionar um arquivo YAML de experimento (substitui o oficial)")
         self.btn_reload.setToolTip("Recarregar o parser oficial (ignora qualquer YAML selecionado)")
@@ -162,10 +222,15 @@ class ExperimentGuideDialog(QDialog):
 
         bottom = QHBoxLayout()
         self.btn_console_clear = QPushButton("Limpar console")
+        self.btn_console_clear.setIcon(qta.icon("fa5s.trash"))
         self.btn_console_save = QPushButton("Salvar log…")
+        self.btn_console_save.setIcon(qta.icon("fa5s.save"))
         self.btn_isolate = QPushButton("Isolar atacante")
+        self.btn_isolate.setIcon(qta.icon("fa5s.shield-alt"))
         self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.setIcon(qta.icon("fa5s.stop"))
         self.btn_run_runner = QPushButton("Gerar dataset")
+        self.btn_run_runner.setIcon(qta.icon("fa5s.database"))
 
         self.btn_console_clear.setToolTip("Limpar todo o texto do console abaixo")
         self.btn_console_save.setToolTip("Salvar o conteúdo do console em um arquivo de texto")
@@ -218,27 +283,49 @@ class ExperimentGuideDialog(QDialog):
             states = getattr(self, "_last_states", {}) or {}
             attacker_online = (states.get("attacker") == "running")
             any_online = any(st == "running" for st in states.values()) if states else False
-            if hasattr(self, "btn_isolate"):
-                self.btn_isolate.setEnabled(attacker_online)
-                self.btn_isolate.setToolTip("Requer attacker ONLINE" if not attacker_online else "Isolar atacante")
-            if hasattr(self, "btn_run_runner"):
-                self.btn_run_runner.setEnabled(any_online)
-                self.btn_run_runner.setToolTip(
-                    "Requer pelo menos uma máquina ONLINE" if not any_online else "Gerar dataset com o YAML atual")
-            if hasattr(self, "btn_cancel"):
-                running = (self._stream_worker and self._stream_worker.isRunning()) or self._batch_running
-                self.btn_cancel.setEnabled(running)
-                self.btn_cancel.setToolTip("Nenhum passo em execução" if not running else "Cancelar execução em andamento")
-            if hasattr(self, "btn_run_all"):
-                has_commands = any(
-                    (c.step.get("command") or "").strip() or (c.step.get("command_normal") or "").strip() or
-                    (c.step.get("command_b64") or "").strip()
-                    for c in self.cards
-                )
-                self.btn_run_all.setEnabled(bool(self.cards) and has_commands)
-                self.btn_run_all.setToolTip(
-                    "Nenhum passo executável" if not has_commands else
-                    ("Nenhum passo no guia" if not self.cards else "Executar todos os passos com comando definido"))
+            running = (self._stream_worker and getattr(self._stream_worker, "isRunning",
+                                                       lambda: False)()) or self._batch_running
+
+            def _safe_set(btn_attr: str, apply_fn):
+                btn = getattr(self, btn_attr, None)
+                if not btn or not shiboken_is_valid(btn):
+                    return
+                try:
+                    apply_fn(btn)
+                except Exception as ex:
+                    logger.debug(f"[Guide] _safe_set {btn_attr}: {ex}")
+
+            _safe_set("btn_isolate", lambda b: (b.setEnabled(attacker_online),
+                                                b.setToolTip(
+                                                    "Isolar atacante" if attacker_online else "Requer attacker ONLINE")))
+
+            _safe_set("btn_run_runner", lambda b: (b.setEnabled(any_online),
+                                                   b.setToolTip(
+                                                       "Gerar dataset com o YAML atual" if any_online else "Requer pelo menos uma máquina ONLINE")))
+
+            _safe_set("btn_cancel", lambda b: (b.setEnabled(running),
+                                               b.setToolTip(
+                                                   "Cancelar execução em andamento" if running else "Nenhum passo em execução")))
+
+            def _has_commands():
+                try:
+                    has_commands = any(
+                        (c.step.get("command") or "").strip() or (c.step.get("command_normal") or "").strip() or
+                        (c.step.get("command_b64") or "").strip()
+                        for c in getattr(self, "cards", [])
+                    )
+                    return bool(getattr(self, "cards", [])) and has_commands
+                except Exception as e:
+                    logger.debug(f"[Guide] _has_commands: {e}")
+                    return False
+
+            _safe_set("btn_run_all", lambda b: (b.setEnabled(_has_commands()),
+                                                b.setToolTip(
+                                                    "Executar todos os passos com comando definido" if _has_commands() else
+                                                    ("Nenhum passo no guia" if not getattr(self, "cards",
+                                                                                           []) else "Nenhum passo executável")
+                                                )))
+
         except Exception as e:
             logger.error(f"[Guide] _update_footer_actions_enabled: {e}")
 
@@ -291,7 +378,7 @@ class ExperimentGuideDialog(QDialog):
             except Exception as e:
                 logger.error(f"[Guide] _clear_tests.unlink_timeline: {e}")
 
-            self._set_footer("Guia limpo. Pronto para um novo experimento.")
+            self._start_loading_with_watchdog()
             logger.info("[Guide] Limpeza concluída.")
         except Exception as e:
             logger.error(f"[Guide] _clear_tests erro: {e}")
@@ -364,17 +451,8 @@ class ExperimentGuideDialog(QDialog):
 
     # ---------- Watchdog / Loading ----------
     def _start_loading_with_watchdog(self):
+        self._update_yaml_header_label()
         self._load_steps_async()
-        self._watchdog = QTimer(self)
-        self._watchdog.setSingleShot(True)
-        self._watchdog.timeout.connect(self._on_loading_slow)
-        self._watchdog.start(5000)
-
-        self._watchdog2 = QTimer(self)
-        self._watchdog2.setSingleShot(True)
-        self._watchdog2.timeout.connect(self._on_loading_very_slow)
-        self._watchdog2.start(20000)
-
         self._set_footer("Carregando passos do guia (parser oficial)…")
 
     def _load_steps_async(self):
@@ -387,29 +465,6 @@ class ExperimentGuideDialog(QDialog):
         w.error.connect(self._on_loader_err)
         w.finished.connect(lambda: self._cleanup_worker(w))
         w.start()
-
-    def _on_loading_slow(self):
-        if self._rendered_real or self._rendered_fallback:
-            return
-        try:
-            if self._loading_spinner:
-                self._loading_spinner.base = "Carregando (parser oficial demorando…)"
-            self._loading_label.setText("Carregando passos… (oficial pode demorar por rede/SSH)")
-            self._set_footer("Aguarde: obtendo passos oficiais…")
-        except Exception as e:
-            logger.error(f"[Guide] slow: {e}")
-
-    def _on_loading_very_slow(self):
-        if self._rendered_real or self._rendered_fallback:
-            return
-        try:
-            steps = naive_yaml_quick_parse(self.yaml_path)
-            self._render_steps(steps, replace=True)
-            self._rendered_fallback = True
-            self._ignore_loader_results = False
-            self._set_footer("Guia básico exibido — oficial substituirá ao concluir.")
-        except Exception as e:
-            logger.error(f"[Guide] very_slow falhou: {e}")
 
     # ---------- Loader result ----------
     def _on_loader_ok(self, steps: list[dict]):
@@ -466,6 +521,7 @@ class ExperimentGuideDialog(QDialog):
                     w.deleteLater()
             self.cards.clear()
 
+        logger.info(f"[Guide] Renderizando {len(steps)} passo(s)…")
         for i, st in enumerate(steps, start=1):
             card = StepCard(i, st)
             card.run_clicked.connect(self._run_step_async)
@@ -509,7 +565,7 @@ class ExperimentGuideDialog(QDialog):
 
     def _on_pick_yaml_in_guide(self):
         try:
-            start_dir = str((Path(self.yaml_path).parent if self.yaml_path else (self.project_root / "lab" / "experiments")))
+            start_dir = str((Path(self.yaml_path).parent if self.yaml_path else (self.project_root / "app" / "templates")))
         except Exception:
             start_dir = "."
         path, _ = QFileDialog.getOpenFileName(self, "Escolher YAML de experimento (Guia)", start_dir, "YAML (*.yaml *.yml)")
@@ -587,35 +643,81 @@ class ExperimentGuideDialog(QDialog):
         w.start()
 
     def _run_runner_async(self):
-        self._append_console("[guide] Iniciando Runner com o YAML atual…")
+        self._append_console("[guide] Iniciando Runner (gerar manifest e ETL)…")
+
+        # Evita cliques duplos durante a execução
+        try:
+            self.btn_run_runner.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        except Exception:
+            pass
+
         def job():
+            """
+            Executa em thread: gera o manifest e roda o ETL.
+            Retorna um dict com caminhos úteis em caso de sucesso.
+            """
             try:
-                from app.core import runner as core_runner
-                if hasattr(core_runner, "run_from_yaml"):
-                    return core_runner.run_from_yaml(self.yaml_path)
-                if hasattr(core_runner, "main"):
-                    return core_runner.main(["--yaml", self.yaml_path])
+                base = Path.cwd()
+                captures = base / "lab" / "data" / "captures"
+                if not captures.exists():
+                    raise RuntimeError("Diretório `captures` não existe no projeto.")
+
+                from lab.data.manifest import get_latest_run_ts, build_manifest
+                run_ts = get_latest_run_ts(captures_dir=captures)
+                manifest_dict = build_manifest(run_ts, cap_dir=captures)
+                if not manifest_dict:
+                    raise RuntimeError("Manifest vazio. Verifique se há capturas no diretório.")
+                manifest_path = captures / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+
+                # 2) Executa o ETL usando o manifest gerado
+                from lab.data.etl import run_etl_from_manifest
+                out_dir = base / "lab" / "data" / "processed"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                # victim_ip opcional (None). Se precisar, evoluir para receber do UI.
+                run_etl_from_manifest(manifest_path, out_dir, victim_ip=None)
+
+                return {
+                    "run_ts": run_ts,
+                    "manifest_path": str(manifest_path),
+                    "etl_out": str(out_dir / run_ts)
+                }
             except Exception as e:
-                logger.error(f"[Guide] import runner: {e}")
-            proc = subprocess.run([sys.executable, "-m", "app.core.runner", "--yaml", self.yaml_path],
-                                  capture_output=True, text=True)
-            return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-        def ok(res):
-            if isinstance(res, dict):
-                out, err, rc = res.get("stdout", ""), res.get("stderr", ""), res.get("returncode", 0)
-                if out: self._append_console(out)
-                if err: self._append_console(err)
-                self._append_console(f"[guide] Runner finalizado (rc={rc}).")
-            else:
-                self._append_console("[guide] Runner finalizado.")
-            self._set_footer("Dataset gerado (veja a pasta data/).")
+                # Log útil para diagnóstico em arquivo e console da UI
+                logger.error(f"[GuideRunner] Falha no Runner: {e}", exc_info=True)
+                # Propaga para o worker emitir `error`
+                raise
+
+        def ok(res: dict):
+            self._append_console(f"[runner] Manifesto salvo em: {res.get('manifest_path')}")
+            self._append_console(f"[runner] Artefatos do ETL em: {res.get('etl_out')}")
+            self._set_footer("Dataset gerado com sucesso.")
+            try:
+                QMessageBox.information(self, "Runner", "Dataset gerado com sucesso.")
+            except Exception:
+                pass
+
         def fail(msg: str):
             self._append_console(f"[erro] Runner: {msg}")
-            QMessageBox.critical(self, "Runner", f"Falha: {msg}")
+            self._set_footer("Falha ao gerar dataset.")
+            try:
+                QMessageBox.critical(self, "Runner", f"Falha ao gerar dataset:\n{msg}")
+            except Exception:
+                pass
+
+        def on_finish():
+            try:
+                self.btn_run_runner.setEnabled(True)
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+
         w = _FnWorker(job)
         self._keep_worker(w)
         w.result.connect(ok)
         w.error.connect(fail)
+        w.finished.connect(on_finish)
         w.finished.connect(lambda: self._cleanup_worker(w))
         w.start()
 
@@ -686,7 +788,7 @@ class ExperimentGuideDialog(QDialog):
 
         def _is_current(worker) -> bool:
             try:
-                return (worker is self._stream_worker) and (worker is self._current_worker)
+                return worker is self._stream_worker
             except Exception:
                 return False
 
@@ -710,11 +812,56 @@ class ExperimentGuideDialog(QDialog):
                 return
             self._on_step_fail(c, s, msg)
 
+        def _on_line_guard(text: str, worker=w, c=card, s=step):
+            try:
+                self._append_console(text)
+                if self._step_sent_done:
+                    return
+                if "[guide] step_done_" in (text or ""):
+                    self._step_sent_done = True
+                    logger.info("[Guide] Sentinela de conclusão detectada no stream.")
+                    try:
+                        if c:
+                            c.set_done(True)
+                    except Exception as e:
+                        logger.warning(f"[Guide] sentinela: set_done: {e}")
+                    self._append_console("[guide] Passo concluído (sentinela).")
+
+                    self._on_step_final(c, s)
+
+                    try:
+                        if worker and worker.isRunning():
+                            worker.requestInterruption() if hasattr(worker, "requestInterruption") else None
+                            worker.quit()
+                            worker.wait(300)
+                    except Exception:
+                        pass
+
+                    try:
+                        if self._step_watchdog:
+                            self._step_watchdog.stop()
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.error(f"[Guide] _on_line_guard: {e}")
+
         def _on_worker_finished_guard(worker=w, c=card, s=step):
             if not _is_current(worker):
                 logger.warning("[Guide] Sinal 'finished' de worker antigo ignorado.")
                 return
             try:
+                try:
+                    if self._step_watchdog:
+                        self._step_watchdog.stop()
+                except Exception:
+                    pass
+
+                try:
+                    st = str(c.status.property("state") or "")
+                    if st == "running":
+                        c.set_done(True)
+                except Exception as e:
+                    logger.warning(f"[Guide] fallback done on finished: {e}")
                 self._on_step_final(c, s)
             finally:
                 self._cleanup_worker(worker)
@@ -727,15 +874,17 @@ class ExperimentGuideDialog(QDialog):
                 except Exception as e:
                     logger.warning(f"[Guide] footer actions update: {e}")
 
-        w.line.connect(self._append_console)
+        w.line.connect(_on_line_guard)
         w.finished_ok.connect(_on_worker_done_guard)
         w.error.connect(_on_worker_error_guard)
         w.finished.connect(_on_worker_finished_guard)
-        # w.line.connect(self._append_console)
-        # w.finished_ok.connect(lambda: self._on_step_done(card, step, ok=True))
-        # w.error.connect(lambda msg: self._on_step_fail(card, step, msg))
-        # w.finished.connect(lambda: (self._on_step_final(card, step), self._cleanup_worker(w)))
         self._set_footer(f"Executando passo em {host}…")
+
+        try:
+            self._arm_step_watchdog(timeout, card, step, w)
+        except Exception as e:
+            logger.warning(f"[Guide] watchdog: {e}")
+
         w.start()
 
     def _on_step_done(self, card: StepCard | None, step: dict, ok: bool):
@@ -940,7 +1089,6 @@ class ExperimentGuideDialog(QDialog):
         try:
             role = role_from_host(name)
             vis = "online" if state == "running" else "offline"
-            logger.info(f"[Guide] reflect_machine_status: {name} -> {state} (role={role}, vis={vis})")
             for c in self.cards:
                 if c.matches_role(role) or c.matches_host(name):
                     c.set_machine_visibility(vis)

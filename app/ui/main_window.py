@@ -34,9 +34,7 @@ from app.ui.services.preset_service import PresetBootstrapper
 from app.ui.services.theme_loader import load_theme
 from app.ui.controllers.main_controller import MainController
 
-
 LOG_DIR = Path(".logs")
-
 
 class MainWindow(QMainWindow):
     log_line = Signal(str)
@@ -47,7 +45,7 @@ class MainWindow(QMainWindow):
         self.first_show = True
         self._guide_dialog = None
 
-        self.logger = setup_logger(LOG_DIR)
+        self.logger = setup_logger(LOG_DIR, name="MainWindow")
         self.project_root = get_project_root(Path(__file__))
         self.cfg_path = find_config(self.project_root / "config.yaml")
         self.cfg = load_config(self.cfg_path)
@@ -161,9 +159,9 @@ class MainWindow(QMainWindow):
         self.btn_preflight = self.dock.btn_preflight
         self.btn_yaml_designer = self.dock.btn_yaml_designer
         self.btn_pick_yaml = self.dock.btn_pick_yaml
-        self.btn_generate_dataset = self.dock.btn_generate_dataset
+        # self.btn_generate_dataset = self.dock.btn_generate_dataset
         self.btn_open_guide = self.dock.btn_open_guide
-        self.btn_open_data = self.dock.btn_open_data
+        # self.btn_open_data = self.dock.btn_open_data
 
         # Board
         board_wrap = QFrame(); board_wrap.setObjectName("machinesBoard")
@@ -292,9 +290,9 @@ class MainWindow(QMainWindow):
         self.btn_preflight.clicked.connect(self._on_preflight)
         self.btn_yaml_designer.clicked.connect(self._on_yaml_designer)
         self.btn_pick_yaml.clicked.connect(self._on_pick_yaml)
-        self.btn_generate_dataset.clicked.connect(lambda: self.ctrl.generate_dataset(toggle_cancel=lambda: None))
+        # self.btn_generate_dataset.clicked.connect(lambda: self.ctrl.generate_dataset(toggle_cancel=lambda: None))
         self.btn_open_guide.clicked.connect(self._on_open_guide)
-        self.btn_open_data.clicked.connect(lambda: self.ctrl.open_folder(self.project_root / "data"))
+        # self.btn_open_data.clicked.connect(lambda: self.ctrl.open_folder(self.project_root / "data"))
 
         try:
             self.ds_controller.started.connect(lambda: self._set_global_progress(True))
@@ -484,7 +482,7 @@ class MainWindow(QMainWindow):
             dlg = YAMLDesignerDialog(
                 parent=self,
                 initial_path=self.ctrl.current_yaml_path if self.ctrl.current_yaml_path.exists() else None,
-                experiments_dir=self.project_root / "lab" / "experiments",
+                experiments_dir=self.project_root / "app" / "templates",
             )
             dlg.exec()
             if dlg.current_path:
@@ -498,7 +496,8 @@ class MainWindow(QMainWindow):
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 "Escolher YAML de experimento",
-                str(self.ctrl.current_yaml_path if self.ctrl.current_yaml_path.exists() else (self.project_root / "lab" / "experiments")),
+                str(self.ctrl.current_yaml_path if self.ctrl.current_yaml_path.exists()
+                    else (self.project_root / "app" / "templates")),
                 "YAML (*.yaml *.yml)",
             )
             if path:

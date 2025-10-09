@@ -75,7 +75,7 @@ class MainController:
         except Exception:
             pass
 
-        self.current_yaml_path: Path = self.project_root / "lab" / "templates" / "exp_hydra_sweep.yaml"
+        self.current_yaml_path: Path = self.project_root / "app" / "templates" / "hydra_attack.yaml"
         self.yaml_selected_by_user: bool = False
 
         try:

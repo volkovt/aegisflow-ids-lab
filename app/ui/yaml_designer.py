@@ -1,18 +1,16 @@
 import logging
 from pathlib import Path
 
+import yaml
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QPlainTextEdit, QFileDialog, QMessageBox, QComboBox
 )
 
-try:
-    import yaml
-except Exception as e:
-    yaml = None
+from app.core.logger_setup import setup_logger
 
-logger = logging.getLogger("[YAMLDesigner]")
+logger = setup_logger(Path('.logs'), name="[YamlDesigner]")
 
 class YAMLDesignerDialog(QDialog):
     def __init__(self, parent=None, initial_path: Path | None = None, experiments_dir: Path | None = None):
@@ -56,11 +54,8 @@ class YAMLDesignerDialog(QDialog):
         presets.addWidget(QLabel("Preset:"))
         self.combo_presets = QComboBox()
         self.combo_presets.addItems([
-            "exp_all.yaml",
-            "exp_scan_brute.yaml",
-            "exp_dos.yaml",
-            "exp_heavy_syn.yaml",     # NOVO
-            "exp_brute_http.yaml"     # NOVO
+            "hydra_attack.yaml",
+            "official_steps.yaml"
         ])
         btn_use_preset = QPushButton("Carregar no editor")
         btn_create_files = QPushButton("Criar arquivos de preset (se faltarem)")

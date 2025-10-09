@@ -4,7 +4,6 @@ import logging
 
 from PySide6.QtWidgets import QWidget
 
-
 def load_theme(widget: QWidget, theme_path: Path, *, logger: logging.Logger):
     try:
         qss = Path(theme_path).read_text(encoding="utf-8")

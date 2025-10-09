@@ -8,7 +8,6 @@ from PySide6.QtWidgets import QWidget, QProgressBar, QToolButton
 
 from app.ui.components.spinner_animation import _SpinnerAnimator
 
-
 class TaskManager:
     """
     Orquestrador genérico de Workers/ResultWorkers.

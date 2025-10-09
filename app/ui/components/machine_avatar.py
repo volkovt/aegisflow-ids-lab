@@ -1,18 +1,15 @@
 # app/ui/components/machine_avatar.py
 # -*- coding: utf-8 -*-
-import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QWidget, QLabel, QSizePolicy, QVBoxLayout
 
+from app.core.logger_setup import setup_logger
 from app.ui.components.anim_utils import AvatarHoverAnimator
 
-logger = logging.getLogger("[MachineAvatarExt]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
-
+logger = setup_logger(Path('.logs'), name="[MachineAvatar]")
 
 class MachineIconProvider:
     """

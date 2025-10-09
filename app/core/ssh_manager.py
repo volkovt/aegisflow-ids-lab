@@ -12,7 +12,9 @@ from typing import Dict
 import paramiko
 import logging
 
-logger = logging.getLogger("[SSHManager]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[SSHManager]")
 
 _CONNECT_GATE = threading.BoundedSemaphore(value=2)
 
@@ -44,11 +46,18 @@ def _ensure_shell_preamble(script: str) -> str:
 def _exec_bash_via_stdin(cli, script: str, timeout: int = 30, want_pty: bool = False, name=""):
     """
     Executa 'script' enviando via STDIN para bash limpo (-se), evitando problemas de quoting.
+    NOTA: PTY desabilitado por padrão (get_pty=False) para evitar deadlocks em stdout.read().
     """
     try:
         chan_cmd = "bash --noprofile --norc -se"
-        stdin, stdout, stderr = cli.exec_command(chan_cmd, get_pty=want_pty, timeout=timeout)
-        safe_script = _ensure_shell_preamble(script)
+        # NUNCA peça PTY para comandos não interativos (even com heredoc)
+        stdin, stdout, stderr = cli.exec_command(chan_cmd, get_pty=False, timeout=timeout)
+
+        safe_script = _ensure_shell_preamble(script or "")
+        # Garante newline final para here-docs terminarem corretamente
+        if not safe_script.endswith("\n"):
+            safe_script += "\n"
+
         stdin.write(safe_script)
         try:
             stdin.flush()
@@ -59,17 +68,38 @@ def _exec_bash_via_stdin(cli, script: str, timeout: int = 30, want_pty: bool = F
         except Exception:
             pass
 
-        out = stdout.read().decode(errors="ignore")
-        err = stderr.read().decode(errors="ignore")
-        rc = stdout.channel.recv_exit_status()
+        # Leitura robusta: consome stdout/stderr até o exit status estar disponível.
+        out_chunks, err_chunks = [], []
+        ch = stdout.channel
+        ch.settimeout(max(5.0, float(timeout)))  # timeout de socket para não pendurar
+
+        # Loop até o comando sinalizar término
+        while True:
+            # Lê stdout
+            while ch.recv_ready():
+                out_chunks.append(ch.recv(4096).decode(errors="ignore"))
+            # Lê stderr
+            while ch.recv_stderr_ready():
+                err_chunks.append(ch.recv_stderr(4096).decode(errors="ignore"))
+            # Sai quando o exit status estiver pronto E não houver mais bytes pendentes
+            if ch.exit_status_ready() and not ch.recv_ready() and not ch.recv_stderr_ready():
+                break
+            # Evita busy-wait
+            time.sleep(0.02)
+
+        rc = ch.recv_exit_status()
+        out = "".join(out_chunks)
+        err = "".join(err_chunks)
+
         if rc != 0:
-            raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
+            raise RuntimeError(f"Remote exit status {rc}: {(err.strip() or out.strip() or 'sem saída')}")
+
         return out or ""
     except Exception as e:
-        logger.error(f"-----------------------------------------------------")
+        logger.error("-----------------------------------------------------")
         logger.error(f"[SSHManager] Executando comando em '{name}': {script}")
         logger.error(f"[SSHManager] _exec_bash_via_stdin falhou: {e}")
-        logger.error(f"-----------------------------------------------------")
+        logger.error("-----------------------------------------------------")
         raise
 
 class SSHManager:
@@ -432,7 +462,7 @@ class SSHManager:
         - Se o canal falhar, purga o client e reconecta na próxima tentativa.
         """
         raw_cmd = (command or "").replace("\r\n", "\n")
-        want_pty = ("<<'__EOF__'" in raw_cmd) or ('<<"__EOF__"' in raw_cmd) or ('<<__EOF__' in raw_cmd)
+        want_pty = False #("<<'__EOF__'" in raw_cmd) or ('<<"__EOF__"' in raw_cmd) or ('<<__EOF__' in raw_cmd)
 
         last_exc = None
         open_timeout = max(45, timeout + 15)  # abertura de canal um pouco mais folgada

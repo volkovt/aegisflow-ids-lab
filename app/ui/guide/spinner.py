@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 import logging
+from pathlib import Path
+
 from PySide6.QtCore import QTimer
 
-logger = logging.getLogger("[GuideSpinner]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[Spinner]")
 if not hasattr(logger, "warn"):
     logger.warn = logger.warning
 

@@ -2,9 +2,12 @@
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Dict
 
-logger = logging.getLogger("[Collector]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[Collector]")
 
 class WarmupCoordinator:
     def __init__(self, warmup_window_s: int = 30):

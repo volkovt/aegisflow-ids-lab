@@ -9,44 +9,30 @@ from lab.utils import format_only_keys
 
 logger = setup_logger(Path('.logs'), name="[Sensor]")
 
-# sensor.py (trechos relevantes)
-
 SENSOR_INIT_SCRIPT = r"""
     set -euo pipefail
     umask 022
-    
+
     log() { echo "[sensor] $*"; }
-    
-    # Descobre usuário real (sem sudo)
     USR="$(id -un)"
     BASE1="${HOME}/tcc"
     BASE2="/tmp/tcc"
-    
+
     ensure_base() {
       local base="$1"
       local pcap="${base}/pcap" zeek="${base}/zeek" run="${base}/run"
       mkdir -p "$pcap" "$zeek" "$run" 2>/dev/null || true
       chmod 0777 "$pcap" "$zeek" "$run" 2>/dev/null || true
-    
-      # teste de escrita como usuário
-      if ! touch "${pcap}/.__wtest_u" 2>/dev/null; then
-        return 1
-      fi
+      if ! touch "${pcap}/.__wtest_u" 2>/dev/null; then return 1; fi
       rm -f "${pcap}/.__wtest_u" 2>/dev/null || true
-    
-      # se tivermos sudo, testa também escrita por root (para pegar root-squash)
       if sudo -n true 2>/dev/null; then
-        if ! sudo -n /bin/sh -c "echo test > '${pcap}/.__wtest_r'" 2>/dev/null; then
-          return 1
-        fi
+        if ! sudo -n /bin/sh -c "echo test > '${pcap}/.__wtest_r'" 2>/dev/null; then return 1; fi
         sudo -n rm -f "${pcap}/.__wtest_r" 2>/dev/null || true
       fi
-    
       echo "$base"
       return 0
     }
-    
-    # Escolhe BASE preferindo HOME, caindo para /tmp em caso de squash/permissões
+
     BASE=""
     if b="$(ensure_base "$BASE1")"; then BASE="$b"; else
       b="$(ensure_base "$BASE2")" || true
@@ -54,71 +40,226 @@ SENSOR_INIT_SCRIPT = r"""
       mkdir -p "${BASE}/pcap" "${BASE}/zeek" "${BASE}/run" 2>/dev/null || true
       chmod 0777 "${BASE}/pcap" "${BASE}/zeek" "${BASE}/run" 2>/dev/null || true
     fi
-    
+
     LOGPCAP="${BASE}/pcap"
     LOGZEEK="${BASE}/zeek"
     RUNDIR="${BASE}/run"
-    
-    # SUDO se disponível; caso contrário vazio
-    if sudo -n true 2>/dev/null; then
-      SUDO="sudo -n"
-    else
-      SUDO=""
-    fi
-    
+
+    if sudo -n true 2>/dev/null; then SUDO="sudo -n"; else SUDO=""; fi
+
+    # ----------------------------
+    # Zeek: verificação + instalação com repositórios oficiais se necessário
+    # ----------------------------
+    ensure_zeek() {
+      if command -v zeek >/dev/null 2>&1; then
+        log "zeek encontrado no PATH."
+        return 0
+      fi
+      if [ -x "/opt/zeek/bin/zeek" ]; then
+        log "zeek encontrado em /opt/zeek/bin/zeek."
+        return 0
+      fi
+
+      log "zeek não encontrado — preparando instalação…"
+
+      if [ -r /etc/os-release ]; then
+        . /etc/os-release
+      else
+        log "ERRO: /etc/os-release ausente — instalação automática indisponível."
+        return 1
+      fi
+
+      # Funções auxiliares
+      _require_sudo() {
+        if [ -z "$SUDO" ]; then
+          log "ERRO: sem sudo não-interativo — não é possível instalar pacotes."
+          return 1
+        fi
+      }
+
+      _apt_update_quiet() { $SUDO apt-get update -y || true; }
+      _apt_install() { $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" || return 1; }
+      _dnf_install() { $SUDO dnf install -y "$@" || $SUDO yum install -y "$@" || return 1; }
+      _zypper_install() { $SUDO zypper --non-interactive install "$@" || return 1; }
+
+      _ubuntu_enable_universe() {
+        if command -v add-apt-repository >/dev/null 2>&1; then
+          $SUDO add-apt-repository -y universe || true
+        else
+          _apt_install software-properties-common || true
+          $SUDO add-apt-repository -y universe || true
+        fi
+      }
+
+      _add_obs_repo_debian_ubuntu() {
+        # Mapas de versão (tentamos VERSION_ID e fallback em VERSION_CODENAME)
+        local repo_url="" key_url="" list_path=""
+        case "${ID}-${VERSION_ID:-}" in
+          ubuntu-24.04) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/";;
+          ubuntu-22.04) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/";;
+          ubuntu-20.04) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/";;
+          debian-12)    repo_url="https://download.opensuse.org/repositories/security:/zeek/Debian_12/";;
+          debian-11)    repo_url="https://download.opensuse.org/repositories/security:/zeek/Debian_11/";;
+          *) # tentar por codename se id+version não baterem
+             case "${ID}-${VERSION_CODENAME:-}" in
+               ubuntu-noble) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/";;
+               ubuntu-jammy) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_22.04/";;
+               ubuntu-focal) repo_url="https://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/";;
+               debian-bookworm) repo_url="https://download.opensuse.org/repositories/security:/zeek/Debian_12/";;
+               debian-bullseye) repo_url="https://download.opensuse.org/repositories/security:/zeek/Debian_11/";;
+             esac
+          ;;
+        esac
+
+        if [ -z "$repo_url" ]; then
+          log "Aviso: mapeamento OBS não encontrado para ${ID} ${VERSION_ID:-}. Tentando instalação nativa primeiro."
+          return 2
+        fi
+
+        key_url="${repo_url}Release.key"
+        list_path="/etc/apt/sources.list.d/security_zeek.list"
+
+        _require_sudo || return 1
+        $SUDO mkdir -p /etc/apt/keyrings || true
+        curl -fsSL "$key_url" | gpg --dearmor | $SUDO tee /etc/apt/keyrings/security_zeek.gpg >/dev/null
+        echo "deb [signed-by=/etc/apt/keyrings/security_zeek.gpg] ${repo_url} /" | $SUDO tee "$list_path" >/dev/null
+        _apt_update_quiet
+        return 0
+      }
+
+      _add_obs_repo_el() {
+        # Enterprise Linux 8/9 (RHEL/CentOS/Rocky/Alma)
+        local base=""
+        case "${VERSION_ID:-}" in
+          9*) base="RHEL_9";;
+          8*) base="RHEL_8";;
+          *)  base="";;
+        esac
+        if [ -z "$base" ]; then
+          log "Aviso: versão EL não mapeada (${VERSION_ID:-})."
+          return 2
+        fi
+        _require_sudo || return 1
+        $SUDO curl -fsSL "https://download.opensuse.org/repositories/security:zeek/${base}/security:zeek.repo" -o /etc/yum.repos.d/zeek.repo
+        return 0
+      }
+
+      # Tentativas por família de SO
+      if command -v apt-get >/dev/null 2>&1 || echo "${ID_LIKE:-}${ID:-}" | grep -qi "debian\|ubuntu"; then
+        log "Detectado ambiente Debian/Ubuntu."
+        _require_sudo || return 1
+        _apt_update_quiet
+        # 1) tentar nativo
+        if _apt_install zeek; then
+          :
+        else
+          log "zeek não está no repo nativo — habilitando 'universe' (Ubuntu) e adicionando OBS security:zeek…"
+          _ubuntu_enable_universe || true
+          _add_obs_repo_debian_ubuntu || true
+          _apt_update_quiet
+          _apt_install zeek || { log "ERRO: falha ao instalar zeek via OBS (Debian/Ubuntu)."; return 1; }
+        fi
+
+      elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || echo "${ID_LIKE:-}${ID:-}" | grep -qi "rhel\|fedora\|centos"; then
+        log "Detectado ambiente RHEL/CentOS/Fedora."
+        _require_sudo || return 1
+        # Fedora geralmente tem pacote nativo
+        if echo "${ID:-}" | grep -qi "fedora"; then
+          _dnf_install zeek || {
+            log "Pacote não encontrado no Fedora — adicionando OBS…"
+            ver="${VERSION_ID:-}"
+            if [ -n "$ver" ]; then
+              $SUDO dnf config-manager --add-repo "https://download.opensuse.org/repositories/security:zeek/Fedora_${ver}/security:zeek.repo" || true
+              _dnf_install zeek || { log "ERRO: falha ao instalar zeek (Fedora via OBS)."; return 1; }
+            else
+              log "ERRO: Fedora sem VERSION_ID; não foi possível mapear OBS."
+              return 1
+            fi
+          }
+        else
+          # RHEL/CentOS/Rocky/Alma — habilitar EPEL ajuda dependências
+          $SUDO dnf install -y epel-release || $SUDO yum install -y epel-release || true
+          if ! _dnf_install zeek; then
+            log "Pacote nativo indisponível — adicionando OBS para EL…"
+            _add_obs_repo_el || true
+            _dnf_install zeek || { log "ERRO: falha ao instalar zeek (EL via OBS)."; return 1; }
+          fi
+        fi
+
+      elif command -v zypper >/dev/null 2>&1 || echo "${ID_LIKE:-}${ID:-}" | grep -qi "suse"; then
+        log "Detectado ambiente openSUSE/SLES."
+        _require_sudo || return 1
+        $SUDO zypper --non-interactive refresh || true
+        _zypper_install zeek || {
+          log "Tentando adicionar repositório security:zeek…"
+          $SUDO zypper --non-interactive addrepo --refresh "https://download.opensuse.org/repositories/security:/zeek/$(. /etc/os-release; echo ${ID^}_${VERSION_ID})/" zeek || true
+          $SUDO zypper --non-interactive refresh || true
+          _zypper_install zeek || { log "ERRO: falha ao instalar zeek (openSUSE via OBS)."; return 1; }
+        }
+
+      else
+        log "Distro não reconhecida para instalação automática. Instale Zeek manualmente."
+        return 1
+      fi
+
+      if command -v zeek >/dev/null 2>&1 || [ -x "/opt/zeek/bin/zeek" ]; then
+        log "zeek instalado com sucesso."
+        return 0
+      fi
+
+      log "ERRO: zeek ainda indisponível após tentativa de instalação."
+      return 1
+    }
+
     log "base escolhida: ${BASE}"
-    log "killing zeek/tcpdump if exist..."
+    log "Encerrando restos de zeek/tcpdump (se houver)…"
     $SUDO pkill -x zeek 2>/dev/null || true
     $SUDO pkill -x tcpdump 2>/dev/null || true
     sleep 0.4
-    
-    log "limpando logs antigos de zeek..."
+
+    log "Limpando logs antigos de Zeek…"
     rm -f "${LOGZEEK}"/*.log 2>/dev/null || true
     : > "${LOGZEEK}/zeek.out" 2>/dev/null || true
-    
+
     victim="{victim_ip}"; attacker="{attacker_ip}"
-    
-    # Descobre melhor interface pelo caminho até a vítima
     iface=$(ip route get "$victim" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     [ -z "$iface" ] && iface=$(ip -br link | awk '/UP/ && !/LOOPBACK/ {print $1; exit}')
-    log "selected iface: $iface"
-    
-    # Segurança defensiva: garante que diretórios sejam graváveis mesmo para root-squash
+    log "Interface selecionada: $iface"
+
     chmod 0777 "${LOGPCAP}" "${LOGZEEK}" "${RUNDIR}" 2>/dev/null || true
-    
-    # ---- TCPDUMP ----
-    # -Z $USR: após abrir o socket como root (sudo), derruba privilégios para o usuário real
-    # Arquivo rotativo com strftime + janela (-G) + número de arquivos (-W) + limite de tamanho (-C)
+
     nohup $SUDO /usr/sbin/tcpdump -i "$iface" -s 0 -U -nn \
       -w "${LOGPCAP}/exp_%Y%m%d_%H%M%S.pcap" \
       -G 300 -C 100 -W 48 -Z "$USR" \
       > "${LOGPCAP}/tcpdump.out" 2>&1 \
       & echo $! > "${RUNDIR}/tcc_tcpdump.pid"
-    
+
     sleep 0.8
     if ! pgrep -x tcpdump >/dev/null; then
-      log "ERRO tcpdump (veja ${LOGPCAP}/tcpdump.out abaixo):"
+      log "ERRO tcpdump (veja ${LOGPCAP}/tcpdump.out):"
       tail -n 200 "${LOGPCAP}/tcpdump.out" || true
-      log "dica: se este host usa root-squash no HOME, manteremos a captura em ${BASE} (pode ser /tmp)."
-      log "dica2: considere aplicar 'setcap cap_net_raw,cap_net_admin+eip /usr/sbin/tcpdump' e rodar sem sudo."
       exit 3
     fi
-    
-    # ---- ZEEK ----
+
+    if ! ensure_zeek; then
+      log "Falha ao garantir Zeek — abortando sensor."
+      exit 4
+    fi
+
     ZEEXE=$(command -v zeek || echo /opt/zeek/bin/zeek)
     nohup $SUDO "$ZEEXE" -i "$iface" -C \
       -e "redef Log::default_logdir=\"${LOGZEEK}\"" \
       >> "${LOGZEEK}/zeek.out" 2>&1 \
       & echo $! > "${RUNDIR}/tcc_zeek.pid"
-    
+
     sleep 1.0
-    pgrep -fa "zeek -i" >/dev/null || {
-      log "ERRO zeek"; tail -n 200 "${LOGZEEK}/zeek.out" || true; exit 4;
-    }
-    
-    log "captura ativa (tcpdump+zeek)."
+    pgrep -fa "zeek -i" >/dev/null || { log "ERRO ao subir Zeek"; tail -n 200 "${LOGZEEK}/zeek.out" || true; exit 4; }
+
+    log "Captura ativa (tcpdump + Zeek)."
     log "[paths] pcap=${LOGPCAP} zeek=${LOGZEEK} run=${RUNDIR}"
 """
+
+
 
 
 SENSOR_STOP_SCRIPT = r"""

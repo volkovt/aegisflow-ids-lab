@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-import logging
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QObject, QEvent, QPropertyAnimation, QEasingCurve, Property, QRectF, QPointF
 from PySide6.QtGui import QColor, QPixmap, QPainter, QLinearGradient
 from PySide6.QtWidgets import QLabel, QGraphicsOpacityEffect, QGraphicsDropShadowEffect, QWidget
 
-logger = logging.getLogger("[AnimUtils]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[AnimUtils]")
 
 def _pick_state_color(state: str, online: QColor, offline: QColor) -> QColor:
     s = (state or "").lower()

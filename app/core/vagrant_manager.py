@@ -10,7 +10,9 @@ from typing import Iterable, Optional
 from jinja2 import Environment, FileSystemLoader
 import logging
 
-logger = logging.getLogger("[VagrantManager]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[VagrantManager]")
 
 class VagrantManager:
     def __init__(self, project_root: Path, lab_dir: Path):

@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
-import logging
 import time
 import sys
 
@@ -18,9 +17,9 @@ from app.core.ssh_manager import SSHManager
 from lab.agents.attack import AttackExecutor
 from lab.agents.sensor import SensorAgent
 
-from lab.orchestrator.yaml_loader import ExperimentSpec, resolve_profile_command, _flatten, _safe_format
+from app.core.yaml_loader import ExperimentSpec, resolve_profile_command, _flatten, _safe_format
 
-logger = setup_logger(Path('.logs'), name="[YamlLoader]")
+logger = setup_logger(Path('.logs'), name="[Runner]")
 
 @dataclass
 class ExperimentRunner:
@@ -63,37 +62,94 @@ class ExperimentRunner:
     def _pull_tree_b64(self, host: str, remote_dir: str, includes: list[str], local_dst: Path, timeout: int = 180):
         try:
             local_dst.mkdir(parents=True, exist_ok=True)
-            inc = " ".join([f"\"{x}\"" for x in (includes or [])]) if includes else "."
 
-            # Monta o script SEM adicionar ';' em duplicidade.
-            script_lines = [
-                "set -e",
-                "set -o pipefail",
-                f'REMOTEDIR="{remote_dir}"',
-                'if [ -d "$REMOTEDIR" ]; then cd "$REMOTEDIR";',
-                'elif [ -d "$HOME/tcc" ]; then cd "$HOME/tcc";',
-                'elif [ -d "/home/vagrant/tcc" ]; then cd "/home/vagrant/tcc";',
-                'elif [ -d "/tmp/tcc" ]; then cd "/tmp/tcc";',
-                'else echo "::EMPTY::"; exit 0; fi',
-                f'tar -czf - {inc} 2>/dev/null | (base64 -w0 2>/dev/null || base64)'
-            ]
+            # Monta script remoto robusto:
+            # - resolve diretório de trabalho
+            # - quando há includes, filtra apenas os que existem
+            # - se nada existir => ::EMPTY::
+            # - se tar falhar => ::TARFAILED::<stderr_base64>
+            # - sucesso => tar.gz em base64 no stdout
+            if includes:
+                # Escapa os includes para uso seguro no shell
+                inc_escaped = " ".join([shlex.quote(x) for x in includes])
+                script_lines = [
+                    "set -e",
+                    "set -o pipefail",
+                    f'REMOTEDIR="{remote_dir}"',
+                    'if [ -d "$REMOTEDIR" ]; then cd "$REMOTEDIR";',
+                    'elif [ -d "$HOME/tcc" ]; then cd "$HOME/tcc";',
+                    'elif [ -d "/home/vagrant/tcc" ]; then cd "/home/vagrant/tcc";',
+                    'elif [ -d "/tmp/tcc" ]; then cd "/tmp/tcc";',
+                    'else echo "::EMPTY::"; exit 0; fi',
+                    # Filtra apenas paths existentes
+                    'found="" ; '
+                    f'for p in {inc_escaped}; do '
+                    '  if [ -e "$p" ]; then found="$found \"$p\""; fi; '
+                    'done ; '
+                    'if [ -z "$found" ]; then echo "::EMPTY::"; exit 0; fi ; ',
+                    # Tenta criar o tar. Se falhar, devolve ::TARFAILED::<stderr em base64> e sai 0
+                    'rm -f /tmp/_tar_err 2>/dev/null || true',
+                    'set +e; sh -c "tar -czf - $found" 2>/tmp/_tar_err | (base64 -w0 2>/dev/null || base64); rc=${PIPESTATUS[0]}; set -e;',
+                    'if [ "$rc" -ne 0 ]; then '
+                    '  errb64=$( (base64 -w0 /tmp/_tar_err 2>/dev/null) || (base64 /tmp/_tar_err 2>/dev/null) ); '
+                    '  echo "::TARFAILED::${errb64}"; exit 0; '
+                    'fi'
+                ]
+            else:
+                # Sem includes => compacta o diretório inteiro
+                script_lines = [
+                    "set -e",
+                    "set -o pipefail",
+                    f'REMOTEDIR="{remote_dir}"',
+                    'if [ -d "$REMOTEDIR" ]; then cd "$REMOTEDIR";',
+                    'elif [ -d "$HOME/tcc" ]; then cd "$HOME/tcc";',
+                    'elif [ -d "/home/vagrant/tcc" ]; then cd "/home/vagrant/tcc";',
+                    'elif [ -d "/tmp/tcc" ]; then cd "/tmp/tcc";',
+                    'else echo "::EMPTY::"; exit 0; fi',
+                    'rm -f /tmp/_tar_err 2>/dev/null || true',
+                    'set +e; tar -czf - . 2>/tmp/_tar_err | (base64 -w0 2>/dev/null || base64); rc=${PIPESTATUS[0]}; set -e;',
+                    'if [ "$rc" -ne 0 ]; then '
+                    '  errb64=$( (base64 -w0 /tmp/_tar_err 2>/dev/null) || (base64 /tmp/_tar_err 2>/dev/null) ); '
+                    '  echo "::TARFAILED::${errb64}"; exit 0; '
+                    'fi'
+                ]
 
-            # Junta com '; ' garantindo que não criamos ';;'
             script = "; ".join([ln.rstrip("; ") for ln in script_lines])
-
             wrapped = f"bash -lc {shlex.quote(script)}"
             logger.info(f"[Runner] pull {host}:{remote_dir} -> {local_dst}")
 
             b64 = self.ssh.run_command(host, wrapped, timeout=timeout) or ""
-            if not b64.strip() or b64.strip() == "::EMPTY::":
+            s = b64.strip()
+
+            # Marcadores especiais do script remoto
+            if not s or s == "::EMPTY::":
                 logger.warning(f"[Runner] nada para copiar de {host}:{remote_dir} (diretório remoto vazio/inexistente)")
                 return
 
-            data = base64.b64decode(b64.encode("utf-8"))
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-                tf.extractall(local_dst)
+            if s.startswith("::TARFAILED::"):
+                # Extrai stderr em base64 (se houver) para ajudar no diagnóstico
+                err_part = s[len("::TARFAILED::"):]
+                try:
+                    if err_part:
+                        err_txt = base64.b64decode(err_part.encode("utf-8"), validate=False).decode("utf-8",
+                                                                                                    errors="replace")
+                    else:
+                        err_txt = "(sem stderr)"
+                except Exception:
+                    err_txt = "(falha ao decodificar stderr)"
+                (local_dst / "remote_tar_error.txt").write_text(err_txt, encoding="utf-8")
+                logger.error(f"[Runner] tar falhou no host {host}. Detalhes em {local_dst / 'remote_tar_error.txt'}")
+                return
 
-            logger.info(f"[Runner] ok: {local_dst}")
+            # Caso normal: temos um tar.gz em base64
+            try:
+                data = base64.b64decode(s.encode("utf-8"), validate=False)
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+                    tf.extractall(local_dst)
+                logger.info(f"[Runner] ok: {local_dst}")
+            except Exception as e:
+                logger.error(f"[Runner] falha ao decodificar/extrair tar de {host}:{remote_dir} -> {local_dst}: {e}")
+
         except Exception as e:
             logger.error(f"[Runner] falha no pull {host}:{remote_dir} -> {local_dst}: {e}")
 
@@ -109,7 +165,6 @@ class ExperimentRunner:
                 "generated_at": datetime.now(timezone.utc).isoformat()
             }
             (out_base / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            # timeline.json é útil para ETL relabel
             (out_base / "timeline.json").write_text(json.dumps({"stages": stages}, indent=2), encoding="utf-8")
             logger.info(f"[Runner] metadata/timeline escritos em {out_base}")
         except Exception as e:
@@ -127,7 +182,7 @@ class ExperimentRunner:
         try:
             logger.info(f"[ETL] Iniciando pipeline ETL (exp_dir={exp_dir})")
 
-            # Import dinâmico e robusto (evita falhas se módulos estiverem em outro path)
+            # Import dinâmico e robusto
             try:
                 from lab.datasets.pre_etl import generate_conn_features
             except Exception as e:
@@ -142,14 +197,14 @@ class ExperimentRunner:
                 sys.path.append(str(self.lab_dir))
                 from lab.datasets.etl_netsec import run_etl
 
-            # 1) Pré-ETL (janelas agregadas por conn.log, com timeline/heurística)
+            # 1) Pré-ETL
             try:
                 out_csv = generate_conn_features(exp_dir, window_s=int(getattr(self, "pre_etl_window_s", 60)))
                 logger.info(f"[ETL] Pré-ETL ok: {out_csv}")
             except Exception as e:
                 logger.warning(f"[ETL] Pré-ETL falhou (seguindo para ETL direto do Zeek): {e}")
 
-            # 2) ETL final (datasets prontos para ML)
+            # 2) ETL final
             exp_id = exp_dir.name
             etl_out_dir = Path(etl_out_root) / exp_id
             etl_out_dir.mkdir(parents=True, exist_ok=True)
@@ -242,8 +297,7 @@ class ExperimentRunner:
                         attacker.run_cmd(host, cmd, timeout=ssh_timeout)
                         t_end = datetime.now(timezone.utc).isoformat()
 
-                        # timeline com base no label do template (sem forçar "Hydra" para tudo)
-                        # Adiciona estágios no timeline com rótulo do template e, quando aplicável, um token padronizado
+                        # timeline
                         token = None
                         try:
                             if ("Hydra" in label_base) or profile_id.lower().startswith("hydra"):
@@ -259,7 +313,8 @@ class ExperimentRunner:
                         if token:
                             self.timeline.append({"stage": f"{token}_start", "ts": t_start})
                             self.timeline.append({"stage": f"{token}_end", "ts": t_end})
-# verificação do Hydra apenas quando for Hydra
+
+                        # Verificação rápida do resultado Hydra
                         try:
                             is_hydra = ("Hydra" in label_base) or profile_id.lower().startswith("hydra")
                             if is_hydra:
@@ -291,10 +346,8 @@ class ExperimentRunner:
                         )
                         logger.info(f"[Runner] manifest: {manifest}")
 
-                        # === NOVO: copiar artefatos das VMs ===
-                        # Sensor: Zeek e PCAP (onde o sensor grava por padrão)
+                        # Copia artefatos das VMs
                         self._pull_tree_b64("sensor", "$HOME/tcc", ["zeek", "pcap", "run"], out_base / "sensor")
-                        # Attacker: saída do Hydra (se existir)
                         try:
                             vic_ip = ips.get("victim", "")
                             self._pull_tree_b64("attacker", "$HOME/tcc",
@@ -302,33 +355,33 @@ class ExperimentRunner:
                                                  "lists/small_wordlist.txt"], out_base / "attacker")
                         except Exception as e:
                             logger.warning(f"[Runner] hydra logs: {e}")
-                        # Victim: auth.log para reforçar brute/ssh
                         try:
                             self._pull_tree_b64("victim", "/var/log", ["auth.log", "auth.log.1"], out_base / "victim")
                         except Exception as e:
                             logger.warning(f"[Runner] auth.log: {e}")
 
-                        # === NOVO: metadata/timeline para pré-ETL/ETL ===
+                        # metadata/timeline
                         self._write_metadata_and_timeline(out_base, ips, self.timeline)
 
                         # ETL acoplado (gera datasets prontos em data/etl/<exp_id>/)
                         if run_pre_etl:
-                            # padronize a raiz de saída do ETL (use 'data/etl', não 'data/lab/etl')
                             etl_root = Path(out_dir).parent / "etl"
                             try:
                                 etl_path = self._run_etl(out_base, etl_root)
                                 if etl_path:
+                                    etl_executado = True  # evita reexecutar no finally
                                     logger.info(f"[Runner] ETL pronto em {etl_path}")
-                                try:
-                                    import json
-                                    meta = Path(etl_path) / "meta" / "label_counts.json"
-                                    if meta.exists():
-                                        counts = json.loads(meta.read_text(encoding="utf-8"))
-                                        logger.info(f"[Runner] Labels finais: {counts}")
-                                except Exception as _e:
-                                    logger.warning(f"[Runner] Falha lendo label_counts.json: {_e}")
+                                    try:
+                                        meta = Path(etl_path) / "meta" / "label_counts.json"
+                                        if meta.exists():
+                                            counts = json.loads(meta.read_text(encoding="utf-8"))
+                                            logger.info(f"[Runner] Labels finais: {counts}")
+                                        else:
+                                            logger.warning("[Runner] label_counts.json não encontrado.")
+                                    except Exception as _e:
+                                        logger.warning(f"[Runner] Falha lendo label_counts.json: {_e}")
                                 else:
-                                    logger.warning("[Runner] ETL não produziu saída (veja logs acima).")
+                                    logger.warning("[Runner] ETL não produziu saída (consulte logs do ETL).")
                             except Exception as e:
                                 logger.error(f"[Runner] ETL falhou: {e}")
                         continue
@@ -345,7 +398,7 @@ class ExperimentRunner:
                             logger.warning(f"[Runner] falha ao aguardar: {e}")
                         continue
 
-                    # --- cmd arbitrário pelo YAML (debug/etc) ---
+                    # --- cmd arbitrário pelo YAML ---
                     if "run_cmd" in action:
                         host = str(action["run_cmd"].get("host") or "attacker")
                         raw = str(action["run_cmd"].get("cmd") or "")
@@ -368,6 +421,7 @@ class ExperimentRunner:
             err = e
             logger.exception("[Runner] erro durante execução")
         finally:
+            # Sempre tenta parar sensor
             try:
                 sensor.stop()
             except Exception:
@@ -380,14 +434,44 @@ class ExperimentRunner:
             except Exception:
                 logger.warning("[Runner] não foi possível criar marker final.")
 
+            # FAILSAFE: se o usuário esqueceu 'collect_artifacts', tenta coletar e rodar ETL
+            try:
+                sensor_zeek = out_base / "sensor" / "zeek"
+                if run_pre_etl and not sensor_zeek.exists():
+                    logger.warning("[Runner] sensor/zeek ausente — acionando coleta de artefatos automaticamente (failsafe).")
+                    try:
+                        # snapshot tenta fechar/compactar rotação no host sensor
+                        sensor.collect_snapshot()
+                    except Exception as e:
+                        logger.warning(f"[Runner] snapshot (failsafe): {e}")
 
-            # Se o usuário desabilitar o run_pre_etl no futuro, ainda oferecemos um ETL ao final
+                    # puxa de cada VM (mesma lógica do collect_artifacts)
+                    self._pull_tree_b64("sensor", "$HOME/tcc", ["zeek", "pcap", "run"], out_base / "sensor")
+                    try:
+                        vic_ip = ips.get("victim", "")
+                        self._pull_tree_b64("attacker", "$HOME/tcc",
+                                            [f"lists/hydra_{vic_ip}.out", "lists/users.txt",
+                                             "lists/small_wordlist.txt"], out_base / "attacker")
+                    except Exception as e:
+                        logger.warning(f"[Runner] hydra logs (failsafe): {e}")
+                    try:
+                        self._pull_tree_b64("victim", "/var/log", ["auth.log", "auth.log.1"], out_base / "victim")
+                    except Exception as e:
+                        logger.warning(f"[Runner] auth.log (failsafe): {e}")
+
+                    self._write_metadata_and_timeline(out_base, ips, self.timeline)
+            except Exception as e:
+                logger.warning(f"[Runner] failsafe de coleta não executado: {e}")
+
+            # ETL pós (só se ainda não rodou e usuário habilitou)
             if (err is None) and (not etl_executado) and run_pre_etl:
                 try:
                     etl_root = Path(out_dir).parent / "etl"
                     etl_path = self._run_etl(out_base, etl_root)
                     if etl_path:
                         logger.info(f"[Runner] (pós) ETL pronto em {etl_path}")
+                    else:
+                        logger.warning("[Runner] (pós) ETL não gerou saída.")
                 except Exception as e:
                     logger.warning(f"[Runner] (pós) ETL falhou: {e}")
 

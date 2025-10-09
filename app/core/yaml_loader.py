@@ -4,8 +4,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import logging
+from typing import Any, Dict, List, Optional
 import yaml
 
 from app.core.logger_setup import setup_logger
@@ -62,7 +61,6 @@ def _to_profiles(obj: Any) -> Dict[str, ProfileSpec]:
     out: Dict[str, ProfileSpec] = {}
     try:
         if isinstance(obj, dict):
-            # aceita profiles como mapa: { brute_small: {id:..., template:..., params:...}, ... }
             for key, val in (obj or {}).items():
                 pd = val or {}
                 pid = str(pd.get("id") or key)

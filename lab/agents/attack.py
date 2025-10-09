@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.core.logger_setup import setup_logger
-from lab.orchestrator.yaml_loader import _join_shell_lines
+from app.core.yaml_loader import _join_shell_lines
 
 logger = setup_logger(Path('.logs'), name="[AttackExecutor]")
 

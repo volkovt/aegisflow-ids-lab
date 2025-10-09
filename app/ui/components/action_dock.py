@@ -10,14 +10,15 @@ Mantém compatibilidade com main.py:
 
 Foco TCC: agrupar ações de Infra e Dataset/Experimentos.
 """
-import logging
+from pathlib import Path
+
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QLabel, QGroupBox, QVBoxLayout as QV, QPushButton
 )
 
-logger = logging.getLogger("[ActionDock]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning  # compat
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[ActionDock]")
 
 class ActionDockWidgetExt(QFrame):
     def __init__(self, parent=None):
@@ -55,11 +56,11 @@ class ActionDockWidgetExt(QFrame):
             ev = QV(exp)
             self.btn_yaml_designer = QPushButton("Designer (YAML)")
             self.btn_pick_yaml = QPushButton("Escolher YAML")
-            self.btn_generate_dataset = QPushButton("Gerar Dataset (YAML)")
+            # self.btn_generate_dataset = QPushButton("Gerar Dataset (YAML)")
             self.btn_open_guide = QPushButton("Guia do Experimento")
-            self.btn_open_data = QPushButton("Abrir pasta data")
-            for b in (self.btn_yaml_designer, self.btn_pick_yaml, self.btn_generate_dataset,
-                      self.btn_open_guide, self.btn_open_data):
+            # self.btn_open_data = QPushButton("Abrir pasta data")
+            for b in (self.btn_yaml_designer, self.btn_pick_yaml, #self.btn_generate_dataset,
+                      self.btn_open_guide): #, self.btn_open_data):
                 ev.addWidget(b)
             root.addWidget(exp)
 

@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging, re
+from pathlib import Path
+
 from PySide6.QtCore import QThread, Signal
 
+from app.core.logger_setup import setup_logger
 from app.ui.guide.guide_utils import _is_heredoc
 
-logger = logging.getLogger("[GuideWorkers]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
-
+logger = setup_logger(Path('.logs'), name="[WORKERS]")
 
 class _FnWorker(QThread):
     result = Signal(object)
@@ -72,7 +72,8 @@ class _StreamWorker(QThread):
                         break
                     self._emit_chunk(chunk)
             else:
-                self._run_no_stream()
+                logger.warning(f"[{self.id}] usando run_command_cancellable")
+                self._run_no_stream(True)
         except Exception as e:
             self.error.emit(str(e))
             return
@@ -91,13 +92,21 @@ class _StreamWorker(QThread):
     def _run_no_stream(self, use_classic: bool = False):
         try:
             if _is_heredoc(self.cmd):
+                logger.warning(f"[{self.id}] Host: {self.host} | CMD: \n{self.cmd}\n | Timeout: {self.timeout_s}s")
                 out = self.ssh.run_command(self.host, self.cmd, timeout=self.timeout_s)
             else:
+                if use_classic:
+                    logger.warning(f"[{self.id}] usando run_command (classic)")
+                else:
+                    logger.warning(f"[{self.id}] usando run_command_cancellable")
+                logger.warning(f"[{self.id}] Host: {self.host} | CMD: {self.cmd} | Timeout: {self.timeout_s}s")
+
                 out = (
                     self.ssh.run_command(self.host, f"bash -lc '{self.cmd}'", timeout=self.timeout_s)
                     if use_classic else
                     self.ssh.run_command_cancellable(self.host, self.cmd, timeout_s=self.timeout_s)
                 )
+                logger.warning(f"[{self.id}] out: {out}")
             self._emit_block_output(out)
         except Exception as e:
             self.error.emit(str(e))

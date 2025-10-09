@@ -1,119 +1,53 @@
+# Experimento: sweep com Hydra (SSH) gerando dataset com coleta/ETL acoplados
 experiment:
   id: exp_hydra_sweep
 
 network:
+  # Segurança: o Runner aborta se não for host_only
   mode: host_only
 
-targets:
-  attacker: {}
-  victim: {}
-  sensor: {}
-
-global:
+# Variáveis globais usadas pelo Runner, perfis e templates
+gvars:
+  # Janela (segundos) para agregação no pré-ETL (conn.log -> features_conn_window.csv)
+  pre_etl_window_s: 60
+  # Duração máxima de comandos remotos via SSH (failsafe)
   max_duration_s: 900
-  pre_etl_window_s: 90
+  # Onde o atacante grava os arquivos do Hydra (na VM attacker)
   local_lists: "$HOME/tcc/lists"
 
+# Papéis das VMs (IPs são resolvidos automaticamente pelo Runner)
+roles:
+  - attacker
+  - victim
+  - sensor
+
+# Templates de ações (reuso em perfis)
 templates:
-  wait_http:
-    run_on: attacker
-    label: benign_WaitHttp
-    cmd_template: |
+  hydra_ssh_template:
+    label: "HydraSSH"
+    engine: bash
+    # O {victim} é substituído pelo Runner com o IP resolvido da vítima
+    script: |
       set -e
-      for i in $(seq 1 20); do
-        curl -s "http://{victim}:8081/" >/dev/null 2>&1 && echo "HTTP OK" && exit 0
-        sleep 0.5
-      done
-      echo "HTTP indisponível em 10s"; exit 1
+      mkdir -p "{local_lists}"
+      users_file="{local_lists}/users.txt"
+      wordlist_file="{local_lists}/small_wordlist.txt"
+      out_file="{local_lists}/hydra_{victim}.out"
 
-  hydra_ssh:
-    run_on: attacker
-    label: attack_HydraBruteAction
-    cmd_template: |
-      set -e
-      mkdir -p "$HOME/tcc/lists"
-      test -s "$HOME/tcc/lists/users.txt" || echo "vagrant" > "$HOME/tcc/lists/users.txt"
-      test -s "$HOME/tcc/lists/small_wordlist.txt" || echo "vagrant" > "$HOME/tcc/lists/small_wordlist.txt"
-      echo "[hydra] iniciando: users=$HOME/tcc/lists/{users} passlist=$HOME/tcc/lists/{passlist} threads={threads}"
-      hydra -I -V -L "$HOME/tcc/lists/{users}" -P "$HOME/tcc/lists/{passlist}" -t {threads} -o "$HOME/tcc/lists/hydra_{victim}.out" ssh://{victim}:22
+      # Se não existirem, cria entradas mínimas de usuários/senhas p/ teste
+      test -s "$users_file" || printf "vagrant\nroot\n" > "$users_file"
+      test -s "$wordlist_file" || printf "vagrant\n123456\npassword\n" > "$wordlist_file"
 
-  http_server:
-    run_on: victim
-    label: benign_HttpServer
-    cmd_template: |
-      set -e
-      nohup python3 -m http.server 8081 >/tmp/http.out 2>&1 &
-      echo "[httpd] iniciado em :8081"
-
-  http_client_noise:
-    run_on: attacker
-    label: benign_HttpNoiseAction
-    cmd_template: |
-      set -e
-      for i in $(seq 1 {http_reqs}); do
-        curl -m {curl_timeout_s} -s "http://{victim}:8081/?q=$i" >/dev/null || true
-        sleep {http_sleep}
-      done
-      echo "[http] noise concluído: {http_reqs} reqs"
-
-  nmap_syn:
-    run_on: attacker
-    label: attack_SynScan
-    cmd_template: |
-      set -e
-      nmap -Pn -sS -p 1-1024 -T4 {victim} -oN "$HOME/tcc/nmap_{victim}_syn.txt" || true
-      tail -n 5 "$HOME/tcc/nmap_{victim}_syn.txt" || true
+      echo "[hydra] atacando {victim}:22 (SSH); saída: $out_file"
+      hydra -L "$users_file" -P "$wordlist_file" -t 4 -f -o "$out_file" ssh://{victim}:22
 
 profiles:
-  wait_http:
-    id: wait_http
-    template: wait_http
-
-  brute_small:
-    id: brute_small
-    template: hydra_ssh
-    params:
-      users: "users.txt"
-      passlist: "small_wordlist.txt"
-      threads: 8
-      duration_s: 300     # antes: 120
-
-  brute_heavy:
-    id: brute_heavy
-    template: hydra_ssh
-    params:
-      users: "users.txt"
-      passlist: "small_wordlist.txt"
-      threads: 12
-      duration_s: 420     # antes: 180
-
-  http_server:
-    id: http_server
-    template: http_server
-
-  http_noise_fast:
-    id: http_noise_fast
-    template: http_client_noise
-    params:
-      http_reqs: 120
-      http_sleep: 0.05
-      curl_timeout_s: 2
-      duration_s: 30
-
-  http_noise_slow:
-    id: http_noise_slow
-    template: http_client_noise
-    params:
-      http_reqs: 60
-      http_sleep: 0.25
-      curl_timeout_s: 1
-      duration_s: 50
-
-  syn_scan:
-    id: syn_scan
-    template: nmap_syn
-    params:
-      duration_s: 45
+  # Perfil que instancia o template acima no host 'attacker'
+  hydra_ssh_quick:
+    template: hydra_ssh_template
+    host: attacker
+    # timeout de SSH usado pelo Runner
+    timeout_s: 420
 
 workflow:
   - name: safety
@@ -124,47 +58,26 @@ workflow:
   - name: start
     actions:
       - start_sensor: {}
-      - run_profile: { profile_id: http_server }
-      - run_profile: { profile_id: wait_http }
-      - wait_seconds: { seconds: 1 }
-
-  - name: warmup_benign
-    actions:
-      - run_profile: { profile_id: http_noise_fast }
-      - wait_seconds: { seconds: 5 }
-
-  - name: pre_attack_scan
-    actions:
-      - run_profile: { profile_id: syn_scan }
-      - wait_seconds: { seconds: 3 }
+      # Pequeno aquecimento benigno para o Zeek registrar tráfego de base
+      - run_cmd:
+          host: attacker
+          cmd: |
+            set -e
+            for i in $(seq 1 20); do
+              curl -s "http://{victim}:80/" >/dev/null && echo "HTTP OK" && break
+              sleep 0.5
+            done || { echo "HTTP indisponível em 10s"; exit 1; }
+      - wait_seconds: { seconds: 2 }
 
   - name: attack_hydra
     actions:
-      - run_profile: { profile_id: brute_small }
+      - run_profile: { profile_id: hydra_ssh_quick }
       - wait_seconds: { seconds: 3 }
-      - run_profile: { profile_id: brute_heavy }
-      - wait_seconds: { seconds: 5 }
 
-  - name: post_noise
+  - name: stop_and_collect
     actions:
-      - run_profile: { profile_id: http_noise_slow }
-      - wait_seconds: { seconds: 5 }
-
-
-  # (Opcional) Passo de debug para inspecionar listas no atacante
-  # - name: debug_lists
-  #   actions:
-  #     - run_cmd:
-  #         host: attacker
-  #         cmd: >
-  #           ls -lh {local_lists} || true;
-  #           echo "--- users.txt ---";
-  #           head -n 5 {local_lists}/users.txt || true;
-  #           echo "--- small_wordlist.txt ---";
-  #           head -n 5 {local_lists}/small_wordlist.txt || true
-
-
-notes:
-  - "O runner deve substituir {victim}, {attacker}, {sensor} por IPs resolvidos."
-  - "NUNCA permitir execução se network.mode != host_only; falhar com erro claro."
-  - "As palavras de lista (wordlist) devem estar no diretório do attacker ou transferidas antes."
+      - stop_sensor: {}
+      # Margem para flush dos logs do Zeek/tcpdump
+      - wait_seconds: { seconds: 3 }
+      # ESSENCIAL: coleta artefatos + escreve metadata/timeline + roda ETL
+      - collect_artifacts: {}

@@ -3,7 +3,6 @@ from typing import Callable
 from pathlib import Path
 import logging
 
-
 class VagrantContextService:
     """
     Constrói o contexto do Vagrantfile a partir do config + YAML de experimento.

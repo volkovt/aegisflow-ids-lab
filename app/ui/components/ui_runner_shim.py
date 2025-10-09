@@ -12,7 +12,7 @@ def _ts():
 def _import_orchestrator():
     try:
         from lab.orchestrator.runner import ExperimentRunner
-        from lab.orchestrator.yaml_loader import load_experiment_from_yaml
+        from app.core.yaml_loader import load_experiment_from_yaml
         return load_experiment_from_yaml, ExperimentRunner
     except Exception as e:
         logger.error(f"[UIRunnerShim] Erro: {e}")

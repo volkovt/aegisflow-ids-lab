@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any
 import logging
 
-logger = logging.getLogger("[ConfigLoader]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[ConfigLoader]")
 
 @dataclass
 class SyncedFolder:

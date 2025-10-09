@@ -1,11 +1,13 @@
+from pathlib import Path
+
 from PySide6.QtGui import QGuiApplication, QFontMetrics
 from PySide6.QtWidgets import QToolTip, QSizePolicy
 from PySide6.QtWidgets import QPushButton, QWidget
 from PySide6.QtCore import Qt
 
-import logging
+from app.core.logger_setup import setup_logger
 
-_ui_logger = logging.getLogger("[InfoPill]")
+_ui_logger = setup_logger(Path('.logs'), name="[InfoPills]")
 
 class InfoPill(QPushButton):
     """

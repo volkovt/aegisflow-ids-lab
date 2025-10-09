@@ -2,9 +2,12 @@
 import logging
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Iterable
 
-logger = logging.getLogger("[Preflight]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[PreflightEnforcer]")
 
 class PreflightEnforcer:
     def __init__(self, vagrant_manager, lab_dir: str, max_age_minutes: int = 10):

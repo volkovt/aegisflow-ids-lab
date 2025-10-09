@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 import logging
+from pathlib import Path
+from shiboken6 import isValid as shiboken_is_valid
+
 from PySide6.QtCore import Qt, Signal, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QAction, QFontMetrics, QPixmap, QGuiApplication, QClipboard, QColor
 from PySide6.QtWidgets import (
@@ -7,21 +10,20 @@ from PySide6.QtWidgets import (
     QPushButton, QPlainTextEdit, QMessageBox, QGraphicsOpacityEffect
 )
 
+from app.core.logger_setup import setup_logger
 from app.ui.components.anim_utils import crossfade_label_pixmap, HoverGlowFilter
 from app.ui.components.machine_avatar import ICONS
 from app.ui.guide.spinner import _MiniSpinner
-from app.ui.guide.guide_utils import build_copy_payloads
+from app.ui.guide.guide_utils import build_copy_payloads, wrap_b64_for_copy
 
-logger = logging.getLogger("[GuideCard]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
 
+logger = setup_logger(Path('.logs'), name="[StepCardWidget]")
 
 def role_from_host(host: str) -> str:
     try:
         h = (host or "").strip().lower()
-        if h.startswith("vit"):  # vitima/victim
-            return "general"
+        if h.startswith("vic") or h.startswith("vit"):  # vitima/victim
+            return "victim"
         if h.startswith("att") or "attack" in h or h == "attacker" or "kali" in h:
             return "attacker"
         if h.startswith("sensor") or "sensor" in h or "zeek" in h or "snort" in h:
@@ -84,7 +86,8 @@ class StepCard(QFrame):
         title.setObjectName("GuideTitle")
         title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         fm = QFontMetrics(title.font())
-        title.setToolTip(title.text())
+        #title.setToolTip(title.text())
+        title.setToolTip(self._meta_text())
         title.setText(fm.elidedText(title.text(), Qt.ElideRight, 720))
         header.addWidget(title)
 
@@ -102,13 +105,24 @@ class StepCard(QFrame):
         desc.setWordWrap(True)
         layout.addWidget(desc)
 
-        # Comando (aceita 'command' ou 'cmd')
+        timeout_s = self.step.get("timeout", 0)
+        if timeout_s and isinstance(timeout_s, int) and timeout_s > 0:
+            to_lbl = QLabel(f"Timeout: {timeout_s} segundos")
+            to_lbl.setObjectName("GuideDesc")
+            layout.addWidget(to_lbl)
+
+        meta_lbl = QLabel(self._meta_text())
+        meta_lbl.setObjectName("GuideMeta")
+        meta_lbl.setWordWrap(True)
+        meta_lbl.setStyleSheet("color: rgba(255,255,255,0.65); font-size: 12px;")
+        layout.addWidget(meta_lbl)
+
         cmd_text = (self.step.get("command") or self.step.get("cmd") or "")
         self.cmd_box = QPlainTextEdit(cmd_text)
         self.cmd_box.setObjectName("GuideCmdBox")
-        self.cmd_box.setReadOnly(False)
+        self.cmd_box.setReadOnly(True)
         self.cmd_box.setPlaceholderText("Comando a executar no host deste passo…")
-        self.cmd_box.setFixedHeight(86)
+        self.cmd_box.setFixedHeight(100)
         layout.addWidget(self.cmd_box)
 
         # Artefatos esperados
@@ -177,43 +191,68 @@ class StepCard(QFrame):
     def _build_copy_button(self, step: dict) -> QPushButton:
         btn = QPushButton("Copiar")
         btn.setObjectName("HoloBtn")
-        btn.setMenu(self._build_copy_menu(step))
+
+        menu = QMenu(self)
+        a_norm = QAction("Normal", self)
+        a_b64 = QAction("Base64", self)
+        a_script = QAction("Script .sh", self)
+        menu.addAction(a_norm)
+        menu.addAction(a_b64)
+        menu.addAction(a_script)
+        btn.setMenu(menu)
+
+        def _default_script(cmd_text: str) -> str:
+            cmd_text = (cmd_text or "").strip()
+            shebang = "#!/usr/bin/env bash\nset -euo pipefail\n\n"
+            return shebang + (cmd_text + "\n" if cmd_text else "")
 
         def _copy_current():
             try:
-                normal, b64, script_text = build_copy_payloads(step)
-                key = self._copy_mode
-                payload = {"normal": normal, "b64": b64, "script": script_text}.get(key, "")
+                # Valores do step (separados por tipo) + fallback para o que o usuário editou na caixa
+                normal, b64, script_text = build_copy_payloads(
+                    step)  # usa keys command_normal/command/command_b64/script
+                live_cmd = (self.cmd_box.toPlainText() or "").strip()
+
+                key = self._copy_mode  # "normal" | "b64" | "script"
+
+                if key == "normal":
+                    payload = (normal or live_cmd)
+                elif key == "b64":
+                    payload = b64 or (wrap_b64_for_copy(live_cmd) if live_cmd else "")
+                else:  # "script"
+                    payload = script_text or _default_script(live_cmd)
+
                 payload = (payload or "").strip()
                 if not payload:
                     QMessageBox.warning(self, "Copiar", "Nada para copiar.")
                     return
+
                 cb = QGuiApplication.clipboard()
                 cb.setText(payload, mode=QClipboard.Clipboard)
                 try:
                     cb.setText(payload, mode=QClipboard.Selection)
                 except Exception:
                     pass
-                self.status.setText(f"Copiado ✓ ({'Normal' if key=='normal' else ('Base64' if key=='b64' else 'Script')})")
+
+                label = "Normal" if key == "normal" else ("Base64" if key == "b64" else "Script")
+                self.status.setText(f"Copiado ✓ ({label})")
                 self.copy_clicked.emit(payload)
             except Exception as e:
                 logger.error(f"[GuideCard] copy: {e}")
                 QMessageBox.critical(self, "Erro", f"Não foi possível copiar. {e}")
 
+        # Clique direto no botão → copia usando o modo atual
         btn.clicked.connect(_copy_current)
-        return btn
 
-    def _build_copy_menu(self, step: dict) -> QMenu:
-        menu = QMenu(self)
-        a_norm = QAction("Normal", self)
-        a_b64 = QAction("Base64", self)
-        a_script = QAction("Script .sh", self)
-        for a in (a_norm, a_b64, a_script):
-            menu.addAction(a)
-        a_norm.triggered.connect(lambda: setattr(self, "_copy_mode", "normal"))
-        a_b64.triggered.connect(lambda: setattr(self, "_copy_mode", "b64"))
-        a_script.triggered.connect(lambda: setattr(self, "_copy_mode", "script"))
-        return menu
+        # Escolha pelo menu deve, além de mudar o modo, copiar imediatamente
+        a_norm.triggered.connect(lambda: (setattr(self, "_copy_mode", "normal"), _copy_current()))
+        a_b64.triggered.connect(lambda: (setattr(self, "_copy_mode", "b64"), _copy_current()))
+        a_script.triggered.connect(lambda: (setattr(self, "_copy_mode", "script"), _copy_current()))
+
+        # Dica visual útil
+        btn.setToolTip("Clique para copiar (usa o modo atual). Pelo menu, escolha o formato e copia na hora.")
+
+        return btn
 
     def _emit_ssh(self, step: dict, cmd_text: str = ""):
         try:
@@ -222,6 +261,7 @@ class StepCard(QFrame):
                 host = "victim"
             self.status.setText("Abrindo SSH…")
             self.btn_ssh.setEnabled(False)
+            logger.info(f"[GuideCard] emit_ssh: host={host} cmd='\n{cmd_text}'")
             self.ssh_clicked.emit(host, cmd_text)
         except Exception as e:
             logger.error(f"[GuideCard] ssh: {e}")
@@ -243,27 +283,43 @@ class StepCard(QFrame):
 
     def _refresh_header_icon(self):
         try:
+            if not getattr(self, "header_icon", None) or not shiboken_is_valid(self.header_icon):
+                return
+
             pm: QPixmap | None = ICONS.get_icon(self._role, self._vis, 22)
             if pm is not None and not pm.isNull():
+                if not shiboken_is_valid(self.header_icon):
+                    return
                 self.header_icon.setProperty("vis", self._vis)
                 crossfade_label_pixmap(self.header_icon, pm, duration=170)
-                self.header_icon.setToolTip(f"{self._role} | {self._vis}")
+                try:
+                    self.header_icon.setToolTip(f"{self._role} | {self._vis}")
+                except Exception:
+                    pass
             else:
-                self.header_icon.clear()
+                if shiboken_is_valid(self.header_icon):
+                    self.header_icon.clear()
         except Exception as e:
-            logger.error(f"[GuideCard] header icon: {e}")
+            msg = str(e)
+            logger.error(f"[GuideCard] header icon: {msg}")
 
     def _update_action_enabled(self):
         try:
             online = (self._vis == "online")
-            if hasattr(self, "btn_run") and self.btn_run:
-                self.btn_run.setEnabled(online)
-                tip = "Disponível quando a máquina estiver ONLINE." if not online else "Executar no host."
-                self.btn_run.setToolTip(tip)
-            if hasattr(self, "btn_ssh") and self.btn_ssh:
-                self.btn_ssh.setEnabled(online)
-                tip = "Disponível quando a máquina estiver ONLINE." if not online else "Abrir sessão SSH."
-                self.btn_ssh.setToolTip(tip)
+
+            def _safe_set(btn_attr: str, tip_online: str, tip_offline: str):
+                btn = getattr(self, btn_attr, None)
+                if not btn or not shiboken_is_valid(btn):
+                    return
+                try:
+                    btn.setEnabled(online)
+                    tip = tip_online if online else tip_offline
+                    btn.setToolTip(tip)
+                except Exception as ex:
+                    logger.debug(f"[GuideCard] _safe_set {btn_attr}: {ex}")
+
+            _safe_set("btn_run", "Executar no host.", "Disponível quando a máquina estiver ONLINE.")
+            _safe_set("btn_ssh", "Abrir sessão SSH.", "Disponível quando a máquina estiver ONLINE.")
         except Exception as e:
             logger.error(f"[GuideCard] _update_action_enabled: {e}")
 
@@ -275,17 +331,6 @@ class StepCard(QFrame):
             self._update_action_enabled()
         except Exception as e:
             logger.error(f"[GuideCard] set_machine_visibility: {e}")
-
-    def set_machine_role(self, role: str):
-        try:
-            r = role_from_host(role)
-            self._role = r
-            self._refresh_header_icon()
-        except Exception as e:
-            logger.error(f"[GuideCard] set_machine_role: {e}")
-
-    def get_role(self) -> str:
-        return self._role
 
     def matches_role(self, role: str) -> bool:
         try:

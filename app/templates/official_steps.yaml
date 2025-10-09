@@ -1,0 +1,404 @@
+# Metadados do guia (opcional)
+meta:
+  name: official_experiment_steps
+  version: 1
+
+steps:
+  - id: preflight
+    title: "Preflight do Lab"
+    description: "Valida virtualização, Vagrant, rede host-only e chaves SSH."
+    host: attacker
+    tags: ["safety", "infra"]
+    eta: "~1 min"
+    timeout: 60
+    artifacts: []
+    script: 'echo "[preflight] OK (executado pela UI principal)."'
+
+  - id: up_vms
+    title: "Subir e aquecer VMs"
+    description: "Suba sensor, vítima e atacante. Aguarde SSH ficar pronto (a UI já faz o aquecimento)."
+    host: attacker
+    tags: ["infra"]
+    eta: "~2-4 min"
+    timeout: 240
+    artifacts: []
+    script: 'echo "[infra] VMs UP (executado pela UI principal)."'
+
+  - id: attacker_sudo_diag
+    title: "Diagnóstico sudo/PTY no atacante"
+    description: "Verifica se sudo -n funciona e se base64 existe (evita 255 silencioso)."
+    host: attacker
+    tags: ["infra", "diagnostic"]
+    eta: "<3s"
+    timeout: 10
+    artifacts: []
+    script: |
+      set -e
+      echo "[diag] whoami=$(whoami)"
+      if sudo -n true 2>/dev/null; then
+        echo "[diag] sudo -n OK (NOPASSWD ativo)"
+      else
+        echo "[diag] sudo -n FALHOU (sem NOPASSWD ou sudo exige TTY)"
+        exit 42
+      fi
+      if command -v base64 >/dev/null 2>&1; then
+        echo "[diag] base64 OK"
+      else
+        echo "[diag] base64 ausente"
+        exit 43
+      fi
+
+  - id: attacker_prepare
+    title: "Preparar atacante (Kali): keyring + ferramentas"
+    description: "Corrige keyring/repos e instala nmap/slowhttptest/curl/jq; tenta Hydra e faz fallback para ncrack/patator."
+    host: attacker
+    tags: ["infra", "tools"]
+    eta: "~2-4 min"
+    timeout: 300
+    artifacts: []
+    script: |
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      unalias rm 2>/dev/null || true
+
+      cp /etc/apt/sources.list /etc/apt/sources.list.bak.$(date +%F) || true
+      printf "deb [signed-by=/usr/share/keyrings/kali-archive-keyring.gpg] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware\n" > /etc/apt/sources.list
+      apt-get clean
+      rm -rf /var/lib/apt/lists/* || true
+      apt-get update || true
+      apt-get install -y --reinstall kali-archive-keyring || true
+      apt-get update -o Acquire::AllowInsecureRepositories=true || true
+      apt-get install -y --reinstall kali-archive-keyring -o APT::Get::AllowUnauthenticated=true || true
+      if command -v curl >/dev/null 2>&1 && command -v gpg >/dev/null 2>&1; then
+        curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor > /usr/share/keyrings/kali-archive-keyring.gpg || true
+      fi
+
+      if dpkg -l 2>/dev/null | awk '/^.r|^.U/ {print $2}' | grep -Eq '^(firebird4\.0-common|libfbclient2|hydra)$'; then
+        echo "[attacker] >>> dpkg com pacotes presos; removendo e atualizando Perl…"
+        dpkg --remove --force-remove-reinstreq hydra libfbclient2:amd64 firebird4.0-common || true
+        apt-get update || true
+        apt-get install -y perl-base perl || true
+        apt-get -y -f install || true
+        apt-get -y full-upgrade || true
+      fi
+
+      apt-get update || true
+      apt-get install -y --no-install-recommends netcat-traditional nmap slowhttptest curl jq || true
+
+      set +e
+      apt-get install -y --no-install-recommends hydra
+      hydra_ok=$?
+      set -e
+
+      if [ $hydra_ok -ne 0 ] || ! command -v hydra >/dev/null 2>&1; then
+        echo "[attacker] >>> Hydra indisponível; instalando alternativas (ncrack/patator)…"
+        apt-get install -y --no-install-recommends ncrack patator || true
+      fi
+
+      echo "[attacker] Ferramentas instaladas/ok:"
+      nmap --version | head -1 || true
+      if command -v hydra >/dev/null 2>&1; then
+        hydra -V 2>/dev/null | head -1 || true
+      else
+        echo "[MISSING] hydra"
+      fi
+      slowhttptest -h | head -1 || true
+      curl --version | head -1 || true
+      jq --version || true
+      if command -v ncrack >/dev/null 2>&1; then ncrack --version | head -1 || true; fi
+      if command -v patator >/dev/null 2>&1; then patator --help | head -3 | tail -1 || true; fi
+
+  - id: sensor_prepare
+    title: "Preparar sensor: Zeek (OBS xUbuntu_20.04) + ferramentas"
+    description: "Instala Zeek e utilitários (tcpdump, tshark, jq, curl etc.), ajusta PATH e valida versões."
+    host: sensor
+    tags: ["infra", "tools", "sensor", "zeek"]
+    eta: "~2-5 min"
+    timeout: 300
+    artifacts: []
+    script: |
+      set -e
+      export DEBIAN_FRONTEND=noninteractive
+
+      echo "[sensor] >>> Atualizando índices e instalando utilitários base…"
+      apt-get update || true
+      apt-get install -y \
+        tcpdump jq curl gnupg ca-certificates apt-transport-https \
+        tmux iproute2 net-tools ethtool iftop tshark || true
+
+      echo "[sensor] >>> Configurando repositório do Zeek (OBS, xUbuntu_20.04)…"
+      if ! command -v zeek >/dev/null 2>&1 && [ ! -x /opt/zeek/bin/zeek ]; then
+        echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_20.04/ /' \
+          | tee /etc/apt/sources.list.d/security:zeek.list
+        curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_20.04/Release.key \
+          | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+        apt-get update
+        apt-get install -y zeek
+      fi
+
+      echo "[sensor] >>> Ajustando PATH do Zeek e atalho…"
+      if [ -x /opt/zeek/bin/zeek ]; then
+        printf 'export PATH=/opt/zeek/bin:$PATH\n' | tee /etc/profile.d/zeek.sh >/dev/null
+        chmod +x /etc/profile.d/zeek.sh
+        ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek || true
+        . /etc/profile || true
+      fi
+
+      echo "[sensor] >>> Verificando versões instaladas…"
+      tcpdump --version | head -1 || true
+      if command -v zeek >/dev/null 2>&1; then
+        zeek --version | head -1 || true
+      elif [ -x /opt/zeek/bin/zeek ]; then
+        /opt/zeek/bin/zeek --version | head -1 || true
+      else
+        echo "[MISSING] zeek"
+      fi
+      tshark -v 2>/dev/null | head -1 || true
+      jq --version || true
+      curl --version | head -1 || true
+
+  - id: attacker_tools_check
+    title: "Verificar ferramentas no attacker"
+    description: "Confere nmap/slowhttptest/curl/jq e valida Hydra OU Ncrack OU Patator."
+    host: attacker
+    tags: ["infra", "verify"]
+    eta: "~5-10s"
+    timeout: 20
+    artifacts: []
+    script: |
+      set -e
+      missing=0
+
+      check_ver() {
+        bin="$1"
+        if command -v "$bin" >/dev/null 2>&1; then
+          ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
+        else
+          echo "[MISSING] $bin"
+          missing=$((missing+1))
+        fi
+      }
+
+      echo "[attacker] >>> checando ferramentas base:"
+      for b in nmap slowhttptest curl jq; do
+        check_ver "$b"
+      done
+
+      echo "[attacker] >>> checando ferramenta de brute-force:"
+      if command -v hydra >/dev/null 2>&1; then
+        hydra -V 2>/dev/null | head -1 || true
+      elif command -v ncrack >/dev/null 2>&1; then
+        ncrack --version 2>/dev/null | head -1 || true
+      elif command -v patator >/dev/null 2>&1; then
+        patator --help 2>/dev/null | head -3 | tail -1 || true
+      else
+        echo "[MISSING] hydra/ncrack/patator"
+        missing=$((missing+1))
+      fi
+
+      if [ $missing -ne 0 ]; then
+        echo "[attacker] >>> faltando $missing ferramenta(s)."
+        exit $missing
+      fi
+      echo "[attacker] >>> OK"
+
+  - id: sensor_tools_check
+    title: "Verificar ferramentas no sensor"
+    description: "Confere tcpdump/jq/curl/zeek (também em /opt/zeek/bin) e mostra versões."
+    host: sensor
+    tags: ["infra", "verify"]
+    eta: "~5-10s"
+    timeout: 20
+    artifacts: []
+    script: |
+      set -e
+      missing=0
+      check_ver() {
+        bin="$1"
+        if command -v "$bin" >/dev/null 2>&1; then
+          ($bin --version 2>/dev/null || $bin -h 2>/dev/null || echo "$bin presente") | head -1
+        else
+          echo "[MISSING] $bin"
+          missing=$((missing+1))
+        fi
+      }
+
+      echo "[sensor] >>> checando ferramentas:"
+      for b in tcpdump jq curl; do
+        check_ver "$b"
+      done
+
+      if command -v zeek >/dev/null 2>&1; then
+        zeek --version | head -1 || true
+      elif [ -x /opt/zeek/bin/zeek ]; then
+        /opt/zeek/bin/zeek --version | head -1 || true
+      else
+        echo "[MISSING] zeek"
+        missing=$((missing+1))
+      fi
+
+      if [ $missing -ne 0 ]; then
+        echo "[sensor] >>> faltando $missing ferramenta(s)."
+        exit $missing
+      fi
+      echo "[sensor] >>> OK"
+
+  - id: connectivity
+    title: "Checagem de conectividade com a vítima"
+    description: "Ping e tentativas de conexão a portas comuns para validar o alvo."
+    host: attacker
+    tags: ["infra", "recon"]
+    eta: "<15s"
+    timeout: 30
+    artifacts: []
+    script: |
+      set -e
+      ping -c 2 {victim_ip} || true
+      nc -zv {victim_ip} 22 || true
+      nc -zv {victim_ip} 80 || true
+      echo "[check] conectividade básica testada"
+
+  - id: hydra_lists
+    title: "Gerar listas de usuários/senhas (Hydra)"
+    description: "Cria ~/users.txt e ~/passwords.txt (não sobrescreve se já existirem)."
+    host: attacker
+    tags: ["prep", "credential_access"]
+    eta: "<5s"
+    timeout: 15
+    artifacts: ["~/users.txt", "~/passwords.txt"]
+    # Você pode sobrescrever defaults em top-level 'brute' ou via actions[].params
+    params:
+      users_inline: ["admin","user","test","tcc"]
+      pass_inline: ["123456","password","wrongpass","tcc2025"]
+    script: |
+      set -e
+      test -f ~/users.txt     || echo -e "{users_block}" | tee ~/users.txt >/dev/null
+      test -f ~/passwords.txt || echo -e "{pwds_block}" | tee ~/passwords.txt >/dev/null
+      wc -l ~/users.txt ~/passwords.txt || true
+
+  - id: sensor_capture_show
+    title: "Ativar captura e exibir provas (PCAP + Zeek)"
+    description: "Liga tcpdump e Zeek, gera tráfego de teste e imprime amostras (conn.log, pcaps, tails)."
+    host: sensor
+    tags: ["capture", "healthcheck", "sensor", "zeek"]
+    eta: "<15s"
+    timeout: 60
+    artifacts: ["/var/log/pcap/*.pcap", "/var/log/zeek/conn.log", "/var/log/zeek/zeek.out"]
+    params:
+      rotate_seconds: 300
+      rotate_size_mb: 100
+    script: |
+      set -Eeuo pipefail
+
+      log() { printf "[sensor] %s\n" "$*"; }
+
+      mkdir -p /var/log/pcap /var/log/zeek /var/run/sensor
+      chown -R tcpdump:tcpdump /var/log/pcap || true
+      chmod 0755 /var/log/pcap /var/log/zeek || true
+
+      attacker="{attacker_ip}"
+      victim="{victim_ip}"
+
+      # Descobre a interface com AWK correto
+      iface=$(ip route get "$victim" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+      [ -z "${iface:-}" ] && iface=$(ip route get "$attacker" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+      [ -z "${iface:-}" ] && iface=$(ip -br link | awk '/UP/ && !/LOOPBACK/ {print $1; exit}')
+      log "usando iface: $iface"
+
+      pkill -f "tcpdump -i $iface" 2>/dev/null || true
+      pkill -f "zeek -i $iface"    2>/dev/null || true
+      sleep 0.3
+
+      nohup /usr/sbin/tcpdump -i "$iface" -s 0 -U -nn \
+        -w /var/log/pcap/exp_%Y%m%d_%H%M%S.pcap -G {rotate_seconds} -C {rotate_size_mb} -W 48 -Z tcpdump \
+        >/var/log/pcap/tcpdump.out 2>&1 &
+
+      sleep 0.8
+      if ! pgrep -fa "tcpdump -i $iface" >/dev/null; then
+        log "ERRO ao iniciar tcpdump — últimas linhas:"
+        tail -n 60 /var/log/pcap/tcpdump.out || true
+        exit 1
+      fi
+
+      ZEEXE=$(command -v zeek || echo /opt/zeek/bin/zeek)
+      truncate -s 0 /var/log/zeek/zeek.out || true
+      nohup "$ZEEXE" -i "$iface" -C \
+        -e 'redef Log::default_logdir="/var/log/zeek";' \
+        >>/var/log/zeek/zeek.out 2>&1 &
+      sleep 1.2
+      if ! pgrep -fa "zeek -i $iface" >/dev/null; then
+        log "ERRO ao iniciar Zeek — últimas linhas:"
+        tail -n 80 /var/log/zeek/zeek.out || true
+        exit 1
+      fi
+
+      log "processos iniciados com sucesso"
+
+      (ping -c 6 "$attacker" >/dev/null 2>&1 & ping -c 6 "$victim" >/dev/null 2>&1 &)
+      sleep 0.4
+      nc -z -w1 "$victim" 22  >/dev/null 2>&1 || true
+      curl -m 2 -s "http://$victim:80/" >/dev/null 2>&1 || true
+      nc -z -w1 "$attacker" 22 >/dev/null 2>&1 || true
+      sleep 1
+
+      echo "[health] processos relevantes:"
+      pgrep -fa "tcpdump -i" || true
+      pgrep -fa "zeek -i"    || true
+
+      echo "[health] últimos arquivos:"
+      ls -lh /var/log/pcap/*.pcap 2>/dev/null | tail -n 5 || true
+      ls -lh /var/log/zeek/*.log  2>/dev/null | tail -n 10 || true
+
+      echo "[health] amostra do conn.log:"
+      if [ -f /var/log/zeek/conn.log ]; then
+        grep -m1 '^#fields' /var/log/zeek/conn.log || true
+        grep -v '^#' /var/log/zeek/conn.log | tail -n 5 | sed -e 's/\t/ | /g' || true
+      else
+        echo "[warn] conn.log ainda não criado — gere tráfego e rode novamente o passo."
+      fi
+
+      echo "[health] tails dos serviços:"
+      tail -n 10 /var/log/pcap/tcpdump.out 2>/dev/null || true
+      tail -n 10 /var/log/zeek/zeek.out    2>/dev/null || true
+
+# Ações (template) — replicam a lógica de _steps_from_actions (nmap, hydra_brute, dos, custom)
+actions:
+  - name: nmap_scan
+    title: "Varredura (Nmap)"
+    params:
+      flags: "-sS -sV -T4"
+      ports: "1-1024"
+      output: "~/exp_scan"
+    host: attacker
+    tags: ["recon", "MITRE:T1046"]
+
+  - name: hydra_brute
+    title: "Força bruta (Hydra)"
+    params:
+      user: "~/users.txt"          # ou users_inline no mesmo YAML
+      pass_list: "~/passwords.txt" # ou pass_inline no mesmo YAML
+      service: "ssh"
+      path: "/login"
+      extra: ""
+      port: null
+      output: "~/exp_brute.hydra"
+    host: attacker
+    tags: ["credential_access", "MITRE:T1110"]
+
+  - name: slowhttp_dos
+    title: "DoS controlado (slowhttptest)"
+    params:
+      duration_s: 60
+      concurrency: 400
+      rate: 50
+      port: 80
+      output_prefix: "~/exp_dos"
+    host: attacker
+    tags: ["impact","safety"]
+
+  - name: custom
+    title: "Ação customizada"
+    params:
+      command: "echo 'substitua por comando customizado'"
+    host: attacker
+    tags: ["custom"]

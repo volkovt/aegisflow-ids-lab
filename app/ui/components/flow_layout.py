@@ -1,10 +1,12 @@
 # --- Pills futuristas e FlowLayout para quebrar linha automaticamente ---
-import logging
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
-from PySide6.QtGui import QFontMetrics, QGuiApplication, QIcon
-from PySide6.QtWidgets import QPushButton, QLayout, QWidget, QToolTip
+from pathlib import Path
 
-_ui_logger = logging.getLogger("[FlowLayout]")
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtWidgets import QLayout
+
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[FlowLayout]")
 
 class FlowLayout(QLayout):
     def __init__(self, parent=None, margin=0, hspacing=6, vspacing=6, alignment=Qt.AlignLeft):

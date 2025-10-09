@@ -2,17 +2,15 @@
 import base64, logging, re, shlex
 from pathlib import Path
 
-logger = logging.getLogger("[GuideUtils]")
-if not hasattr(logger, "warn"):
-    logger.warn = logger.warning
+from app.core.logger_setup import setup_logger
 
+logger = setup_logger(Path('.logs'), name="[GuideUtils]")
 
 def _safe(obj):
     try:
         return repr(obj)
     except Exception:
         return f"<{type(obj).__name__}>"
-
 
 def _is_heredoc(cmd: str) -> bool:
     t = cmd or ""

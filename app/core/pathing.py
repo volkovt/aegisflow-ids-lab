@@ -1,9 +1,10 @@
 # app/core/pathing.py
 import os
-import logging
 from pathlib import Path
 
-logger = logging.getLogger("[Pathing]")
+from app.core.logger_setup import setup_logger
+
+logger = setup_logger(Path('.logs'), name="[Pathing]")
 
 def get_project_root(start: Path | None = None) -> Path:
     p = (start or Path(__file__)).resolve()

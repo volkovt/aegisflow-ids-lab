@@ -1,14 +1,10 @@
 from __future__ import annotations
 from typing import Callable, Tuple
-import logging
-
-from PySide6.QtCore import QTimer
-
 
 class MachineInfoService:
     """Coleta e normaliza informações de SO/Host/IP das VMs."""
 
-    def __init__(self, *, vagrant, ssh, cfg, lab_dir, append_log: Callable[[str], None], logger: logging.Logger):
+    def __init__(self, *, vagrant, ssh, cfg, lab_dir, append_log: Callable[[str], None], logger):
         self.vagrant = vagrant
         self.ssh = ssh
         self.cfg = cfg
