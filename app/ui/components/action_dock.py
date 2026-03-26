@@ -31,9 +31,9 @@ class ActionDockWidgetExt(QFrame):
             root.setContentsMargins(12, 12, 12, 12)
             root.setSpacing(12)
 
-            title = QLabel("VagrantLabUI")
+            title = QLabel("LabSecUI")
             title.setObjectName("dockTitle")
-            subtitle = QLabel("ML IDS Lab — Matrix Edition")
+            subtitle = QLabel("Orquestrador de laboratórios de segurança")
             subtitle.setObjectName("dockSubtitle")
             root.addWidget(title)
             root.addWidget(subtitle)

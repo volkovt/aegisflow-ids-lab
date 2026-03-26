@@ -71,6 +71,9 @@ class ExperimentGuideDialog(QDialog):
         self._step_watchdog: QTimer | None = None
         self._step_sent_done: bool = False
 
+        self._batch_delay_ms = 800  # ajuste aqui seu “N segundinhos”: 800 ms = 0.8s
+        self._step_final_called = False
+
         self._build_ui()
         QTimer.singleShot(0, self._start_loading_with_watchdog)
 
@@ -123,9 +126,11 @@ class ExperimentGuideDialog(QDialog):
                 except Exception as e:
                     logger.warning(f"[Guide] watchdog: set_done falhou: {e}")
             self._append_console("[guide] Watchdog: passo encerrado por timeout (UI).")
-
+            if not self._step_final_called:
+                self._step_final_called = True
+                self._on_step_final(card, step)
             # Fecha timeline e progresso para não travar
-            self._on_step_final(card, step)
+            # self._on_step_final(card, step)
         except Exception as e:
             logger.error(f"[Guide] _on_step_watchdog_timeout: {e}")
 
@@ -721,13 +726,31 @@ class ExperimentGuideDialog(QDialog):
         w.finished.connect(lambda: self._cleanup_worker(w))
         w.start()
 
+    # helper no GuideDialog
+    def _notify(self, kind: str, title: str, msg: str):
+        try:
+            self._append_console(f"[{kind}] {title}: {msg}")
+            if getattr(self, "_batch_running", False):
+                # Em lote: não abrir modal
+                logger.warning(f"[Guide] (batch) suprimido QMessageBox: {title} - {msg}")
+                return
+            # Fora de lote: comporta-se como hoje
+            if kind == "info":
+                QMessageBox.information(self, title, msg)
+            elif kind == "warn":
+                QMessageBox.warning(self, title, msg)
+            else:
+                QMessageBox.critical(self, title, msg)
+        except Exception as e:
+            logger.error(f"[Guide] notify falhou: {e}")
+
     # ---------- Execução de passos ----------
     def _run_all_steps(self):
         if self._stream_worker and self._stream_worker.isRunning():
             self._append_console("[warn] Há um passo em execução. Cancelando antes do lote…")
             self._cancel_running(wait_worker=True)
         if not self.cards:
-            QMessageBox.warning(self, "Rodar todos", "Não há passos para executar.")
+            self._notify("info", "Rodar todos", "Nenhum passo disponível no guia.")
             return
 
         queue = []
@@ -742,7 +765,7 @@ class ExperimentGuideDialog(QDialog):
                 queue.append(st)
 
         if not queue:
-            QMessageBox.information(self, "Rodar todos", "Nenhum passo executável encontrado.")
+            self._notify("info", "Rodar todos", "Nenhum passo definiu um comando executável.")
             return
 
         self._batch_running = True
@@ -750,7 +773,7 @@ class ExperimentGuideDialog(QDialog):
         self._append_console(f"[guide] Rodando {len(queue)} passo(s) em sequência…")
         self._set_footer("Execução em lote iniciada…")
         self.batch_started.emit(len(queue))
-        QTimer.singleShot(120, lambda: self._run_step_async(self._batch_queue.pop(0)))
+        QTimer.singleShot(self._batch_delay_ms, lambda: self._run_step_async(self._batch_queue.pop(0)))
 
     def _run_step_async(self, step: dict):
         host = step.get("host", "attacker")
@@ -785,6 +808,7 @@ class ExperimentGuideDialog(QDialog):
         self._current_card = card
         self._current_worker = w
         self._cancel_requested = False
+        self._step_final_called = False
 
         def _is_current(worker) -> bool:
             try:
@@ -793,18 +817,25 @@ class ExperimentGuideDialog(QDialog):
                 return False
 
         def _on_worker_done_guard(worker=w, c=card, s=step):
-            if not _is_current(worker):
+            if worker is not self._stream_worker:
                 logger.warning("[Guide] Sinal 'done' de worker antigo ignorado.")
                 return
             if self._cancel_requested:
                 try:
-                    if c:
-                        c.set_cancelled()
+                    if c: c.set_cancelled()
                     self._append_console("[guide] Passo cancelado pelo usuário.")
                 except Exception as e:
                     logger.error(f"[Guide] marcar cancelado (done_guard): {e}")
-                return
-            self._on_step_done(c, s, ok=True)
+                # mesmo cancelado, marque fim 1x p/ encadear corretamente
+            try:
+                if self._step_final_called:
+                    logger.debug("[Guide] _on_worker_done_guard: final já processado — ignorando.")
+                    return
+                self._step_final_called = True
+                self._on_step_done(c, s, ok=True)
+                self._on_step_final(c, s)
+            except Exception as e:
+                logger.error(f"[Guide] done_guard: {e}")
 
         def _on_worker_error_guard(msg: str, worker=w, c=card, s=step):
             if not _is_current(worker):
@@ -821,13 +852,10 @@ class ExperimentGuideDialog(QDialog):
                     self._step_sent_done = True
                     logger.info("[Guide] Sentinela de conclusão detectada no stream.")
                     try:
-                        if c:
-                            c.set_done(True)
+                        if c: c.set_done(True)
                     except Exception as e:
                         logger.warning(f"[Guide] sentinela: set_done: {e}")
                     self._append_console("[guide] Passo concluído (sentinela).")
-
-                    self._on_step_final(c, s)
 
                     try:
                         if worker and worker.isRunning():
@@ -838,21 +866,19 @@ class ExperimentGuideDialog(QDialog):
                         pass
 
                     try:
-                        if self._step_watchdog:
-                            self._step_watchdog.stop()
+                        if self._step_watchdog: self._step_watchdog.stop()
                     except Exception:
                         pass
             except Exception as e:
                 logger.error(f"[Guide] _on_line_guard: {e}")
 
         def _on_worker_finished_guard(worker=w, c=card, s=step):
-            if not _is_current(worker):
+            if worker is not self._stream_worker:
                 logger.warning("[Guide] Sinal 'finished' de worker antigo ignorado.")
                 return
             try:
                 try:
-                    if self._step_watchdog:
-                        self._step_watchdog.stop()
+                    if self._step_watchdog: self._step_watchdog.stop()
                 except Exception:
                     pass
 
@@ -862,7 +888,10 @@ class ExperimentGuideDialog(QDialog):
                         c.set_done(True)
                 except Exception as e:
                     logger.warning(f"[Guide] fallback done on finished: {e}")
-                self._on_step_final(c, s)
+
+                if not self._step_final_called:
+                    self._step_final_called = True
+                    self._on_step_final(c, s)
             finally:
                 self._cleanup_worker(worker)
                 self._current_card = None
@@ -900,6 +929,12 @@ class ExperimentGuideDialog(QDialog):
             QMessageBox.critical(self, "Erro no passo", msg)
         except Exception:
             pass
+        try:
+            if not self._step_final_called:
+                self._step_final_called = True
+                self._on_step_final(card, step)
+        except Exception as e:
+            logger.error(f"[Guide] _on_step_fail.final: {e}")
 
     def _on_step_final(self, card: StepCard | None, step: dict):
         # Não sobrepor 'done'/'error' para 'idle'; preserve estado p/ timeline.
@@ -917,8 +952,9 @@ class ExperimentGuideDialog(QDialog):
 
         if self._batch_running:
             if self._batch_queue:
-                self._append_console("[guide] Próximo passo em 0.15s…")
-                QTimer.singleShot(150, lambda: self._run_step_async(self._batch_queue.pop(0)))
+                delay = max(0, int(self._batch_delay_ms))
+                self._append_console(f"[guide] Próximo passo em {delay / 1000:.2f}s…")
+                QTimer.singleShot(delay, lambda: self._run_step_async(self._batch_queue.pop(0)))
             else:
                 self._batch_running = False
                 self._append_console("[guide] Lote concluído ✓")

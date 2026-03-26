@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        self.settings = QSettings("VagrantLabUI", "MatrixEdition")
+        self.settings = QSettings("LabSec", "MatrixEdition")
 
         # Header
         content = QWidget(); content.setObjectName("matrixRoot")
@@ -136,7 +136,8 @@ class MainWindow(QMainWindow):
         content_l.setSpacing(0)
         root.addWidget(content, 1)
         top = QHBoxLayout(); top.setContentsMargins(12, 8, 12, 8)
-        lbl = QLabel("◤ MATRIX OPS"); lbl.setObjectName("matrixBrand");
+        lbl = QLabel("◤ Laboratório")
+        lbl.setObjectName("matrixBrand")
         top.addWidget(lbl)
         top.addStretch(1)
         content_l.addLayout(top)
@@ -244,7 +245,7 @@ class MainWindow(QMainWindow):
         body.addWidget(self.splitter, 1)
 
         try:
-            sizes = QSettings("VagrantLabUI", "MatrixEdition").value("splitter/sizes")
+            sizes = QSettings("LabSec", "MatrixEdition").value("splitter/sizes")
             if isinstance(sizes, (list, tuple)) and len(sizes) == 2:
                 self.splitter.setSizes([int(sizes[0]), int(sizes[1])])
         except Exception as e:
@@ -362,7 +363,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            QSettings("VagrantLabUI", "MatrixEdition").setValue("splitter/sizes", self.splitter.sizes())
+            QSettings("LabSec", "MatrixEdition").setValue("splitter/sizes", self.splitter.sizes())
             self.ctrl.detach_ui_log_handlers()
         except Exception as e:
             self._append_log(f"[UI] closeEvent: {e}")
@@ -561,5 +562,7 @@ class MainWindow(QMainWindow):
 
 def run_app():
     app = QApplication([])
-    win = MainWindow(); win.setWindowTitle("VagrantLabUI — ML IDS Lab (Matrix Edition)"); win.show()
+    win = MainWindow()
+    win.setWindowTitle("LabSecUI — ML IDS Lab")
+    win.show()
     app.exec()

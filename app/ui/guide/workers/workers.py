@@ -63,9 +63,43 @@ class _StreamWorker(QThread):
         self._stop_flag = True
         logger.error(f"[{self.id}] stop solicitado")
 
+    # def _wrap_with_rc(cmd: str) -> str:
+    #     return "{ " + cmd + " ; } ; rc=$?; printf \"\\n[guide] __RC=%s\\n\" \"$rc\"; exit $rc"
+
+    def _wrap_with_rc(cmd: str) -> str:
+        """
+        Embrulha o comando para capturar o exit code e imprimir a sentinela [guide] __RC=...
+        - Garante newline final antes do trailer
+        - Evita bloco { ... } quando houver heredoc (<<'EOF'), para não quebrar o terminador
+        """
+        try:
+            from app.ui.guide.guide_utils import _is_heredoc  # já existe no projeto
+        except Exception:
+            # Fallback defensivo: heurística simples
+            def _is_heredoc(s: str) -> bool:
+                s = (s or "")
+                return ("<<" in s and "EOF" in s) or ("__EOF__" in s)
+
+        c = (cmd or "").replace("\r\n", "\n")
+
+        # Garante que o terminador de heredoc fique sozinho na linha
+        if not c.endswith("\n"):
+            c += "\n"
+
+        trailer = "rc=$?; printf \"\\n[guide] __RC=%s\\n\" \"$rc\"; exit $rc\n"
+
+        if _is_heredoc(c):
+            # Nada de { ... } aqui; apenas anexe o trailer em novas linhas
+            wrapped = c + trailer
+        else:
+            # Use bloco para comandos simples, mas respeite quebras de linha
+            wrapped = "{\n" + c + "}\n" + trailer
+
+        return wrapped
+
     def run(self):
         try:
-            wrapped = "{ " + self.cmd + " ; } ; rc=$?; printf \"\\n[guide] __RC=%s\\n\" \"$rc\"; exit $rc"
+            wrapped = _StreamWorker._wrap_with_rc(self.cmd)
             if hasattr(self.ssh, "run_command_stream"):
                 for chunk in self.ssh.run_command_stream(self.host, wrapped, timeout_s=self.timeout_s):
                     if self._stop_flag:

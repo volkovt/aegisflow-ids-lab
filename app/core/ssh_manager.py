@@ -423,37 +423,58 @@ class SSHManager:
             time.sleep(0.4)
         raise TimeoutError(f"Banner SSH não disponível em {host}:{port}: {last_err}")
 
+    def run_command_stream(self, name: str, command: str, timeout_s: int = 300):
+        """
+        Executa 'command' e gera (yield) chunks de saída em tempo real.
+        Garante bash limpo e normaliza \n.
+        """
+        raw_cmd = (command or "").replace("\r\n", "\n")
+        cli = self._get_client(name, timeout=timeout_s)
+        chan_cmd = "bash --noprofile --norc -se"
+        try:
+            stdin, stdout, stderr = cli.exec_command(chan_cmd, get_pty=False, timeout=max(20, timeout_s))
+            safe = raw_cmd if raw_cmd.endswith("\n") else raw_cmd + "\n"
+            try:
+                stdin.write(safe)
+                stdin.flush()
+                stdin.channel.shutdown_write()
+            except Exception:
+                pass
+
+            ch = stdout.channel
+            ch.settimeout(max(5.0, float(timeout_s)))
+            last = time.time()
+            while True:
+                progressed = False
+                while ch.recv_ready():
+                    data = ch.recv(4096).decode(errors="ignore")
+                    progressed = True
+                    for line in data.splitlines():
+                        yield line
+                while ch.recv_stderr_ready():
+                    data = ch.recv_stderr(4096).decode(errors="ignore")
+                    progressed = True
+                    for line in data.splitlines():
+                        yield f"[stderr] {line}"
+                if ch.exit_status_ready() and not ch.recv_ready() and not ch.recv_stderr_ready():
+                    break
+                if not progressed:
+                    time.sleep(0.02)
+                # opcional: timeout por inatividade
+                if (time.time() - last) > (timeout_s + 3):
+                    yield "[stderr] [ssh_manager] timeout de stream"
+                    break
+        except Exception as e:
+            logger.error(f"[SSHManager] run_command_stream({name}) falhou: {e}", exc_info=True)
+            raise
+
     def run_command_cancellable(self, name: str, cmd: str, timeout_s: int = 300):
         """
         Executa 'vagrant ssh name -c "<wrapped>"' de forma cancelável, usando shell limpo.
         """
         self.run_command(name, cmd, timeout=timeout_s)
         return
-        # try:
-        #     wrapped = _wrap_no_rc_shell((cmd or "").replace("\r\n", "\n"))
-        #     ssh_cmd = ["vagrant", "ssh", name, "-c", wrapped]
-        #
-        #     creationflags = 0
-        #     preexec_fn = None
-        #     if os.name != "nt":
-        #         preexec_fn = os.setsid
-        #     else:
-        #         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-        #
-        #     proc = subprocess.Popen(
-        #         ssh_cmd, cwd=self.lab_dir,
-        #         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        #         preexec_fn=preexec_fn, creationflags=creationflags
-        #     )
-        #     self._register_proc(name, proc)
-        #     out, err = proc.communicate(timeout=timeout_s)
-        #     rc = proc.returncode
-        #     self._unregister_proc(name, proc)
-        #     if rc != 0:
-        #         raise RuntimeError(f"Remote exit status {rc}: {err.strip() or out.strip()}")
-        #     return out
-        # except subprocess.TimeoutExpired:
-        #     self.cancel_all_running()
+
 
     def run_command(self, name: str, command: str, timeout: int = 15, retries: int = 5) -> str:
         """
